@@ -1,0 +1,26 @@
+{
+  "name": "ahead-todo",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.ts",
+  "scripts": {
+    "start": "expo start",
+    "ios": "expo run:ios",
+    "ios:build": "xcodebuild -workspace ios/AheadTodo.xcworkspace -scheme AheadTodo -configuration Release -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' -derivedDataPath ios/build ARCHS=arm64 CODE_SIGNING_ALLOWED=NO build",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@ahead/client-react-native": "file:../../../packages/client-react-native",
+    "@ahead/native": "file:../../../packages/client-react-native/native-module",
+    "expo": "~57.0.22",
+    "expo-crypto": "~15.0.9",
+    "expo-file-system": "~57.0.7",
+    "expo-status-bar": "~57.0.1",
+    "react": "19.2.3",
+    "react-native": "0.86.3"
+  },
+  "devDependencies": {
+    "@types/react": "~19.2.2",
+    "typescript": "~6.0.3"
+  }
+}

@@ -2,7 +2,7 @@
 
 Your backend implements the write path through handlers and the read/sync path through loaders. The compiler generates their TypeScript interfaces from your schema. Ahead supplies protocol processing; your application supplies business logic, authorization and a database transaction.
 
-Examples use the `Entry` / `Edit` schema from [getting started](../getting-started.md). The complete working implementation is [server.mts](https://github.com/zanminwang/ahead/blob/main/examples/rust-round-trip/server.mts).
+Examples use the `Entry` / `Edit` schema of the [round-trip fixture](https://github.com/zanminwang/ahead/blob/main/integration/e2e/fixtures/round-trip/models/entry.model), which keeps a nullable field and an update patch that the [To-do example](../getting-started.md) does not need. The complete working implementation is [server.mts](https://github.com/zanminwang/ahead/blob/main/integration/e2e/fixtures/round-trip/server.mts); the To-do backend is [examples/todo/server.mts](https://github.com/zanminwang/ahead/blob/main/examples/todo/server.mts).
 
 ## createBackend
 

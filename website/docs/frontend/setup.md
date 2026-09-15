@@ -2,7 +2,7 @@
 
 Read, watch and update local data through the generated client. TypeScript and Flutter share the same model and mutation contract, backed by the Rust engine and SQLite. Select a language above each example; Flutter examples use Dart.
 
-Examples use the `Entry` model and `Edit` mutation from [getting started](../getting-started.md). [Generate your interfaces](../schema/define.md) before importing them.
+Examples use the `Entry` model and `Edit` mutation of the [round-trip fixture](https://github.com/zanminwang/ahead/blob/main/integration/e2e/fixtures/round-trip/models/entry.model); the [To-do example](../getting-started.md) uses the same generated API with its own names. [Generate your interfaces](../schema/define.md) before importing them.
 
 ## Set up the runtime
 
@@ -14,7 +14,7 @@ bash scripts/build.sh
 
 === "TypeScript"
 
-    The TypeScript client currently runs on Node.js 22.18 or newer. Build the native addon before importing generated code. The source package is `packages/client-js`; the example's generated `client.ts` already imports it through a relative path.
+    The TypeScript client currently runs on Node.js 22.18 or newer. Build the native addon before importing generated code. The source package is `packages/client-js`; the generated `client.ts` of the examples already imports it through a relative path.
 
     Generate with `--client-runtime` pointing to that source package, relative to your generated directory. See the [schema guide](../schema/define.md#generate-from-a-source-checkout) for the working command.
 
@@ -61,7 +61,7 @@ These examples open local storage without a connection. A fresh database returns
 
 ## Connect to your backend
 
-Start the [tutorial backend](../getting-started.md), then connect the client:
+Start the fixture backend with `bash integration/e2e/fixtures/round-trip/run.sh` (or the [To-do backend](../getting-started.md) with its own token and channel), then connect the client:
 
 === "TypeScript"
 

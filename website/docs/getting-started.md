@@ -1,128 +1,89 @@
 # Getting started
 
-Run a complete Ahead app from source: a generated TypeScript client with local SQLite, and your own TypeScript backend using Prisma/PostgreSQL. You will make a local edit, see the backend normalize it, work offline and observe a business rejection.
+Run the collaborative To-do example from source: one React Native app installed on two iOS simulators as two independent phones, each with its own local SQLite database, synchronizing through your own TypeScript backend on Prisma/PostgreSQL. You will add a task on one phone, complete it on the other, and keep working while one phone is offline.
 
 ## Prerequisites
 
-Use a macOS or Linux development environment with:
+Use macOS with:
 
+- Xcode with an installed iOS simulator runtime, and CocoaPods.
 - Node.js 22.18 or newer and npm.
-- Rust/rustup, using the repository's `rust-toolchain.toml`.
+- Rust/rustup, using the repository's `rust-toolchain.toml`, plus the `aarch64-apple-ios-sim` target.
 - Python 3 and a C/C++ build toolchain for the native Node addon.
 - PostgreSQL tools `initdb` and `pg_ctl` on `PATH`.
 - Internet access for the first dependency/build setup.
 
-Run all commands below from the repository root. Packages have not been published; these instructions use the checked-in source and generated APIs.
+Run all commands below from the repository root. Packages have not been published; these instructions use the checked-in source and generated APIs. Linux hosts can run the backend and the host tests but not the simulators.
 
-## 1. Start the backend
+## 1. Read the schema
+
+The whole application contract is [models/todo.model](https://github.com/zanminwang/ahead/blob/main/examples/todo/models/todo.model):
+
+```text
+model User {
+  id String
+  name String
+  @@id(id)
+}
+
+model Todo {
+  id String
+  title String
+  done Bool
+  createdById String
+  createdBy User @reference(via: [createdById])
+  @@id(id)
+}
+
+mutation AddTodo { todo Todo.create }
+mutation SetTodoDone { todo Todo.update<done> }
+```
+
+`AddTodo` creates a task and `SetTodoDone` changes only `done`. The compiler generates the typed client for the app and the typed `Handlers`/`Loaders` for the backend from this one file.
+
+## 2. Start the backend
 
 ```sh
 git clone https://github.com/zanminwang/ahead.git
 cd ahead
-bash examples/rust-round-trip/run.sh
+bash examples/todo/run.sh
 ```
 
-The runner builds the native runtime, generates the interfaces, installs example dependencies, and starts a private disposable PostgreSQL cluster. It creates the example tables and seeds `Entry` with ID `entry-1`.
-
-Wait for:
+The runner builds the native runtime, generates the interfaces, installs example dependencies, starts a private disposable PostgreSQL cluster and seeds the users Alice and Bob with three tasks. Wait for:
 
 ```text
-Example listening at http://127.0.0.1:4242
+To-do backend listening at http://127.0.0.1:4242
 ```
 
-The server uses development authentication, `Bearer demo-user`. Keep this terminal open. Stopping the runner removes its temporary backend database; it is not a persistent application deployment.
+The backend uses development authentication: the bearer token `alice` or `bob` is the whole credential. Keep this terminal open. Stopping the runner removes its temporary database; it is not a persistent deployment.
 
-## 2. Open a client
+## 3. Run two phones
 
-In another terminal, from the repository root:
+Build the Rust simulator slice and the Expo app once, then install the same app on two simulators. Without configuration the app is Alice; a `config.json` in the second installation's Documents directory makes it Bob. The exact commands are in the [example README](https://github.com/zanminwang/ahead/blob/main/examples/todo/README.md#run-two-phones).
 
-```sh
-node examples/rust-round-trip/client.mts
-```
+Each installation keeps its own database and client identity, so the two simulators behave as two phones. Expo Go cannot load the native module; use the native build.
 
-The client opens `example-client.sqlite`, connects to the backend and subscribes to `book:demo`. It catches up over HTTP and receives subsequent changes over WebSocket. It may first print null while its cache is empty, then the entry with text `Hello from the server`.
+## 4. Try it
 
-The CLI accepts `edit TEXT`, `offline`, `online`, `status` and `quit`. `AHEAD_DATABASE` selects a different local SQLite file, and `AHEAD_URL` selects a backend URL.
+1. Add a task on Alice's phone. It appears in her list at once and on Bob's phone after the backend accepts it.
+2. Mark it done on Bob's phone. Both lists converge.
+3. Interrupt one phone's connection to the backend (the simulator runner below does this with a per-phone proxy), add a task and complete it. Both writes commit locally and stay queued. Relaunch the app: the rows, the queue and the client identity survive. Restore networking: the create is pushed before its dependent update, missed changes are caught up over HTTP, and the live stream resumes.
 
-## 3. Make an edit
-
-Enter this in the client terminal (the extra spaces are intentional):
-
-```text
-edit   hello
-```
-
-The local record changes immediately. The handler trims whitespace in the backend; synchronization then supplies `hello`. The watcher reports the resulting changes. The corresponding application call is:
-
-```ts
-await client.transaction(tx => tx.mutate.edit({
-  entry: { identity: { id: 'entry-1' }, values: { text: '  hello' } },
-}));
-```
-
-The transaction resolves after local commit. It does not wait for the handler to accept the mutation.
-
-### Watch another client
-
-Keep the first client open and start a second one from another terminal, using its own local database:
-
-```sh
-AHEAD_DATABASE=example-client-peer.sqlite node examples/rust-round-trip/client.mts
-```
-
-Edit the entry in either client. After the backend accepts it, the other client's watcher updates through WebSocket without a manual sync call. Each client reads its own SQLite file; the shared channel carries the server's record changes.
-
-## 4. Work offline
-
-Enter one command at a time:
-
-```text
-offline
-edit   offline draft
-status
-```
-
-The edit is visible locally and `status` shows pending work. The backend remains unchanged because the connection is paused. Resume synchronization:
-
-```text
-online
-```
-
-The backend normalizes the text to `offline draft`; pending work settles after the required server progress arrives. To observe persistence, pause, edit, `quit`, then reopen the same client while keeping the backend running. The queued edit survives reopening and sync resumes automatically.
-
-## 5. See a rejection
-
-```text
-edit reject
-```
-
-The handler rejects this exact text with `entry.denied`. The local value may appear briefly, then the runtime removes that mutation's optimistic change. `status` includes the durable rejection. Applications can use `recordStatus` and `dismissRejection` to explain and acknowledge it in the UI.
-
-## 6. Stop the example
-
-Enter `quit` in the client, then stop the backend runner with Ctrl-C. Client SQLite persists; the example's temporary PostgreSQL database does not.
-
-For a new backend run, use a **new local database path** so old receipt/cursor history is not paired with a reset server:
-
-```sh
-AHEAD_DATABASE=example-client-second-run.sqlite node examples/rust-round-trip/client.mts
-```
-
-Choose a fresh filename for each fresh backend cluster. Do not delete an application's pending state as a general recovery technique.
+The backend trims titles, rejects empty ones (`todo.title_empty`), requires the creator to be the authenticated user, and reports a primary-key collision as `todo.id_conflict`. A rejected mutation's optimistic change is removed locally and the rejection is recorded for the app.
 
 ## Understand the files
 
 | File | Role |
 | --- | --- |
-| [models/entry.model](https://github.com/zanminwang/ahead/blob/main/examples/rust-round-trip/models/entry.model) | Record schema and local mutation contract |
-| [generated/client.ts](https://github.com/zanminwang/ahead/blob/main/examples/rust-round-trip/generated/client.ts) | Generated TypeScript client entry point |
-| [generated/backend.ts](https://github.com/zanminwang/ahead/blob/main/examples/rust-round-trip/generated/backend.ts) | Generated typed handlers/loaders and bound `createBackend` |
-| [generated/generated.dart](https://github.com/zanminwang/ahead/blob/main/examples/rust-round-trip/generated/generated.dart) | Generated Dart client and model types |
-| [server.mts](https://github.com/zanminwang/ahead/blob/main/examples/rust-round-trip/server.mts) | Business handler, loader and example database setup |
-| [client.mts](https://github.com/zanminwang/ahead/blob/main/examples/rust-round-trip/client.mts) | Local queries, mutation call, channel subscription and connection controls |
+| [models/todo.model](https://github.com/zanminwang/ahead/blob/main/examples/todo/models/todo.model) | Record schema and mutation contract |
+| [generate.sh](https://github.com/zanminwang/ahead/blob/main/examples/todo/generate.sh) | Compiles the schema into `generated/node` and `generated/mobile` |
+| [server.mts](https://github.com/zanminwang/ahead/blob/main/examples/todo/server.mts) | Handlers, loaders, development authentication and database setup |
+| [seed.mts](https://github.com/zanminwang/ahead/blob/main/examples/todo/seed.mts) | Create-if-missing demo users and tasks |
+| [mobile/src/todo.ts](https://github.com/zanminwang/ahead/blob/main/examples/todo/mobile/src/todo.ts) | Opens the generated client per user, subscribes to `todo:demo`, exposes `watch`, `add` and `setDone` |
+| [mobile/src/TodoScreen.tsx](https://github.com/zanminwang/ahead/blob/main/examples/todo/mobile/src/TodoScreen.tsx) | The one screen, rendered from watch callbacks |
 
 Next, [define your own schema](schema/define.md), browse the [API reference](api-index.md), or use the [client setup guide](frontend/setup.md).
 
-## Verify the round trip
+## Verify
 
-With Dart installed, `bash integration/e2e/run.sh` runs both languages against a temporary backend. It verifies retry after a lost response, normalization, business rejection, offline reopen, local writes during a delayed response and connection controls.
+`bash integration/e2e/todo-run.sh` runs the backend scenarios (happy path, every rejection code, an unknown identity, a lost push response, offline add-then-done across a reopen, opposing completions) through real clients against a temporary backend. `bash integration/platform/run_todo_ios_smoke.sh` repeats the two-phone flow on disposable simulators with a real per-phone network fault. `bash integration/e2e/run.sh` runs the Node and Dart round-trip fixture that the API reference examples are written against.

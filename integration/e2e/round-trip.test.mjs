@@ -5,7 +5,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
-import {createExample} from '../../examples/rust-round-trip/server.mts';
+import {createExample} from './fixtures/round-trip/server.mts';
 import {Client} from '../../packages/client-js/index.mts';
 import {syncProtocol} from './protocol-fixture.mjs';
 
@@ -48,7 +48,7 @@ test('documented CLI keeps offline edits local and syncs them on online', { time
   const server = await app.listen(0);
   const before = await app.db.entry.findUnique({ where: { id: 'entry-1' } });
   const root = fileURLToPath(new URL('../..', import.meta.url));
-  child = spawn(process.execPath, ['examples/rust-round-trip/client.mts'], {
+  child = spawn(process.execPath, ['integration/e2e/fixtures/round-trip/client.mts'], {
    cwd: root,
    env: { ...process.env, AHEAD_URL: server.url, AHEAD_DATABASE: join(directory, 'client.sqlite') },
    stdio: ['pipe', 'pipe', 'pipe'],

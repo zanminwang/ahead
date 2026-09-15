@@ -13,6 +13,7 @@
     "packages/client-js/*.mts",
     "packages/server/*.mts",
     "packages/persistence-prisma/*.mts",
-    "examples/rust-round-trip/*.mts"
+    "integration/e2e/fixtures/round-trip/*.mts",
+    "examples/todo/*.mts"
   ]
 }

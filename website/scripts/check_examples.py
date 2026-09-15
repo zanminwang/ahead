@@ -33,11 +33,11 @@ def snippets(language, sources=None):
 
 def check():
     # Keep temporary sources within package ancestry so module resolution uses
-    # the same installed dependencies and Dart package config as the example.
+    # the same installed dependencies and Dart package config as the fixture.
     with tempfile.TemporaryDirectory(prefix='.docs-check-', dir=ROOT / 'packages/dart') as temp:
         directory = Path(temp)
         ts = directory / 'examples.mts'
-        ts.write_text('''import { GeneratedClient, Edit, schema } from '../../../examples/rust-round-trip/generated/client.ts';
+        ts.write_text('''import { GeneratedClient, Edit, schema } from '../../../integration/e2e/fixtures/round-trip/generated/client.ts';
 import { Client } from '../../client-js/index.mts';
 declare const client: GeneratedClient;
 declare const raw: Client;
@@ -60,7 +60,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:ahead/ahead.dart';
-import '../../../examples/rust-round-trip/generated/generated.dart';
+import '../../../integration/e2e/fixtures/round-trip/generated/generated.dart';
 late GeneratedClient client;
 late Client raw;
 late StreamSubscription<List<Entry>> subscription;
@@ -74,12 +74,12 @@ Future<void> uploadFile(dynamic key) async {}
 ''' + '\n'.join(f'// {source}\nFuture<void> example{i}() async {{\n{code}\n}}'
                   for i, (source, code) in enumerate(snippets('dart'))))
         subprocess.run(['dart', 'analyze', str(dart)], cwd=ROOT / 'packages/dart', check=True)
-    with tempfile.TemporaryDirectory(prefix='.docs-check-', dir=ROOT / 'examples/rust-round-trip') as temp:
+    with tempfile.TemporaryDirectory(prefix='.docs-check-', dir=ROOT / 'integration/e2e/fixtures/round-trip') as temp:
         backend = Path(temp) / 'backend.mts'
         backend.write_text('''import { PrismaClient, type Prisma } from '@prisma/client';
 import { createBackend, devAuth, Entry, MutationRejected, type Handlers, type Loaders } from '../generated/backend.ts';
-import { prisma } from '../../../packages/persistence-prisma/index.mts';
-import type { Database, Notify } from '../../../packages/server/index.mts';
+import { prisma } from '../../../../../packages/persistence-prisma/index.mts';
+import type { Database, Notify } from '../../../../../packages/server/index.mts';
 type Tx = Prisma.TransactionClient;
 declare function canEdit(tx: Tx, userId: string, identity: { id: string }): Promise<boolean>;
 declare function loadVisibleEntry(tx: Tx, userId: string, identity: { id: string }): Promise<Entry | null>;

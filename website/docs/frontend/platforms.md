@@ -34,7 +34,7 @@ The repository includes a React Native TypeScript adapter, reusable Expo native 
 
 Generated read/watch/mutation/transaction APIs are shared with Node. React Native's raw transaction does not expose nested savepoints. Native WebSocket failures do not expose a structured HTTP status; HTTP 401 refresh and application-managed socket credentials are documented separately in the package guide. Background execution while iOS suspends the app is not promised.
 
-See the [package guide](https://github.com/zanminwang/ahead/blob/main/packages/client-react-native/README.md) for installation and API limits, and the [integration harness](https://github.com/zanminwang/ahead/blob/main/integration/platform/react-native/README.md) for exact build/run steps and runtime evidence. The simulator sequence uses embedded JavaScript and actual network interruption; host tests or native linking alone do not establish completion.
+The runnable demo is the [To-do example](https://github.com/zanminwang/ahead/blob/main/examples/todo/README.md): two simulators, local writes, offline work and synchronization through the example backend ([getting started](../getting-started.md)). See the [package guide](https://github.com/zanminwang/ahead/blob/main/packages/client-react-native/README.md) for installation and API limits, and the [SDK integration harness](https://github.com/zanminwang/ahead/blob/main/integration/platform/react-native/README.md) for exact build/run steps and runtime evidence. The simulator sequence uses embedded JavaScript and actual network interruption; host tests or native linking alone do not establish completion.
 
 ## Verification
 

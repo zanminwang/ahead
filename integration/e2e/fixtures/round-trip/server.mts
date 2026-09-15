@@ -1,7 +1,7 @@
 import { PrismaClient, type Prisma } from "@prisma/client";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { prisma } from "../../packages/persistence-prisma/index.mts";
+import { prisma } from "../../../../packages/persistence-prisma/index.mts";
 import {
   createBackend,
   devAuth,
@@ -49,7 +49,7 @@ export async function createExample() {
     },
     async initialize() {
       const migration = await readFile(
-        new URL("../../packages/persistence-prisma/migration.sql", import.meta.url),
+        new URL("../../../../packages/persistence-prisma/migration.sql", import.meta.url),
         "utf8",
       );
       for (const sql of migration.split(";").map((s) => s.trim()).filter(Boolean))

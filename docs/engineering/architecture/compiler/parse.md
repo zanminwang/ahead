@@ -23,7 +23,7 @@ Code: `lex`, `Parser`, `parse` and the `Declarations` types in [compiler/parse.r
 - A syntax error names its line. Evidence: [compiler/tests/compiler.rs](../../../../crates/compiler/tests/compiler.rs) `rejects_unknown_with_location`.
 - With several input files, the CLI names the file and the line within that file, for syntax and semantic errors alike. Evidence: [compiler/tests/cli.rs](../../../../crates/compiler/tests/cli.rs) `cli_relocates_errors_into_the_file_that_declares_them`.
 - Parsing records every declaration with its position and applies no semantic rule; an unknown type parses and is refused only by Validate. Evidence: [compiler/tests/parse.rs](../../../../crates/compiler/tests/parse.rs) `parse_keeps_every_declaration_with_its_position`, `parse_reports_syntax_errors_with_the_found_token_and_nothing_semantic`.
-- The split changes no output: the checked-in fixtures and the example compile to byte-identical files before and after it. Evidence: `compile_is_parse_then_validate_and_declarations_are_plain_data`; verified 2026-09-14 by compiling `fixtures/compiler/*.model` and `examples/rust-round-trip/models` with both binaries and diffing the seven output files of each.
+- The split changes no output: the checked-in fixtures and the example compile to byte-identical files before and after it. Evidence: `compile_is_parse_then_validate_and_declarations_are_plain_data`; verified 2026-09-14 by compiling `fixtures/compiler/*.model` and the round-trip models (now `integration/e2e/fixtures/round-trip/models`) with both binaries and diffing the seven output files of each.
 
 ## 11. Risks and Technical Debt
 

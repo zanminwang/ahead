@@ -28,7 +28,7 @@ const database = prisma(db, { retries: 3, timeout: 20_000 });
 // Pass database to generated createBackend({ database, ... }).
 ```
 
-`db` is your Prisma client. The import above uses the example's directory depth. Apply [migration.sql](https://github.com/zanminwang/ahead/blob/main/packages/persistence-prisma/migration.sql) to your backend database using your deployment migration process before accepting sync traffic. The adapter does not create your business tables or initialize a database for you. The [getting-started runner](../getting-started.md) handles a disposable database for the example.
+`db` is your Prisma client. The import above uses the To-do example's directory depth. Apply [migration.sql](https://github.com/zanminwang/ahead/blob/main/packages/persistence-prisma/migration.sql) to your backend database using your deployment migration process before accepting sync traffic. The adapter does not create your business tables or initialize a database for you. The [getting-started runner](../getting-started.md) handles a disposable database for the example.
 
 | Export | Input / return |
 | --- | --- |

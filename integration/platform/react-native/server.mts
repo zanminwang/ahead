@@ -1,7 +1,7 @@
 import {
   PrismaClient,
   type Prisma,
-} from "../../../examples/rust-round-trip/node_modules/@prisma/client/default.js";
+} from "../../e2e/fixtures/round-trip/node_modules/@prisma/client/default.js";
 import { readFile, writeFile } from "node:fs/promises";
 import { createServer, request as httpRequest } from "node:http";
 import { connect as netConnect, type Socket } from "node:net";

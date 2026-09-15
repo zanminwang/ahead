@@ -27,3 +27,6 @@ artifacts/
 
 # Optional workspace-local Rust toolchain (symlink or directory)
 .tools
+
+# Prisma client generated for the To-do example (npm run generate)
+/examples/todo/prisma/client/

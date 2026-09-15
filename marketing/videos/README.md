@@ -19,7 +19,7 @@ Adoption is the longer-term outcome. The introduction's immediate goal is a tria
 - Use the same collaborative To-do scenario, participants, and visual vocabulary in both videos.
 - Use Manim for explanatory animation. Select and pin the Manim distribution when production begins; Manim Community is the current proposal.
 - The introduction gives a short view of how Ahead works. The engineering video expands selected steps into concrete failure scenarios and design reasoning.
-- Keep the walkthrough anchored to the mobile demo in [#31](https://github.com/zanminwang/ahead/issues/31). The later web client in [#72](https://github.com/zanminwang/ahead/issues/72) can supply additional footage after it is implemented and verified.
+- Keep the walkthrough anchored to the mobile demo in [#31](https://github.com/zanminwang/ahead/issues/31), implemented as the [To-do example](../../examples/todo/README.md). The later web client in [#72](https://github.com/zanminwang/ahead/issues/72) can supply additional footage after it is implemented and verified.
 - A schematic animation explains a mechanism; it does not establish that a platform or behavior has been verified. Match capability claims and application footage to the demonstrated revision.
 - Store scripts, storyboards, and scene source in each video's directory as production starts. Add `shared/` when there are reusable components or assets.
 - Keep rendering caches and large exported video files out of ordinary Git history. Record published video links here when available.

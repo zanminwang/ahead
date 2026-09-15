@@ -8,8 +8,10 @@ bash scripts/build.sh
 cargo fmt --all --check
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
-(cd examples/rust-round-trip && npm ci && npx prisma generate)
-cargo run -p ahead-compiler -- compile examples/rust-round-trip/models examples/rust-round-trip/generated --backend-runtime ../../../packages/server/index.mts --client-runtime ../../../packages/client-js/index.mts
+(cd integration/e2e/fixtures/round-trip && npm ci && npx prisma generate)
+cargo run -p ahead-compiler -- compile integration/e2e/fixtures/round-trip/models integration/e2e/fixtures/round-trip/generated --backend-runtime ../../../../../packages/server/index.mts --client-runtime ../../../../../packages/client-js/index.mts
+(cd examples/todo && npm ci && npx prisma generate)
+bash examples/todo/generate.sh
 npm run typecheck
 "$root/node_modules/.bin/prettier" --check packages/client-js/*.mts packages/server/*.mts packages/persistence-prisma/*.mts packages/client-react-native/*.mts packages/client-react-native/index.ts
 "$root/node_modules/.bin/tsc" -p packages/client-react-native
@@ -27,4 +29,5 @@ export AHEAD_DART_LIBRARY="$AHEAD_LIBRARY"
 (cd packages/dart && dart pub get && dart analyze && dart test)
 bash integration/generated-api/verify.sh
 bash integration/e2e/run.sh
+bash integration/e2e/todo-run.sh
 python3 website/scripts/check_examples.py

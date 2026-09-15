@@ -1,0 +1,13 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "paths": {
+      "expo-modules-core": [
+        "./node_modules/expo-modules-core"
+      ]
+    }
+  }
+}

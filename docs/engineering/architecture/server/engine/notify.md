@@ -38,7 +38,7 @@ Tests read, not executed.
 
 ## 11. Risks and Technical Debt
 
-**Problem: the shortcut `backend.notify(tx, …)` never wakes live subscribers.** *Condition:* application code publishes outside a push without `bindTransaction`. *Consequence:* the publication is stored, but the touched set is discarded, so connected clients learn of the change only when they reconnect and catch up. The example backend uses this shortcut. *Evidence:* `publish` falls back to a throwaway session in [server/index.mts](../../../../../packages/server/index.mts); [examples/rust-round-trip/server.mts](../../../../../examples/rust-round-trip/server.mts). **To confirm:** remove the shortcut or document the `afterCommit` requirement.
+**Problem: the shortcut `backend.notify(tx, …)` never wakes live subscribers.** *Condition:* application code publishes outside a push without `bindTransaction`. *Consequence:* the publication is stored, but the touched set is discarded, so connected clients learn of the change only when they reconnect and catch up. The round-trip fixture backend and the To-do example seed use this shortcut. *Evidence:* `publish` falls back to a throwaway session in [server/index.mts](../../../../../packages/server/index.mts); [fixtures/round-trip/server.mts](../../../../../integration/e2e/fixtures/round-trip/server.mts). **To confirm:** remove the shortcut or document the `afterCommit` requirement.
 
 **Accepted limitation.** Wakes are in-process: a second server instance, or a publication from another process, does not wake this process's sockets; those clients catch up on reconnect. No issue tracks an external pub/sub.
 

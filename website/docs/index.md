@@ -17,7 +17,7 @@ Define your records and mutations once. Ahead generates typed client calls and b
 
 ## Start here
 
-[Run the getting-started tutorial](getting-started.md) to make a local edit, work offline and see your backend accept or reject a mutation.
+[Run the getting-started tutorial](getting-started.md) to run the collaborative To-do example on two simulators, work offline and see your backend accept or reject a mutation.
 
 | What you need | Read |
 | --- | --- |

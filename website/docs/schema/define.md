@@ -23,16 +23,16 @@ mutation Edit {
 
 ## Generate from a source checkout
 
-For the existing repository example, run from the repository root:
+For the To-do example, run from the repository root:
 
 ```sh
 cargo run -p ahead-compiler -- compile \
-  examples/rust-round-trip/models examples/rust-round-trip/generated \
-  --backend-runtime ../../../packages/server/index.mts \
-  --client-runtime ../../../packages/client-js/index.mts
+  examples/todo/models examples/todo/generated/node \
+  --backend-runtime ../../../../packages/server/index.mts \
+  --client-runtime ../../../../packages/client-js/index.mts
 ```
 
-The runtime import paths are relative to the generated output directory. Adjust them when generating into another directory. Follow [getting started](../getting-started.md) to build the required native artifacts. Packages are not currently published; the default package specifiers are not a registry installation guide.
+The runtime import paths are relative to the generated output directory. Adjust them when generating into another directory; [examples/todo/generate.sh](https://github.com/zanminwang/ahead/blob/main/examples/todo/generate.sh) also emits the React Native client from the same schema. Follow [getting started](../getting-started.md) to build the required native artifacts. Packages are not currently published; the default package specifiers are not a registry installation guide.
 
 The compiler writes TypeScript and Dart clients, typed backend interfaces, descriptors and retained mutation history. See the [compiler reference](reference.md) for every output and option. Do not edit generated files by hand.
 

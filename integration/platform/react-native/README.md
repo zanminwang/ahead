@@ -11,14 +11,14 @@ From the repository root:
 ```sh
 npm ci
 bash scripts/build.sh
-(cd examples/rust-round-trip && npm ci && npm run generate)
+(cd integration/e2e/fixtures/round-trip && npm ci && npm run generate)
 bash integration/platform/react-native/generate.sh
 rustup target add aarch64-apple-ios-sim
 bash packages/client-react-native/native-module/scripts/build-ios.sh simulator
 (cd integration/platform/react-native && npm ci)
 ```
 
-The harness reuses the existing example's Prisma package/schema for its disposable backend. Its additional AddEntry mutation and generated mobile entry point are owned by `models/entry.model`; it does not modify the public example.
+The harness reuses the Prisma package/schema of the [round-trip fixture](../../e2e/fixtures/round-trip/README.md) for its disposable backend. Its additional AddEntry mutation and generated mobile entry point are owned by `models/entry.model`; it does not modify the fixture or the public To-do example.
 
 ## Build
 

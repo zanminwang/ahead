@@ -1,0 +1,17 @@
+model User {
+  id String
+  name String
+  @@id(id)
+}
+
+model Todo {
+  id String
+  title String
+  done Bool
+  createdById String
+  createdBy User @reference(via: [createdById])
+  @@id(id)
+}
+
+mutation AddTodo { todo Todo.create }
+mutation SetTodoDone { todo Todo.update<done> }
