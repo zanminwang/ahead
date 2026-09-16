@@ -4,14 +4,15 @@ See the [component documentation index](architecture/README.md) for individual d
 
 ## Core
 
-Four parts carry the product's promises: offline writes that are never lost, at-most-once execution, and convergence. Design discussions start here; everything else adapts to them.
+Five parts carry the product: three define what synchronization guarantees, two define what a developer writes against. Design discussions start here; everything else adapts to them.
 
 | Core part | Why |
 | --- | --- |
 | [Protocol](architecture/protocol/README.md) | The wire contract the two engines agree on: receipts, pages, stamps, cursors. Changing it changes the product. |
 | [Client / Engine](architecture/client/engine/README.md) | Optimistic writes, the mutation queue, authority applied by stamp, completion from receipts. |
+| [Client / Frontend interface](architecture/client/frontend-interface.md) | What a frontend author writes against: reads, writes, transactions, subscriptions and status, one command at a time. |
 | [Server / Engine](architecture/server/engine/README.md) | Per-mutation execution and readback, publication, receipts, pages by cursor. The client engine's counterpart. |
-| [Server / Backend interface](architecture/server/backend-interface.md) | The host contract between application handlers/loaders and the engine: what a backend author writes. |
+| [Server / Backend interface](architecture/server/backend-interface.md) | What a backend author writes against: the host contract between handlers/loaders and the engine. |
 
 The compiler is a tool, the SDKs and connections carry bytes, storage and persistence are adapters, the schema is input. They are marked ★ in the tree and shaded in the graph below.
 
@@ -38,7 +39,7 @@ The tree stops at three levels: Ahead, a component, a part. A part that has inte
   - **[Typed API](architecture/sdks/typed-api/README.md)** — Expose strongly typed client and server APIs to applications.
   - **[Bindings](architecture/sdks/bindings.md)** — Bridge calls, arguments, results, errors and events between the language and Rust.
 - **[Client runtime (Rust)](architecture/client/README.md)** — Local state, storage and sync.
-  - **[Frontend interface](architecture/client/frontend-interface.md)** — Expose reads, writes, subscriptions and status to SDKs.
+  - ★ **[Frontend interface](architecture/client/frontend-interface.md)** — Expose reads, writes, subscriptions and status to SDKs.
   - ★ **[Engine](architecture/client/engine/README.md)** — Local reads and writes, the mutation queue, completion from receipts and page application.
   - **[Storage](architecture/client/storage/README.md)** — Execute Engine-requested SQL and transactions; table layout and reconciliation.
   - **[Connection](architecture/client/connection/README.md)** — HTTP/WebSocket transport and the controller that decides when to push, stream, catch up and retry.
@@ -93,7 +94,7 @@ flowchart LR
     classDef contract fill:#edf4ff,stroke:#6485b5,color:#243247;
     classDef core fill:#fff3e0,stroke:#c77700,color:#3d2600,stroke-width:2px;
     class SCH contract;
-    class PRO,CE,SE,SB core;
+    class PRO,CE,CF,SE,SB core;
 ```
 
 ## Code map
