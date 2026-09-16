@@ -136,7 +136,7 @@ struct Origin<S> {
 }
 
 /// Opens a store at a file; how [`Client::open_at`] reaches storage.
-pub type StoreFactory<S> = Box<dyn Fn(&std::path::Path) -> Result<S>>;
+pub type StoreFactory<S> = Box<dyn Fn(&std::path::Path) -> Result<S> + Send + Sync>;
 
 /// What the schema check found at open ([Reconciliation](../../docs/engineering/architecture/client/storage/reconciliation.md)).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
