@@ -300,6 +300,31 @@ fn semantic_errors_report_the_offending_declaration() {
 }
 
 #[test]
+fn rejects_model_and_enum_names_the_generated_client_uses() {
+    for name in [
+        "SyncState",
+        "Rejection",
+        "Mutate",
+        "GeneratedClient",
+        "Transaction",
+    ] {
+        let e = compile(&format!("model {name} {{ id UUID @@id(id) }}")).unwrap_err();
+        assert!(e.contains("generated client"), "{name}: {e}");
+        let e = compile(&format!(
+            "enum {name} {{ a b }}\nmodel Other {{ id UUID @@id(id) }}"
+        ))
+        .unwrap_err();
+        assert!(e.contains("generated client"), "enum {name}: {e}");
+    }
+    for name in ["Status", "SyncStates", "Rejections", "Order"] {
+        assert!(
+            compile(&format!("model {name} {{ id UUID @@id(id) }}")).is_ok(),
+            "{name} should stay valid"
+        );
+    }
+}
+
+#[test]
 fn rejects_reserved_model_names_at_the_declaration() {
     for name in ["sqlite_entry", "SQLite_Entry", "ahead_entry", "Ahead_entry"] {
         let e = compile(&format!(
