@@ -1,0 +1,60 @@
+import type { DriverOptions, PostgresDriver } from "./driver.mts";
+import { RETRYABLE_SQLSTATES, withRetries } from "./driver.mts";
+import { persistence } from "./persistence.mts";
+
+/** The part of a `pg` client Ahead uses; `pg.PoolClient` satisfies it. */
+export interface PgClient {
+  query(
+    sql: string,
+    params?: readonly unknown[],
+  ): Promise<{ rows: Record<string, unknown>[] }>;
+  release(error?: Error | boolean): void;
+}
+/** The part of a `pg` pool Ahead uses; `pg.Pool` satisfies it. */
+export interface PgPool {
+  connect(): Promise<PgClient>;
+}
+
+const sqlstate = (error: unknown): string | undefined =>
+  (error as { code?: string } | null)?.code;
+
+/** `pg` bigint parameters are sent as text; everything else as is. */
+const bind = (params: readonly unknown[]): unknown[] =>
+  params.map((p) => (typeof p === "bigint" ? p.toString() : p));
+
+/** A driver over a node-postgres pool. Handlers and loaders receive the `PoolClient`. */
+export function pgDriver(
+  pool: PgPool,
+  options: DriverOptions = {},
+): PostgresDriver<PgClient> {
+  return {
+    transaction: (body) =>
+      withRetries(
+        async () => {
+          const client = await pool.connect();
+          try {
+            await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+            try {
+              const result = await body(client);
+              await client.query("COMMIT");
+              return result;
+            } catch (error) {
+              await client.query("ROLLBACK").catch(() => {});
+              throw error;
+            }
+          } finally {
+            client.release();
+          }
+        },
+        (error) => RETRYABLE_SQLSTATES.has(sqlstate(error) ?? ""),
+        options.retries ?? 3,
+      ),
+    query: async (client, sql, params) =>
+      (await client.query(sql, bind(params))).rows,
+  };
+}
+
+/** `createBackend({ database: pg(pool) })`. */
+export function pg(pool: PgPool, options: DriverOptions = {}) {
+  return persistence(pgDriver(pool, options));
+}

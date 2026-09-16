@@ -13,7 +13,7 @@ cargo run -p ahead-compiler -- compile integration/e2e/fixtures/round-trip/model
 (cd examples/todo && npm ci && npx prisma generate)
 bash examples/todo/generate.sh
 npm run typecheck
-"$root/node_modules/.bin/prettier" --check packages/client-js/*.mts packages/server/*.mts packages/persistence-prisma/*.mts packages/client-react-native/*.mts packages/client-react-native/index.ts
+"$root/node_modules/.bin/prettier" --check packages/client-js/*.mts packages/server/*.mts packages/postgres/*.mts packages/postgres/src/*.mts packages/client-react-native/*.mts packages/client-react-native/index.ts
 "$root/node_modules/.bin/tsc" -p packages/client-react-native
 node --test packages/client-react-native/plugins/expo-path-spaces.test.cjs
 node --test integration/bindings/client-js/*.test.mjs

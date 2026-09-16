@@ -4,11 +4,15 @@ import {readFile} from 'node:fs/promises';
 import {createRequire} from 'node:module';
 import * as serverSdk from '../../../packages/server/index.mts';
 import {createBackend,MutationRejected,EngineError,RECORD} from '../../../packages/server/index.mts';
-import {PrismaPersistence,prismaTransactions,prisma} from '../../../packages/persistence-prisma/index.mts';
+import {prisma,prismaDriver} from '../../../packages/postgres/index.mts';
 const require=createRequire(import.meta.url);
 const {PrismaClient}=require('../../bindings/node/generated/client');
 const native=require('../../../bindings/node/ahead-node.node');
 const db=new PrismaClient();
+// The server suite runs on the Prisma shim (its handlers use Prisma's raw API); driver-conformance.test.mjs proves every shim.
+const database=()=>prisma(db);
+const store=tx=>prisma(db).persistence(tx);
+const run=prismaDriver(db).transaction;
 const schema={enums:[],models:[{name:'Task',identity:['id'],fields:[{name:'id',type:{kind:'scalar',name:'string'},nullable:false},{name:'title',type:{kind:'scalar',name:'string'},nullable:false}]}]};
 const config={schema,mutations:[{name:'edit',version:1,slots:[{name:'task',model:'Task',operation:'update',cardinality:'single',allowedPatchFields:['title']}]}]};
 const authenticate=async req=>req.headers.authorization==='Bearer alice'?'alice':null;
@@ -16,7 +20,7 @@ let called=0,prepared=0,lastInput;const loaderCalls=[];
 const write=(tx,id,title)=>tx.$executeRawUnsafe('INSERT INTO business_task(id,title) VALUES($1,$2) ON CONFLICT(id) DO UPDATE SET title=$2',id,title);
 const readTasks=({ids,tx})=>Promise.all(ids.map(async identity=>{const rows=await tx.$queryRawUnsafe('SELECT title FROM business_task WHERE id=$1',identity.id);return rows[0]??null;}));
 // The patch title steers the handler: every mutation writes its row and, unless told to stay quiet, publishes the change set to `shared`.
-const backend=createBackend({config,database:prisma(db),authenticate,handlers:{
+const backend=createBackend({config,database:database(),authenticate,handlers:{
  async edit({input,tx,changes,publish}){
   called++;lastInput=input;const {identity,patch}=input.task;
   await write(tx,identity.id,patch.title);
@@ -42,7 +46,7 @@ const key=id=>`{"id":"${id}"}`;
 const recordStamp=async id=>{const rows=await db.$queryRawUnsafe('SELECT stamp FROM ahead_record WHERE model=$1 AND identity_key=$2','Task',key(id));return rows.length?Number(rows[0].stamp):null;};
 const invalidations=async id=>(await db.$queryRawUnsafe('SELECT channel, cursor, stamp FROM ahead_invalidation WHERE identity_key=$1 ORDER BY channel',key(id))).map(r=>[r.channel,Number(r.cursor),Number(r.stamp)]);
 const head=async channel=>{const rows=await db.$queryRawUnsafe('SELECT head FROM ahead_channel WHERE channel=$1',channel);return rows.length?Number(rows[0].head):0;};
-before(async()=>{for(const sql of (await readFile(new URL('../../../packages/persistence-prisma/migration.sql',import.meta.url),'utf8')).split(';').map(x=>x.trim()).filter(Boolean))await db.$executeRawUnsafe(sql);await db.$executeRawUnsafe('CREATE TABLE business_task(id text PRIMARY KEY,title text NOT NULL)');});
+before(async()=>{for(const sql of (await readFile(new URL('../../../packages/postgres/migration.sql',import.meta.url),'utf8')).split(';').map(x=>x.trim()).filter(Boolean))await db.$executeRawUnsafe(sql);await db.$executeRawUnsafe('CREATE TABLE business_task(id text PRIMARY KEY,title text NOT NULL)');});
 after(()=>db.$disconnect());
 test('native exports production runtime',()=>{assert.equal(typeof native.processPush,'function');assert.equal(typeof native.processPull,'function');assert.equal(typeof native.publish,'function');assert.equal(typeof native.validateConfig,'function');
  assert.equal(typeof native.negotiateLive,'function');assert.equal(typeof native.pullLive,'function');
@@ -52,14 +56,14 @@ test('native exports production runtime',()=>{assert.equal(typeof native.process
 });
 test('backend validates config and complete registrations at startup',()=>{
  const base={...config,schema:structuredClone(schema)};
- assert.throws(()=>createBackend({config:{...base,mutations:[{name:'bad',version:0,slots:[]}]},native,database:prisma(db),authenticate,handlers:{},loaders:{task:async()=>[]}}),/invalid mutation descriptor/);
- assert.throws(()=>createBackend({config:base,native,database:prisma(db),authenticate,handlers:{},loaders:{task:async()=>[]}}),/Missing handler edit for edit v1/);
- assert.throws(()=>createBackend({config:base,native,database:prisma(db),authenticate,handlers:{edit:async()=>{}},loaders:{}}),/Missing loader task for Task v1/);
+ assert.throws(()=>createBackend({config:{...base,mutations:[{name:'bad',version:0,slots:[]}]},native,database:database(),authenticate,handlers:{},loaders:{task:async()=>[]}}),/invalid mutation descriptor/);
+ assert.throws(()=>createBackend({config:base,native,database:database(),authenticate,handlers:{},loaders:{task:async()=>[]}}),/Missing handler edit for edit v1/);
+ assert.throws(()=>createBackend({config:base,native,database:database(),authenticate,handlers:{edit:async()=>{}},loaders:{}}),/Missing loader task for Task v1/);
 });
 test('loader registration names every retained model version and a function means v1 only',()=>{
  const base={...config,schema:structuredClone(schema)};
  const contract=version=>({name:'Task',version,identity:['id'],fields:schema.models[0].fields,enums:[]});
- const register=(models,loaders,currentVersion=1)=>{const c={...base,schema:structuredClone(schema),models};c.schema.models[0].version=currentVersion;return createBackend({config:c,native,database:prisma(db),authenticate,handlers:{edit:async()=>{}},loaders});};
+ const register=(models,loaders,currentVersion=1)=>{const c={...base,schema:structuredClone(schema),models};c.schema.models[0].version=currentVersion;return createBackend({config:c,native,database:database(),authenticate,handlers:{edit:async()=>{}},loaders});};
  const both=[contract(1),contract(2)];
  assert.throws(()=>register(both,{task:async()=>[]},2),/Loader task must register v1, v2 of Task; a function registers v1 only/);
  assert.throws(()=>register([contract(2)],{task:async()=>[]},2),/Loader task must register v2 of Task; a function registers v1 only/);
@@ -76,7 +80,7 @@ test('loader registration names every retained model version and a function mean
 });
 test('handler registration names every retained version and a function means v1 only',()=>{
  const base={...config,schema:structuredClone(schema)};
- const register=(mutations,handlers)=>createBackend({config:{...base,mutations},native,database:prisma(db),authenticate,handlers,loaders:{task:async()=>[]}});
+ const register=(mutations,handlers)=>createBackend({config:{...base,mutations},native,database:database(),authenticate,handlers,loaders:{task:async()=>[]}});
  const both=[config.mutations[0],{...config.mutations[0],version:2}];
  assert.throws(()=>register(both,{edit:async()=>{}}),/Handler edit must register v1, v2 of edit; a function registers v1 only/);
  assert.throws(()=>register([{...config.mutations[0],version:2}],{edit:async()=>{}}),/Handler edit must register v2 of edit; a function registers v1 only/);
@@ -87,13 +91,6 @@ test('handler registration names every retained version and a function means v1 
  register(both,{edit:{v1:async()=>{},v2:async()=>{}}});
  register([config.mutations[0]],{edit:{v1:async()=>{}}});
  register([config.mutations[0]],{edit:async()=>{}});
-});
-test('Prisma persistence supports reusable bind without owning a transaction',async()=>{
- const reusable=new PrismaPersistence();let calls=0;
- const tx={$queryRawUnsafe:async()=>[{head:4}],$executeRawUnsafe:async()=>{calls++;return 1}};
- assert.equal(await reusable.bind(tx).call({op:'head',channel:'x'}),4);
- await reusable.bind(tx).call({op:'saveReceipt',clientId:'c',owner:'o',sequence:1,receipt:'r'});
- assert.equal(calls,1);
 });
 test('push commits business + compacted publication + exact durable receipt together',async()=>{
  const request=push('dedup',1,[mutation(1,'first')]);const receipt=await backend.push('alice',request);const calls=called;
@@ -122,7 +119,7 @@ test('rejected mutation publishes nothing even though it called publish first',a
 });
 test('a handler that throws rejects only its mutation and reaches onError',async()=>{
  const errors=[];
- const crashBackend=createBackend({config,database:prisma(db),authenticate,onError:e=>errors.push(e),handlers:{async edit({input,tx}){
+ const crashBackend=createBackend({config,database:database(),authenticate,onError:e=>errors.push(e),handlers:{async edit({input,tx}){
   await write(tx,input.task.identity.id,input.task.patch.title);
   if(input.task.patch.title==='crash')throw new Error('business crash');
  }},loaders:{task:readTasks}});
@@ -135,7 +132,7 @@ test('a handler that throws rejects only its mutation and reaches onError',async
 });
 test('a handler whose SQL fails leaves an aborted transaction that the savepoint rollback recovers into one rejection',async()=>{
  const errors=[];
- const sqlBackend=createBackend({config,database:prisma(db),authenticate,onError:e=>errors.push(e),handlers:{async edit({input,tx}){
+ const sqlBackend=createBackend({config,database:database(),authenticate,onError:e=>errors.push(e),handlers:{async edit({input,tx}){
   await write(tx,input.task.identity.id,input.task.patch.title);
   // A PostgreSQL error (not a JavaScript one) marks the whole transaction aborted;
   // only ROLLBACK TO SAVEPOINT can make it usable again for the next mutation.
@@ -150,7 +147,7 @@ test('a handler whose SQL fails leaves an aborted transaction that the savepoint
 });
 test('a loader that throws during readback rejects only that mutation',async()=>{
  const errors=[];
- const throwingBackend=createBackend({config,database:prisma(db),authenticate,onError:e=>errors.push(e),handlers:{async edit({input,tx}){await write(tx,input.task.identity.id,input.task.patch.title);}},loaders:{task:async call=>{if(call.ids.some(id=>id.id==='loader-throw-bad'))throw new Error('loader broke');return readTasks(call);}}});
+ const throwingBackend=createBackend({config,database:database(),authenticate,onError:e=>errors.push(e),handlers:{async edit({input,tx}){await write(tx,input.task.identity.id,input.task.patch.title);}},loaders:{task:async call=>{if(call.ids.some(id=>id.id==='loader-throw-bad'))throw new Error('loader broke');return readTasks(call);}}});
  const result=JSON.parse(await throwingBackend.push('alice',push('loader-throw',1,[mutation(1,'ok','loader-throw-ok'),mutation(2,'bad','loader-throw-bad'),mutation(3,'ok2','loader-throw-ok2')])));
  assert.deepEqual(result.rejections,[{ordinal:2,code:'loader.failed'}]);
  assert.equal((await db.$queryRawUnsafe("SELECT * FROM business_task WHERE id='loader-throw-bad'")).length,0,'the loader failure rolled back its write');
@@ -159,7 +156,7 @@ test('a loader that throws during readback rejects only that mutation',async()=>
 });
 test('a handler that breaks the transaction still fails the delivery',async()=>{
  const before=called;let broken=false;
- const breakingBackend=createBackend({config,database:prisma(db),authenticate,handlers:{async edit({input,tx}){
+ const breakingBackend=createBackend({config,database:database(),authenticate,handlers:{async edit({input,tx}){
   called++;
   await write(tx,input.task.identity.id,input.task.patch.title);
   if(!broken){broken=true;try{await tx.$executeRawUnsafe('SELECT 1/0');}catch{}}
@@ -196,7 +193,7 @@ test('a pull reaches the loader of the declared model version and normalizes row
  const v2={name:'Task',version:2,identity:['id'],fields:c.schema.models[0].fields,enums:[]};
  c.models=[v1,v2];
  const reached=[];
- const versioned=createBackend({config:c,database:prisma(db),authenticate,handlers:{},loaders:{task:{
+ const versioned=createBackend({config:c,database:database(),authenticate,handlers:{},loaders:{task:{
   async v1({ids}){reached.push(1);return ids.map(id=>({id:id.id,title:'old'}))},
   async v2({ids}){reached.push(2);return ids.map(id=>({id:id.id,title:'new',note:'n'}))},
  }}});
@@ -213,7 +210,7 @@ test('a pull reaches the loader of the declared model version and normalizes row
  await assert.rejects(()=>versioned.pull('alice',JSON.stringify({clientId:'c',scope:'shared',fromCursor:0,models:{Task:3}})),error=>error instanceof EngineError&&error.code==='model_version_unsupported'&&error.details.model==='Task'&&error.details.version===3);
  await assert.rejects(()=>versioned.pull('alice',JSON.stringify({clientId:'c',scope:'shared',fromCursor:0,models:{Task:2,Ghost:1}})),error=>error instanceof EngineError&&error.code==='model_version_unsupported'&&error.details.model==='Ghost');
  // A row outside the served contract is a loader defect, not silently trimmed.
- const wide=createBackend({config:c,database:prisma(db),authenticate,handlers:{},loaders:{task:{
+ const wide=createBackend({config:c,database:database(),authenticate,handlers:{},loaders:{task:{
   async v1({ids}){return ids.map(id=>({id:id.id,title:'old'}))},
   async v2({ids}){return ids.map(id=>({id:id.id,title:'new',note:'n',extra:true}))},
  }}});
@@ -236,12 +233,12 @@ test('50-row pages retain original cursor progression and remainder reaches head
 test('concurrent same-client retry executes once under PostgreSQL lock',async()=>{const before=called;const request=push('race',1,[mutation(1,'race','race')]);const receipts=await Promise.all([backend.push('alice',request),backend.push('alice',request)]);assert.equal(receipts[0],receipts[1]);assert.equal(called,before+1);});
 test('publication rollback uses user transaction and rejects unregistered models',async()=>{const before=(await pull('shared',56)).toCursor;await assert.rejects(()=>backend.transaction(async({tx,notify})=>{await notify({channel:'shared',records:[{model:'Task',identity:{id:'rollback'}}]});throw new Error('cancel');}),/cancel/);assert.equal((await pull('shared',56)).toCursor,before);await assert.rejects(()=>backend.transaction(({notify})=>notify({channel:'shared',records:[{model:'Unknown',identity:{id:'x'}}]})),/unregistered loader/);});
 test('loader defects abort pull instead of silently advancing its cursor',async()=>{
- const make=load=>createBackend({config:{...config,mutations:[]},database:prisma(db),authenticate,handlers:{},loaders:{task:load}});
+ const make=load=>createBackend({config:{...config,mutations:[]},database:database(),authenticate,handlers:{},loaders:{task:load}});
  await assert.rejects(()=>make(async()=>[]).pull('alice',JSON.stringify({clientId:'c',scope:'shared',fromCursor:56,models:{Task:1}})),/misaligned loader/);
  await assert.rejects(()=>make(async({ids})=>ids.map(()=>({title:'x',unexpected:true}))).pull('alice',JSON.stringify({clientId:'c',scope:'shared',fromCursor:56,models:{Task:1}})),/unknown|state field/);
 });
 test('registered translator rejects one mutation; malformed translator code aborts transaction',async()=>{
- const make=code=>createBackend({config,database:prisma(db),authenticate,translateRejection:()=>code,handlers:{async edit({tx}){await tx.$executeRawUnsafe("INSERT INTO business_task(id,title) VALUES('translated','temporary')");throw new Error('product refusal');}},loaders:{async task(){return []}}});
+ const make=code=>createBackend({config,database:database(),authenticate,translateRejection:()=>code,handlers:{async edit({tx}){await tx.$executeRawUnsafe("INSERT INTO business_task(id,title) VALUES('translated','temporary')");throw new Error('product refusal');}},loaders:{async task(){return []}}});
  const receipt=JSON.parse(await make('product.denied').push('alice',push('translated',1,[mutation(1,'x')])));assert.deepEqual(receipt.rejections,[{ordinal:1,code:'product.denied'}]);assert.equal((await db.$queryRawUnsafe("SELECT * FROM business_task WHERE id='translated'")).length,0);
  await assert.rejects(()=>make('Not a machine code').push('alice',push('bad-translator',1,[mutation(1,'x')])),/stable machine code/);assert.equal((await db.$queryRawUnsafe("SELECT * FROM ahead_client WHERE client_id='bad-translator'")).length,0);
 });
@@ -256,21 +253,21 @@ test('HTTP adapter authenticates and serves the real native persistence path',as
  }finally{await server.close();}
 });
 test('undefined loader entries remain defects and never become tombstones',async()=>{
- const bad=createBackend({config:{...config,mutations:[]},database:prisma(db),authenticate,handlers:{},loaders:{async task({ids}){return ids.map(()=>undefined)}}});
+ const bad=createBackend({config:{...config,mutations:[]},database:database(),authenticate,handlers:{},loaders:{async task({ids}){return ids.map(()=>undefined)}}});
  await assert.rejects(()=>bad.pull('alice',JSON.stringify({clientId:'c',scope:'shared',fromCursor:56,models:{Task:1}})),/undefined|invalid loader/);
 });
 test('publication failures poison push and roll back business writes',async()=>{
- const broken=createBackend({config,database:prisma(db),authenticate,handlers:{async edit({tx,publish}){await tx.$executeRawUnsafe("INSERT INTO business_task(id,title) VALUES('caught','bad')");publish({channel:'shared',records:[{model:'Unknown',identity:{id:'caught'}}]});}},loaders:{async task({ids}){return ids.map(()=>null)}}});
+ const broken=createBackend({config,database:database(),authenticate,handlers:{async edit({tx,publish}){await tx.$executeRawUnsafe("INSERT INTO business_task(id,title) VALUES('caught','bad')");publish({channel:'shared',records:[{model:'Unknown',identity:{id:'caught'}}]});}},loaders:{async task({ids}){return ids.map(()=>null)}}});
  await assert.rejects(()=>broken.push('alice',push('caught',1,[mutation(1,'x')])),/unregistered loader/);
  assert.equal((await db.$queryRawUnsafe("SELECT * FROM business_task WHERE id='caught'")).length,0);assert.equal((await db.$queryRawUnsafe("SELECT * FROM ahead_client WHERE client_id='caught'")).length,0);
 });
 test('nonfinite nullable loader values are defects rather than null clears',async()=>{
  const expanded=structuredClone(config);expanded.schema.models[0].fields.push({name:'score',type:{kind:'scalar',name:'float'},nullable:true});
- expanded.mutations=[];const bad=createBackend({config:expanded,database:prisma(db),authenticate,handlers:{},loaders:{async task({ids}){return ids.map(()=>({title:'x',score:NaN}))}}});
+ expanded.mutations=[];const bad=createBackend({config:expanded,database:database(),authenticate,handlers:{},loaders:{async task({ids}){return ids.map(()=>({title:'x',score:NaN}))}}});
  await assert.rejects(()=>bad.pull('alice',JSON.stringify({clientId:'c',scope:'shared',fromCursor:56,models:{Task:1}})),/nonfinite/);
 });
 test('pending unawaited publication prevents outer transaction commit',async()=>{
- const bad=createBackend({config,database:{transaction:prismaTransactions(db),persistence:tx=>{const storage=new PrismaPersistence(tx);return {call:async r=>{if(r.op==='publish')await new Promise(resolve=>setTimeout(resolve,30));return storage.call(r);}}}},authenticate,handlers:{async edit(){}},loaders:{async task(){return []}}});
+ const bad=createBackend({config,database:{transaction:run,persistence:tx=>{const storage=store(tx);return {call:async r=>{if(r.op==='publish')await new Promise(resolve=>setTimeout(resolve,30));return storage.call(r);}}}},authenticate,handlers:{async edit(){}},loaders:{async task(){return []}}});
  await assert.rejects(()=>db.$transaction(async tx=>{const session=bad.bindTransaction(tx);try{await tx.$executeRawUnsafe("INSERT INTO business_task(id,title) VALUES('unawaited','bad')");void session.notify({channel:'shared',records:[{model:'Task',identity:{id:'unawaited'}}]});await session.assertCommittable();}finally{session.close();}}),/unawaited/);
  assert.equal((await db.$queryRawUnsafe("SELECT * FROM business_task WHERE id='unawaited'")).length,0);
 });
@@ -280,7 +277,7 @@ test('external transaction binding retains swallowed publication failure until i
 });
 test('repeatable-read runner keeps head, scan, and loader coherent across concurrent publication',async()=>{
  await backend.transaction(({notify})=>notify({channel:'snapshot',records:[{model:'Task',identity:{id:'a'}}]}));let changed=false;
- const reader=createBackend({config:{...config,mutations:[]},database:{transaction:prismaTransactions(db),persistence:tx=>{const storage=new PrismaPersistence(tx);return {call:async r=>{const result=await storage.call(r);if(r.op==='head'&&!changed){changed=true;await backend.transaction(({notify})=>notify({channel:'snapshot',records:[{model:'Task',identity:{id:'b'}}]}));}return result;}}}},authenticate,handlers:{},loaders:{async task({ids}){return ids.map(()=>null)}}});
+ const reader=createBackend({config:{...config,mutations:[]},database:{transaction:run,persistence:tx=>{const storage=store(tx);return {call:async r=>{const result=await storage.call(r);if(r.op==='head'&&!changed){changed=true;await backend.transaction(({notify})=>notify({channel:'snapshot',records:[{model:'Task',identity:{id:'b'}}]}));}return result;}}}},authenticate,handlers:{},loaders:{async task({ids}){return ids.map(()=>null)}}});
  const page=JSON.parse(await reader.pull('alice',JSON.stringify({clientId:'c',scope:'snapshot',fromCursor:0,models:{Task:1}})));assert.equal(page.toCursor,1);assert.equal(page.changes.length,1);
  const next=JSON.parse(await reader.pull('alice',JSON.stringify({clientId:'c',scope:'snapshot',fromCursor:1,models:{Task:1}})));assert.equal(next.toCursor,2);assert.equal(next.changes.length,1);
 });
@@ -383,12 +380,6 @@ test('loader safely converts PostgreSQL BigInt scalar and list values without wi
     await assert.rejects(bigintBackend.pull('alice', request), /bigint outside safe integer range/);
   }
 });
-test('prisma() bundles the transaction runner and the persistence factory',async()=>{
- const adapter=prisma(db);
- assert.equal(typeof adapter.transaction,'function');
- const bound=adapter.persistence({$queryRawUnsafe:async()=>[{head:7}],$executeRawUnsafe:async()=>1});
- assert.equal(await bound.call({op:'head',channel:'x'}),7);
-});
 test('listen answers pull over HTTP with authentication and closes cleanly',async()=>{
  const server=await backend.listen({port:0});
  try{
@@ -398,7 +389,7 @@ test('listen answers pull over HTTP with authentication and closes cleanly',asyn
 });
 test('onError captures server-side failures and HTTP responds with {code:"server"}',async()=>{
  const errors=[];
- const boomBackend=createBackend({config,database:prisma(db),authenticate:async()=>{throw new Error('boom')},onError:e=>errors.push(e),handlers:{async edit(){}},loaders:{async task({ids}){return ids.map(()=>null)}}});
+ const boomBackend=createBackend({config,database:database(),authenticate:async()=>{throw new Error('boom')},onError:e=>errors.push(e),handlers:{async edit(){}},loaders:{async task({ids}){return ids.map(()=>null)}}});
  const server=await boomBackend.listen({port:0});
  try{
   const result=await fetch(`${server.url}/sync/mutations`,{method:'POST',headers:{authorization:'Bearer alice'},body:push('boom',1,[mutation(1,'x','boom-a')])});
@@ -438,12 +429,12 @@ test('explicit records publish only those, never join the change set, and are in
  assert.equal(page.changes.some(c=>c.identity.id.startsWith('pub-only-')),false,'the changed records went to shared only');
 });
 test('a loader refusal during push rejects only that mutation; so does a thrown loader error',async()=>{
- const make=load=>createBackend({config,database:prisma(db),authenticate,handlers:{async edit({input,tx,publish}){await write(tx,input.task.identity.id,input.task.patch.title);publish({channel:'shared'});}},loaders:{task:load}});
+ const make=load=>createBackend({config,database:database(),authenticate,handlers:{async edit({input,tx,publish}){await write(tx,input.task.identity.id,input.task.patch.title);publish({channel:'shared'});}},loaders:{task:load}});
  const refusing=make(async call=>{if(call.ids.some(id=>id.id==='ld-forbidden'))throw new MutationRejected('task.forbidden');return readTasks(call);});
  const receipt=JSON.parse(await refusing.push('alice',push('loader-refuse',1,[mutation(1,'ok','ld-ok'),mutation(2,'hidden','ld-forbidden'),mutation(3,'ok','ld-last')])));
  assert.deepEqual(receipt.rejections,[{ordinal:2,code:'task.forbidden'}]);assert.deepEqual(receipt.records,[authority('ld-last',1,{title:'ok'}),authority('ld-ok',1,{title:'ok'})]);
  assert.equal((await db.$queryRawUnsafe("SELECT * FROM business_task WHERE id='ld-forbidden'")).length,0,'the refused mutation rolled back its write');assert.equal(await recordStamp('ld-forbidden'),null,'and its stamp');assert.deepEqual(await invalidations('ld-forbidden'),[],'and its publication');
- const translated=createBackend({config,database:prisma(db),authenticate,translateRejection:()=>'task.translated',handlers:{async edit({input,tx}){await write(tx,input.task.identity.id,input.task.patch.title);}},loaders:{async task(){throw new Error('product read refusal');}}});
+ const translated=createBackend({config,database:database(),authenticate,translateRejection:()=>'task.translated',handlers:{async edit({input,tx}){await write(tx,input.task.identity.id,input.task.patch.title);}},loaders:{async task(){throw new Error('product read refusal');}}});
  assert.deepEqual(JSON.parse(await translated.push('alice',push('loader-translated',1,[mutation(1,'x','ld-translated')]))).rejections,[{ordinal:1,code:'task.translated'}]);
  const crashing=JSON.parse(await make(async()=>{throw new Error('loader crash');}).push('alice',push('loader-crash',1,[mutation(1,'x','ld-crash')])));
  assert.deepEqual(crashing.rejections,[{ordinal:1,code:'loader.failed'}]);
@@ -456,7 +447,7 @@ test('publish validates channel and records; the invalid call rejects only that 
  assert.equal((await db.$queryRawUnsafe("SELECT * FROM business_task WHERE id IN ('bad-a','bad-b','bad-c')")).length,0,'the failed mutations rolled back their writes');
 });
 test('a handler may keep using the transaction after publish; the publication goes out with the commit',async()=>{
- const deferredBackend=createBackend({config,database:prisma(db),authenticate,handlers:{async edit({input,tx,publish}){
+ const deferredBackend=createBackend({config,database:database(),authenticate,handlers:{async edit({input,tx,publish}){
   const {identity,patch}=input.task;
   publish({channel:'deferred'});
   await write(tx,identity.id,patch.title);
@@ -472,7 +463,7 @@ test('an all-rejected batch settles with no records',async()=>{
  assert.deepEqual(receipt,{batchSequence:1,clientId:'allrej',records:[],rejections:[{ordinal:1,code:'task.refused'}]});
 });
 test('advanceStamp increments without a channel: no invalidation, no channel head',async()=>{
- const stamps=await db.$transaction(async tx=>{const storage=new PrismaPersistence(tx);const ref={model:'Task',identityKey:key('stamped')};return [await storage.call({op:'advanceStamp',...ref}),await storage.call({op:'advanceStamp',...ref})];});
+ const stamps=await db.$transaction(async tx=>{const storage=store(tx);const ref={model:'Task',identityKey:key('stamped')};return [await storage.call({op:'advanceStamp',...ref}),await storage.call({op:'advanceStamp',...ref})];});
  assert.deepEqual(stamps,[1,2]);assert.equal(await recordStamp('stamped'),2);assert.deepEqual(await invalidations('stamped'),[]);
  assert.equal((await db.$queryRawUnsafe("SELECT * FROM ahead_channel WHERE channel LIKE 'stamp%'")).length,0);
 });
@@ -491,22 +482,22 @@ test('an external notify advances the stamp on every call; a push publishing an 
  assert.equal(await recordStamp('pub-only'),start+2,'publication alone is distribution');assert.deepEqual(await invalidations('pub-only'),[['other',cursor+1,start+2]]);
 });
 test('concurrent first publications initialise one stamp of 1 and never overwrite an established one',async()=>{
- const ensure=tx=>new PrismaPersistence(tx).call({op:'ensureStamp',model:'Task',identityKey:key('ensure-race')});
+ const ensure=tx=>store(tx).call({op:'ensureStamp',model:'Task',identityKey:key('ensure-race')});
  // The production runner: REPEATABLE READ with serialization retries, so a
  // loser that sees the winner's row only after its snapshot retries and reads 1.
- const run=prismaTransactions(db);
+ 
  assert.deepEqual(await Promise.all([run(ensure),run(ensure),run(ensure)]),[1,1,1]);
  assert.equal((await db.$queryRawUnsafe('SELECT * FROM ahead_record WHERE identity_key=$1',key('ensure-race'))).length,1);
- await db.$transaction(tx=>new PrismaPersistence(tx).call({op:'advanceStamp',model:'Task',identityKey:key('ensure-race')}));
+ await db.$transaction(tx=>store(tx).call({op:'advanceStamp',model:'Task',identityKey:key('ensure-race')}));
  assert.equal(await db.$transaction(ensure),2,'ensureStamp keeps an advanced stamp');
 });
 test('a rolled-back transaction removes a first initialisation together with its publication',async()=>{
- await assert.rejects(()=>db.$transaction(async tx=>{const storage=new PrismaPersistence(tx);const stamp=await storage.call({op:'ensureStamp',model:'Task',identityKey:key('undone')});await storage.call({op:'publish',channel:'undone',model:'Task',identity:{id:'undone'},identityKey:key('undone'),stamp});throw new Error('cancel');}),/cancel/);
+ await assert.rejects(()=>db.$transaction(async tx=>{const storage=store(tx);const stamp=await storage.call({op:'ensureStamp',model:'Task',identityKey:key('undone')});await storage.call({op:'publish',channel:'undone',model:'Task',identity:{id:'undone'},identityKey:key('undone'),stamp});throw new Error('cancel');}),/cancel/);
  assert.equal(await recordStamp('undone'),null);assert.deepEqual(await invalidations('undone'),[]);assert.equal(await head('undone'),0);
 });
 test('publish refuses a record without metadata or with a stamp that is not its current one',async()=>{
- await assert.rejects(()=>db.$transaction(tx=>new PrismaPersistence(tx).call({op:'publish',channel:'stale',model:'Task',identity:{id:'unstamped'},identityKey:key('unstamped'),stamp:1})),/Record metadata missing/);
- await assert.rejects(()=>db.$transaction(async tx=>{const storage=new PrismaPersistence(tx);await storage.call({op:'ensureStamp',model:'Task',identityKey:key('stale')});await storage.call({op:'publish',channel:'stale',model:'Task',identity:{id:'stale'},identityKey:key('stale'),stamp:2});}),/names stamp 2 .* is at stamp 1/);
+ await assert.rejects(()=>db.$transaction(tx=>store(tx).call({op:'publish',channel:'stale',model:'Task',identity:{id:'unstamped'},identityKey:key('unstamped'),stamp:1})),/Record metadata missing/);
+ await assert.rejects(()=>db.$transaction(async tx=>{const storage=store(tx);await storage.call({op:'ensureStamp',model:'Task',identityKey:key('stale')});await storage.call({op:'publish',channel:'stale',model:'Task',identity:{id:'stale'},identityKey:key('stale'),stamp:2});}),/names stamp 2 .* is at stamp 1/);
  assert.equal(await head('stale'),0);assert.deepEqual(await invalidations('stale'),[]);
 });
 test('scan pairs the invalidation cursor with the current record stamp; a missing record row is a storage defect',async()=>{
@@ -516,10 +507,10 @@ test('scan pairs the invalidation cursor with the current record stamp; a missin
  assert.equal(await recordStamp('join-a'),2);assert.deepEqual(await invalidations('join-a'),[['shared',cursor,1]],'no publication: the invalidation row is untouched');
  const page=await pull('shared',cursor-1);
  assert.deepEqual(page.changes[0],{syncId:cursor,model:'Task',identity:{id:'join-a'},stamp:2,state:{title:'quiet'}},'the original cursor with the current stamp and content');
- const rows=await db.$transaction(tx=>new PrismaPersistence(tx).call({op:'scan',channel:'shared',after:cursor-1,limit:1}));assert.deepEqual(rows.map(r=>[r.cursor,r.stamp]),[[cursor,2]]);
- await db.$transaction(async tx=>{const storage=new PrismaPersistence(tx);const stamp=await storage.call({op:'ensureStamp',model:'Task',identityKey:key('orphan')});await storage.call({op:'publish',channel:'orphan',model:'Task',identity:{id:'orphan'},identityKey:key('orphan'),stamp});});
+ const rows=await db.$transaction(tx=>store(tx).call({op:'scan',channel:'shared',after:cursor-1,limit:1}));assert.deepEqual(rows.map(r=>[r.cursor,r.stamp]),[[cursor,2]]);
+ await db.$transaction(async tx=>{const storage=store(tx);const stamp=await storage.call({op:'ensureStamp',model:'Task',identityKey:key('orphan')});await storage.call({op:'publish',channel:'orphan',model:'Task',identity:{id:'orphan'},identityKey:key('orphan'),stamp});});
  await db.$executeRawUnsafe('DELETE FROM ahead_record WHERE identity_key=$1',key('orphan'));
- await assert.rejects(()=>db.$transaction(tx=>new PrismaPersistence(tx).call({op:'scan',channel:'orphan',after:0,limit:50})),/Record metadata missing/);
+ await assert.rejects(()=>db.$transaction(tx=>store(tx).call({op:'scan',channel:'orphan',after:0,limit:50})),/Record metadata missing/);
  await assert.rejects(()=>pull('orphan',0),/Record metadata missing/);
 });
 test('concurrent notifies of one record receive distinct stamps',async()=>{
@@ -583,7 +574,7 @@ test('HTTP maps engine codes to statuses: 403, 409 gap/overlap/version fields, 4
   const overlap=await post('/sync/mutations',push('map',1,[mutation(9,'other','map-a')]));assert.equal(overlap.status,200,'a retry of the accepted sequence returns its receipt');
   await backend.push('alice',push('map',2,[mutation(2,'second','map-a')]));
   const behind=await post('/sync/mutations',push('map',1,[mutation(1,'one','map-a')]));assert.equal(behind.status,409);assert.deepEqual(await behind.json(),{code:'overlap'});
-  const bobBackend=createBackend({config,database:prisma(db),authenticate:async req=>req.headers.authorization==='Bearer bob'?'bob':null,handlers:{async edit(){}},loaders:{async task({ids}){return ids.map(()=>null)}}});
+  const bobBackend=createBackend({config,database:database(),authenticate:async req=>req.headers.authorization==='Bearer bob'?'bob':null,handlers:{async edit(){}},loaders:{async task({ids}){return ids.map(()=>null)}}});
   const bobServer=await bobBackend.listen({port:0});
   try{const owner=await fetch(`${bobServer.url}/sync/mutations`,{method:'POST',headers:{authorization:'Bearer bob'},body:push('map',3,[mutation(3,'x','map-a')])});assert.equal(owner.status,403);assert.deepEqual(await owner.json(),{code:'client.owner_mismatch'});}
   finally{await bobServer.close();}
@@ -626,20 +617,20 @@ test('HTTP classifies native failures by code, not message wording; unknown code
   assert.equal(errors.length,3);assert.ok(!(errors[2] instanceof EngineError));assert.equal(errors[2].message,'not json at all');
  }finally{await server.close();}
 });
-test('prismaTransactions retries only serialization failures, a bounded number of times, and reports the last one',async()=>{
+test('the Prisma driver retries only serialization failures, a bounded number of times, and reports the last one',async()=>{
  const attempts=[];const bodies=[];
  const failing=(codes)=>({async $transaction(body,options){attempts.push(options);const code=codes.shift();await body({attempt:attempts.length});bodies.push(attempts.length);if(code)throw Object.assign(new Error(`fail ${code.code}`),code);return 'committed';}});
  const conflict={code:'P2034'};const rawConflict={code:'P2010',meta:{code:'40001'}};const deadlock={code:'P2010',meta:{code:'40P01'}};const unique={code:'P2002'};
- assert.equal(await prismaTransactions(failing([conflict,rawConflict,deadlock]))(async()=>'body'),'committed','the fourth attempt succeeds within the default of three retries');
+ assert.equal(await prismaDriver(failing([conflict,rawConflict,deadlock])).transaction(async()=>'body'),'committed','the fourth attempt succeeds within the default of three retries');
  assert.equal(attempts.length,4);assert.deepEqual(bodies,[1,2,3,4],'the body runs once per attempt');assert.deepEqual(attempts[0],{isolationLevel:'RepeatableRead',timeout:20000});
  attempts.length=0;bodies.length=0;
- await assert.rejects(()=>prismaTransactions(failing([conflict,conflict,conflict,conflict]))(async()=>{}),error=>error.code==='P2034'&&error.message==='fail P2034');
+ await assert.rejects(()=>prismaDriver(failing([conflict,conflict,conflict,conflict])).transaction(async()=>{}),error=>error.code==='P2034'&&error.message==='fail P2034');
  assert.equal(attempts.length,4,'three retries after the first attempt, then the failure is reported');
  attempts.length=0;
- await assert.rejects(()=>prismaTransactions(failing([conflict,conflict]),{retries:1})(async()=>{}),error=>error.code==='P2034');
+ await assert.rejects(()=>prismaDriver(failing([conflict,conflict]),{retries:1}).transaction(async()=>{}),error=>error.code==='P2034');
  assert.equal(attempts.length,2,'retries is the number of additional attempts');
  attempts.length=0;
- await assert.rejects(()=>prismaTransactions(failing([unique]))(async()=>{}),error=>error.code==='P2002');
+ await assert.rejects(()=>prismaDriver(failing([unique])).transaction(async()=>{}),error=>error.code==='P2002');
  assert.equal(attempts.length,1,'a non-serialization failure is not retried');
  attempts.length=0;
  const bundled=prisma(failing([conflict]),{retries:1,timeout:5});await bundled.transaction(async()=>{});
@@ -647,7 +638,7 @@ test('prismaTransactions retries only serialization failures, a bounded number o
 });
 test('a RepeatableRead conflict on the real database retries the whole body once and commits it exactly once',async()=>{
  await db.$executeRawUnsafe("INSERT INTO ahead_channel(channel,head) VALUES('serial',0) ON CONFLICT(channel) DO UPDATE SET head=0");
- const run=prismaTransactions(db);let bodies=0;let entered,release;const inside=new Promise(resolve=>{entered=resolve;});const gate=new Promise(resolve=>{release=resolve;});
+ let bodies=0;let entered,release;const inside=new Promise(resolve=>{entered=resolve;});const gate=new Promise(resolve=>{release=resolve;});
  const first=run(async tx=>{bodies++;const [{head}]=await tx.$queryRawUnsafe("SELECT head FROM ahead_channel WHERE channel='serial'");if(bodies===1){entered();await gate;}
   await tx.$executeRawUnsafe("UPDATE ahead_channel SET head=head+1 WHERE channel='serial'");return Number(head);});
  await inside;
@@ -656,7 +647,7 @@ test('a RepeatableRead conflict on the real database retries the whole body once
  assert.equal(await first,10,'the retried body read the snapshot taken after the concurrent commit');
  assert.equal(bodies,2,'the first attempt failed with a serialization error after the concurrent update and the body ran again');
  assert.equal(Number((await db.$queryRawUnsafe("SELECT head FROM ahead_channel WHERE channel='serial'"))[0].head),11,'the rolled-back attempt left nothing behind and the retry committed once');
- const exhausted=prismaTransactions(db,{retries:0});bodies=0;let entered2,release2;const inside2=new Promise(resolve=>{entered2=resolve;});const gate2=new Promise(resolve=>{release2=resolve;});
+ const exhausted=prismaDriver(db,{retries:0}).transaction;bodies=0;let entered2,release2;const inside2=new Promise(resolve=>{entered2=resolve;});const gate2=new Promise(resolve=>{release2=resolve;});
  const second=exhausted(async tx=>{bodies++;await tx.$queryRawUnsafe("SELECT head FROM ahead_channel WHERE channel='serial'");entered2();await gate2;await tx.$executeRawUnsafe("UPDATE ahead_channel SET head=head+1 WHERE channel='serial'");});
  await inside2;await db.$executeRawUnsafe("UPDATE ahead_channel SET head=head+10 WHERE channel='serial'");release2();
  await assert.rejects(second,error=>error.code==='P2034'||(error.code==='P2010'&&error.meta?.code==='40001'));
@@ -664,7 +655,7 @@ test('a RepeatableRead conflict on the real database retries the whole body once
 });
 test('an upgrade whose authentication completes after close begins is refused with 503; missing and invalid credentials are refused with 401',async()=>{
  let release;const gate=new Promise(resolve=>{release=resolve;});const seen=[];
- const gated=createBackend({config,database:prisma(db),authenticate:async req=>{seen.push(req.headers.authorization);if(req.headers.authorization==='Bearer slow'){await gate;return 'alice';}return req.headers.authorization==='Bearer alice'?'alice':null;},handlers:{async edit(){}},loaders:{async task({ids}){return ids.map(()=>null)}}});
+ const gated=createBackend({config,database:database(),authenticate:async req=>{seen.push(req.headers.authorization);if(req.headers.authorization==='Bearer slow'){await gate;return 'alice';}return req.headers.authorization==='Bearer alice'?'alice':null;},handlers:{async edit(){}},loaders:{async task({ids}){return ids.map(()=>null)}}});
  const server=await gated.listen({port:0});const ws=server.url.replace('http','ws');
  const refusal=socket=>new Promise(resolve=>{socket.on('error',error=>resolve(String(error.message)));socket.on('open',()=>resolve('open'));});
  try{
@@ -681,7 +672,7 @@ test('an upgrade whose authentication completes after close begins is refused wi
 test('a version dispatches only to its own handler and a function registers v1',async()=>{
  const seen=[];
  const record=tag=>async({input,publish})=>{seen.push([tag,input.task.patch.title]);publish({channel:'registration'});};
- const make=(handlers,mutations=config.mutations)=>createBackend({config:{...config,schema:structuredClone(schema),mutations},database:prisma(db),authenticate,handlers,loaders:{async task({ids}){return ids.map(()=>null)}}});
+ const make=(handlers,mutations=config.mutations)=>createBackend({config:{...config,schema:structuredClone(schema),mutations},database:database(),authenticate,handlers,loaders:{async task({ids}){return ids.map(()=>null)}}});
  const shorthand=JSON.parse(await make({edit:record('function')}).push('alice',push('register-function',1,[mutation(1,'same','reg-a')])));
  const explicit=JSON.parse(await make({edit:{v1:record('v1 key')}}).push('alice',push('register-v1-key',1,[mutation(1,'same','reg-a')])));
  assert.deepEqual(seen,[['function','same'],['v1 key','same']],'both registrations reach the same v1 handler');
@@ -704,7 +695,7 @@ test('concurrent same-client delivery with different bodies commits at most one 
 test('fresh framework tables omit request_hash; a table that still carries the column keeps replaying receipts',async()=>{
  const columns=async()=>(await db.$queryRawUnsafe("SELECT column_name FROM information_schema.columns WHERE table_name='ahead_client'")).map(row=>row.column_name).sort();
  assert.deepEqual(await columns(),['client_id','owner_id','receipt','sequence']);
- const migration=(await readFile(new URL('../../../packages/persistence-prisma/migration.sql',import.meta.url),'utf8')).split(';').map(x=>x.trim()).filter(Boolean);
+ const migration=(await readFile(new URL('../../../packages/postgres/migration.sql',import.meta.url),'utf8')).split(';').map(x=>x.trim()).filter(Boolean);
  const before=called;const request=push('legacy-column',1,[mutation(1,'legacy','legacy-column')]);let receipt;
  await db.$executeRawUnsafe('ALTER TABLE ahead_client ADD COLUMN request_hash text');
  try{
@@ -726,7 +717,7 @@ test('the live stream serves the declared model version and refuses an unretaine
  const v1={name:'Task',version:1,identity:['id'],fields:schema.models[0].fields,enums:[]};
  c.schema.models[0].fields=[...schema.models[0].fields,{name:'note',type:{kind:'scalar',name:'string'},nullable:true}];
  c.models=[v1,{name:'Task',version:2,identity:['id'],fields:c.schema.models[0].fields,enums:[]}];
- const versioned=createBackend({config:c,database:prisma(db),authenticate,handlers:{},loaders:{task:{
+ const versioned=createBackend({config:c,database:database(),authenticate,handlers:{},loaders:{task:{
   async v1({ids}){return ids.map(id=>({id:id.id,title:'old'}))},
   async v2({ids}){return ids.map(id=>({id:id.id,title:'new',note:'n'}))},
  }}});

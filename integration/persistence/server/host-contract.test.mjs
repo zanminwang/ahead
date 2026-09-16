@@ -7,7 +7,7 @@ import {readFile} from 'node:fs/promises';
 import {createRequire} from 'node:module';
 import {createBackend,MutationRejected} from '../../../packages/server/index.mts';
 import {HOST_OPERATIONS} from '../../../packages/server/host-contract.mts';
-import {PrismaPersistence} from '../../../packages/persistence-prisma/index.mts';
+import {answer,persistence} from '../../../packages/postgres/index.mts';
 const require=createRequire(import.meta.url);
 const native=require('../../../bindings/node/ahead-node.node');
 const fixture=JSON.parse(await readFile(new URL('../../../fixtures/protocol/host-operations.json',import.meta.url),'utf8'));
@@ -126,14 +126,12 @@ test('a thrown loader error answers as a failure and reaches onError',async()=>{
  assert.equal(errors.length,1);assert.equal(errors[0].message,'boom');
 });
 
-test('Prisma persistence answers the persistence half and refuses application operations',async()=>{
- const tx={
-  $queryRawUnsafe:async sql=>sql.startsWith('SELECT head')?[{head:6}]:[],
-  $executeRawUnsafe:async()=>1,
- };
- const bound=new PrismaPersistence().bind(tx);
+test('the PostgreSQL persistence answers the persistence half through a two-method driver and refuses application operations',async()=>{
+ const driver={transaction:body=>body('tx'),query:async(tx,sql)=>sql.startsWith('SELECT head')?[{head:6}]:[]};
+ const bound=persistence(driver).persistence('tx');
  assert.equal(await bound.call(entry('head').request),response('head','cursor'));
  assert.equal(await bound.call(entry('savepoint').request),null);
+ assert.equal(await answer(driver,'tx',entry('head').request),6);
  for(const op of ['handle','load'])
   await assert.rejects(()=>bound.call(entry(op).request),/Unsupported persistence operation/);
  await assert.rejects(()=>bound.call({op:'vacuum'}),/Unsupported persistence operation vacuum/);

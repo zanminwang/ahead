@@ -12,7 +12,8 @@
   "include": [
     "packages/client-js/*.mts",
     "packages/server/*.mts",
-    "packages/persistence-prisma/*.mts",
+    "packages/postgres/*.mts",
+    "packages/postgres/src/*.mts",
     "integration/e2e/fixtures/round-trip/*.mts",
     "examples/todo/*.mts"
   ]

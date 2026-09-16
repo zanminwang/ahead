@@ -78,7 +78,7 @@ Future<void> uploadFile(dynamic key) async {}
         backend = Path(temp) / 'backend.mts'
         backend.write_text('''import { PrismaClient, type Prisma } from '@prisma/client';
 import { createBackend, devAuth, Entry, MutationRejected, type Handlers, type Loaders } from '../generated/backend.ts';
-import { prisma } from '../../../../../packages/persistence-prisma/index.mts';
+import { prisma } from '../../../../../packages/postgres/index.mts';
 import type { Database, Publish } from '../../../../../packages/server/index.mts';
 type Tx = Prisma.TransactionClient;
 declare function canEdit(tx: Tx, userId: string, identity: { id: string }): Promise<boolean>;
