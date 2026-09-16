@@ -408,3 +408,133 @@ fn scalar(ty: ScalarType, v: &Value) -> Result<Value> {
         _ => Err(invalid("invalid scalar type")),
     }
 }
+
+/// How a compiled schema relates to the one a local database was built for.
+/// The rules are the model read-contract rules ([Models §9](../../../docs/engineering/architecture/schema/models.md)):
+/// within a model version only an added nullable field (or one with a
+/// default) is compatible; everything else needs a rebuild.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Compatibility {
+    Identical,
+    Additive(Vec<AdditiveStep>),
+    Incompatible(String),
+}
+
+/// One change the storage layer can apply in place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdditiveStep {
+    AddModel(String),
+    AddField { model: String, field: String },
+}
+
+impl Schema {
+    /// Classify `incoming` against `stored`, the schema the database was
+    /// built for. Requirements, prerequisites and client policies are not
+    /// storage and do not take part.
+    pub fn compatibility(stored: &Schema, incoming: &Schema) -> Compatibility {
+        let mut steps = vec![];
+        let enum_of = |schema: &Schema, name: &str| -> Option<Vec<String>> {
+            schema
+                .enums
+                .iter()
+                .find(|e| e.name == name)
+                .map(|e| e.values.clone())
+        };
+        for old in &stored.models {
+            let Some(new) = incoming.models.iter().find(|m| m.name == old.name) else {
+                return Compatibility::Incompatible(format!("model {} was removed", old.name));
+            };
+            if new.version != old.version {
+                return Compatibility::Incompatible(format!(
+                    "model {} changed version from {} to {}",
+                    old.name, old.version, new.version
+                ));
+            }
+            if new.identity != old.identity {
+                return Compatibility::Incompatible(format!(
+                    "model {} changed its identity",
+                    old.name
+                ));
+            }
+            if new.unique != old.unique {
+                return Compatibility::Incompatible(format!(
+                    "model {} changed its unique constraints",
+                    old.name
+                ));
+            }
+            let relation = |r: &RelationDescriptor| {
+                (
+                    r.name.clone(),
+                    r.target.clone(),
+                    r.fields.clone(),
+                    r.target_fields.clone(),
+                    r.on_delete.clone(),
+                )
+            };
+            let mut old_relations: Vec<_> = old.relations.iter().map(relation).collect();
+            let mut new_relations: Vec<_> = new.relations.iter().map(relation).collect();
+            old_relations.sort();
+            new_relations.sort();
+            if old_relations != new_relations {
+                return Compatibility::Incompatible(format!(
+                    "model {} changed its relations",
+                    old.name
+                ));
+            }
+            for field in &old.fields {
+                match new.fields.iter().find(|f| f.name == field.name) {
+                    None => {
+                        return Compatibility::Incompatible(format!(
+                            "field {}.{} was removed or renamed",
+                            old.name, field.name
+                        ));
+                    }
+                    Some(next) => {
+                        let same_type = serde_json::to_value(&next.value_type).ok()
+                            == serde_json::to_value(&field.value_type).ok();
+                        if !same_type || next.nullable != field.nullable {
+                            return Compatibility::Incompatible(format!(
+                                "field {}.{} changed its type or nullability",
+                                old.name, field.name
+                            ));
+                        }
+                        if let ValueType::Enum { name } = &field.value_type
+                            && enum_of(stored, name) != enum_of(incoming, name)
+                        {
+                            return Compatibility::Incompatible(format!(
+                                "enum {name} used by {}.{} changed its values",
+                                old.name, field.name
+                            ));
+                        }
+                    }
+                }
+            }
+            for field in &new.fields {
+                if old.fields.iter().any(|f| f.name == field.name) {
+                    continue;
+                }
+                if field.nullable || field.default.is_some() {
+                    steps.push(AdditiveStep::AddField {
+                        model: new.name.clone(),
+                        field: field.name.clone(),
+                    });
+                } else {
+                    return Compatibility::Incompatible(format!(
+                        "field {}.{} is required and has no default",
+                        new.name, field.name
+                    ));
+                }
+            }
+        }
+        for new in &incoming.models {
+            if !stored.models.iter().any(|m| m.name == new.name) {
+                steps.push(AdditiveStep::AddModel(new.name.clone()));
+            }
+        }
+        if steps.is_empty() {
+            Compatibility::Identical
+        } else {
+            Compatibility::Additive(steps)
+        }
+    }
+}
