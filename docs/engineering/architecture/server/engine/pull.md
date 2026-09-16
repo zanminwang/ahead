@@ -10,7 +10,7 @@ Input: the owner, a [pull request](../../protocol/pull.md) (or, for the live str
 
 ## 5. Building Block View
 
-Pull reads two things: the **invalidation table**, which holds one row per `(channel, model, record)` at the record's latest position in that channel, joined with the record's *current* stamp from the stamp table (`scan`; a row whose record has no stamp metadata is a storage error), and the **loaders**, which supply current content. It writes nothing. The stamp comes from the record, not the invalidation row, because a change advances a stamp whether or not it is published ([Notify](notify.md)); the cursor is delivery progress only.
+Pull reads two things: the **invalidation table**, which holds one row per `(channel, model, record)` at the record's latest position in that channel, joined with the record's *current* stamp from the stamp table (`scan`; a row whose record has no stamp metadata is a storage error), and the **loaders**, which supply current content. It writes nothing. The stamp comes from the record, not the invalidation row, because a change advances a stamp whether or not it is published ([Publish](publish.md)); the cursor is delivery progress only.
 
 Code: `process_pull` in [server/lib.rs](../../../../../crates/server/src/lib.rs); the live wrapper in [server/live.rs](../../../../../crates/server/src/live.rs).
 

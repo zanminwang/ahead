@@ -14,7 +14,7 @@ A backend author writes handlers (one per mutation) and loaders (one per model) 
 | Change set | `changes.records` (the records the uploaded operations target) and `changes.add(record)` for a record the handler changed beyond them; every member is stamped, read back and returned in the receipt |
 | Loader | `({ids, tx, userId}: LoaderCall) => Promise<(Row \| null)[]>`, aligned with `ids`; one per retained model version, `Row` being that version's record type; no channel |
 | Rejecting one mutation, or refusing a read | throw `MutationRejected(code)`, or throw anything `translateRejection` maps to a code; from a loader in a push this rejects the mutation, in a pull it fails the page |
-| Publishing | `publish({channel})` or `publish({channel, records})` (`PublishArgs`) inside a handler; `backend.transaction(async ({tx, notify}) => …)` outside one (`bindTransaction(tx).notify({channel, records})` for a transaction your framework already owns), which advance a stamp per record ([Notify](../../server/engine/notify.md)) |
+| Publishing | `publish({channel})` or `publish({channel, records})` (`PublishArgs`) inside a handler; `backend.transaction(async ({tx, notify}) => …)` outside one (`bindTransaction(tx).notify({channel, records})` for a transaction your framework already owns), which advance a stamp per record ([Publish](../../server/engine/publish.md)) |
 | Serving | `backend.listen({port, host?})` → `{url, close}` |
 | Development auth | `devAuth()` treats the bearer token as the user id; documented as development only |
 

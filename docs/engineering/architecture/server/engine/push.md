@@ -11,7 +11,7 @@ Input: the authenticated owner, the request bytes ([Protocol / Push](../../proto
 ## 5. Building Block View
 
 - **Decoder.** Turns wire operations into handler arguments and lists the records they target, as described with the schema rules in [Mutations](../../schema/mutations.md).
-- **Readback.** Per mutation: the *change set* (uploaded targets plus the handler's `changes`), one `advanceStamp` per changed record, one `load` per changed model at the version the request declared, normalization against that version's retained contract, then the publications the handler asked for ([Notify](notify.md)). Its outcome is the mutation's authority records or a refusal code.
+- **Readback.** Per mutation: the *change set* (uploaded targets plus the handler's `changes`), one `advanceStamp` per changed record, one `load` per changed model at the version the request declared, normalization against that version's retained contract, then the publications the handler asked for ([Publish](publish.md)). Its outcome is the mutation's authority records or a refusal code.
 - **Receipt assembly.** The last successful authority per record, in canonical key order, with the rejections.
 
 Code: `process_push` and `decode` in [server/lib.rs](../../../../../crates/server/src/lib.rs); `read_back` in [server/readback.rs](../../../../../crates/server/src/readback.rs).
@@ -30,7 +30,7 @@ Code: `process_push` and `decode` in [server/lib.rs](../../../../../crates/serve
     Rolling a mutation back issues `rollback {ordinal}` then `release`; a `rollback` call that itself errors fails the whole delivery with `host` — nothing commits, no receipt is saved, and the client resends the same bytes. The savepoint is released either way on success. A record's authority from a later successful mutation replaces an earlier one's; a later rejected mutation replaces nothing.
 5. **Build the receipt.** The client id, the batch sequence, the rejections and the final authority per record, stored with `saveReceipt` and returned.
 
-All of this happens in the transaction the application opened, so business writes, stamps, publications, the client row and the receipt commit or roll back together. A batch that aborts leaves the client row untouched, and the client's retry is still `last + 1`. Subscribers are woken after commit ([Notify](notify.md)).
+All of this happens in the transaction the application opened, so business writes, stamps, publications, the client row and the receipt commit or roll back together. A batch that aborts leaves the client row untouched, and the client's retry is still `last + 1`. Subscribers are woken after commit ([Publish](publish.md)).
 
 ## 9. Architecture Decisions
 

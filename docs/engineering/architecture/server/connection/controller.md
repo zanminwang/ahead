@@ -6,7 +6,7 @@ The server controller holds one WebSocket per client, learns its channels once, 
 
 ## 3. Context and Scope
 
-Input: an authenticated socket from the [transport](transport.md), commit wakes from [Notify](../engine/notify.md). Output: the acknowledgement and pages defined in [Protocol / Subscriptions](../../protocol/subscriptions.md). Negotiation and every page run inside a database transaction through the [backend interface](../backend-interface.md).
+Input: an authenticated socket from the [transport](transport.md), commit wakes from [Publish](../engine/publish.md). Output: the acknowledgement and pages defined in [Protocol / Subscriptions](../../protocol/subscriptions.md). Negotiation and every page run inside a database transaction through the [backend interface](../backend-interface.md).
 
 ## 5. Building Block View
 
@@ -49,4 +49,4 @@ Verified 2026-09-15: `cargo test -p ahead-server --locked` and `bash integration
 
 **Potential risk.** Every commit that touches a channel triggers one pull transaction per subscribed socket; there is no shared page cache. Not measured ([#12](https://github.com/zanminwang/ahead/issues/12)).
 
-**Accepted limitations.** Wakes are process-local ([Notify](../engine/notify.md)). Changing channels requires a new socket, and a subscribe may name any number of channels.
+**Accepted limitations.** Wakes are process-local ([Publish](../engine/publish.md)). Changing channels requires a new socket, and a subscribe may name any number of channels.
