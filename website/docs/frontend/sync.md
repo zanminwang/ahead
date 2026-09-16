@@ -118,5 +118,6 @@ When permissions change, publish the affected records to the channels that deliv
 | `frozen` long after the network recovered | Either the server refused the batch on identity or order grounds (401/403/409 `client.owner_mismatch`/`gap`/`overlap`) — the code reaches `onError` and the batch is resent as is because the server never ran it — or a received receipt was refused locally (it named another client or batch, or omitted an accepted record): check `onError` and the backend's loaders |
 | Server values do not update | Whether every affected channel was published to, and whether the handler reported every record it changed with `changes.add` |
 | Local client fails after another process wrote | One active client per SQLite file; close/reopen the stale instance |
+| Empty local data after an app update | `status().schema.rebuilt`: the schema was incompatible and a fresh database is synchronising from the beginning; `status().schema.pending` means the old file is still sending its last changes, call `rebuild()` when it reaches 0 ([local storage](storage.md#change-the-schema)) |
 
 See [runtime APIs](runtime.md) for controls and [compatibility and recovery](storage.md) for storage constraints.

@@ -58,7 +58,7 @@ Current test locations. Some suites support more than one responsibility.
 | Simulation / Scenarios | [sim/tests](../../crates/sim/tests) |
 | Simulation / Invariants | Checks in [sim/src/invariants.rs](../../crates/sim/src/invariants.rs); runner in [sim/tests/invariants.rs](../../crates/sim/tests/invariants.rs) |
 | Simulation / Failure and recovery | [resilience.rs](../../crates/sim/tests/resilience.rs), [net.rs](../../crates/sim/src/net.rs), [shrink.rs](../../crates/sim/src/shrink.rs) |
-| Integration / Storage and persistence | SQLite contracts in [store.rs](../../crates/sqlite/tests/store.rs) and [ddl.rs](../../crates/sqlite/tests/ddl.rs); PostgreSQL in [integration/persistence](../../integration/persistence) |
+| Integration / Storage and persistence | SQLite contracts in [store.rs](../../crates/sqlite/tests/store.rs), [ddl.rs](../../crates/sqlite/tests/ddl.rs) and [rebuild.rs](../../crates/sqlite/tests/rebuild.rs); PostgreSQL in [integration/persistence](../../integration/persistence) |
 | Integration / SDKs and bindings | [bindings/common/tests](../../bindings/common/tests), [integration/bindings](../../integration/bindings), [packages/dart/test](../../packages/dart/test), [integration/generated-api](../../integration/generated-api) |
 | Integration / Connection | Client tests in [live.test.mjs](../../integration/bindings/client-js/live.test.mjs) and [live_test.dart](../../packages/dart/test/live_test.dart); server tests in [runtime.test.mjs](../../integration/persistence/server/runtime.test.mjs) |
 | End-to-end | [integration/e2e](../../integration/e2e); device smoke tests in [integration/platform](../../integration/platform) |

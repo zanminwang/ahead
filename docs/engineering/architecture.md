@@ -41,7 +41,7 @@ The tree stops at three levels: Ahead, a component, a part. A part that has inte
 - **[Client runtime (Rust)](architecture/client/README.md)** — Local state, storage and sync.
   - ★ **[Frontend interface](architecture/client/frontend-interface.md)** — Expose reads, writes, subscriptions and status to SDKs.
   - ★ **[Engine](architecture/client/engine/README.md)** — Local reads and writes, the mutation queue, completion from receipts and page application.
-  - **[Storage](architecture/client/storage/README.md)** — Execute Engine-requested SQL and transactions; table layout and reconciliation.
+  - **[Storage](architecture/client/storage/README.md)** — Execute Engine-requested SQL and transactions; table layout, schema compatibility and replica rebuild.
   - **[Connection](architecture/client/connection/README.md)** — HTTP/WebSocket transport and the controller that decides when to push, stream, catch up and retry.
 - **[Server runtime (Rust)](architecture/server/README.md)** — Sync protocol and backend execution.
   - ★ **[Backend interface](architecture/server/backend-interface.md)** — Invoke application handlers and loaders through one typed host contract.
@@ -112,7 +112,7 @@ Where each part lives. A part with its own tree carries the finer map in its REA
 | SDKs / Bindings | [bindings/common](../../bindings/common), [bindings/node](../../bindings/node), [bindings/dart](../../bindings/dart) |
 | Client / Frontend interface | [client/lib.rs](../../crates/client/src/lib.rs); per-transaction handle in [client/engine.rs](../../crates/client/src/engine.rs) |
 | Client / Engine | [crates/client/src](../../crates/client/src): `mutate.rs`, `rows.rs`, `query.rs`, `queue.rs`, `policies.rs`, `push.rs`, `downlink.rs`, `ledger.rs`, `authority.rs` ([map](architecture/client/engine/README.md#code-map)) |
-| Client / Storage | [client/store.rs](../../crates/client/src/store.rs), [client/ddl.rs](../../crates/client/src/ddl.rs), [sqlite/lib.rs](../../crates/sqlite/src/lib.rs) ([map](architecture/client/storage/README.md#code-map)) |
+| Client / Storage | [client/store.rs](../../crates/client/src/store.rs), [client/ddl.rs](../../crates/client/src/ddl.rs), [client/schema_store.rs](../../crates/client/src/schema_store.rs), [sqlite/lib.rs](../../crates/sqlite/src/lib.rs) ([map](architecture/client/storage/README.md#code-map)) |
 | Client / Connection | [client/connection.rs](../../crates/client/src/connection.rs), [client/transport.rs](../../crates/client/src/transport.rs), [client/live.rs](../../crates/client/src/live.rs); host loops in [client-js](../../packages/client-js) and [dart](../../packages/dart/lib/src) ([map](architecture/client/connection/README.md#code-map)) |
 | Server / Backend interface | Operation contract in [server/host.rs](../../crates/server/src/host.rs) and [server/host-contract.mts](../../packages/server/host-contract.mts); `Host` in [server/lib.rs](../../crates/server/src/lib.rs); handler/loader dispatch in [server/index.mts](../../packages/server/index.mts) |
 | Server / Engine | [server/lib.rs](../../crates/server/src/lib.rs), [server/readback.rs](../../crates/server/src/readback.rs); `changes`, `publish` and `WakeHub` in [server/index.mts](../../packages/server/index.mts) ([map](architecture/server/engine/README.md#code-map)) |

@@ -77,6 +77,9 @@ class Client implements ReadPort {
     required Map<String, dynamic> schema,
     String? libraryPath,
     Map<String, dynamic>? migration,
+
+    /// Rebuild at once when the schema is incompatible, leaving unsent work in the old file.
+    bool discardPending = false,
   }) async {
     final ready = ReceivePort();
     final isolate = await Isolate.spawn(_nativeWorker, [
@@ -95,6 +98,7 @@ class Client implements ReadPort {
         'path': path,
         'schema': schema,
         if (migration != null) 'migration': migration,
+        if (discardPending) 'discardPending': true,
       });
       final value = opened['value'] as Map;
       return Client._(
@@ -428,6 +432,16 @@ class Client implements ReadPort {
   Future<Map<String, dynamic>> status() => _exclusive(
     () async => (await _send({'op': 'status'})) as Map<String, dynamic>,
   );
+
+  /// Leave an incompatible database behind and open a fresh file for the
+  /// schema this client asked for. Refused while unsent mutations remain
+  /// unless [discardPending]; the report says what the old file keeps.
+  Future<Map<String, dynamic>> rebuild({bool discardPending = false}) =>
+      _exclusive(
+        () async =>
+            (await _send({'op': 'rebuild', 'discardPending': discardPending}))
+                as Map<String, dynamic>,
+      );
   Future<List<Map<String, dynamic>>> pendingTasks() => _exclusive(
     () async =>
         (await _send({'op': 'tasks'}) as List).cast<Map<String, dynamic>>(),

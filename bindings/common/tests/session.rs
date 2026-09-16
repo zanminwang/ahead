@@ -401,3 +401,75 @@ fn transaction_scoped_commands_and_sync_commands_are_refused_by_code() {
         "client_closed"
     );
 }
+
+/// An incompatible schema at open keeps the old file while it holds unsent
+/// work, sends it through the same handle, then `rebuild` switches to a fresh
+/// file; every step is visible in `status().schema`.
+#[test]
+fn incompatible_schema_reports_pending_work_and_rebuild_switches_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut host = RuntimeHost::default();
+    let schema: Value =
+        serde_json::from_str(include_str!("../../../fixtures/schemas/entry.json")).unwrap();
+    let mut breaking = schema.clone();
+    breaking["models"][0]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name":"due","nullable":false,"type":{"kind":"scalar","name":"string"}}));
+    let opened = host
+        .call(json!({"op":"open","path":path,"schema":schema}))
+        .unwrap()["value"]
+        .clone();
+    assert_eq!(opened["schema"]["rebuilt"], false);
+    let id = opened["handle"].clone();
+    host.call(json!({"op":"direct","handle":id,"operation":{"model":"Entry","op":"create","identity":{"id":"e"},"values":{"text":"A","note":null}}})).unwrap();
+    host.call(json!({"op":"enqueue","handle":id,"mutation":{"name":"Edit","operations":[{"model":"Entry","op":"update","identity":{"id":"e"},"values":{"text":"B"}}]}})).unwrap();
+    host.call(json!({"op":"freeze","handle":id})).unwrap();
+    host.call(json!({"op":"close","handle":id})).unwrap();
+
+    let opened = host
+        .call(json!({"op":"open","path":path,"schema":breaking}))
+        .unwrap()["value"]
+        .clone();
+    let id = opened["handle"].clone();
+    let client_id = opened["clientId"].clone();
+    assert_eq!(opened["schema"]["rebuilt"], false);
+    assert_eq!(opened["schema"]["pending"]["pending"], 1);
+    assert!(
+        opened["schema"]["pending"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("due")
+    );
+    let status = host.call(json!({"op":"status","handle":id})).unwrap()["value"].clone();
+    assert_eq!(status["pending"], 1);
+    assert_eq!(
+        status["schema"]["pending"]["oldFile"].as_str().unwrap(),
+        path.to_string_lossy()
+    );
+    assert!(
+        host.call(json!({"op":"rebuild","handle":id})).is_err(),
+        "unsent work blocks the rebuild"
+    );
+    host.call(json!({"op":"ack","handle":id,"sequence":1,"receipt":{"clientId":client_id,"batchSequence":1,"rejections":[],"records":[{"model":"Entry","identity":{"id":"e"},"stamp":2,"state":{"text":"B","note":null}}]}})).unwrap();
+    let report = host.call(json!({"op":"rebuild","handle":id})).unwrap();
+    assert_eq!(report["value"]["leftPending"], 0);
+    assert!(
+        report["value"]["newFile"]
+            .as_str()
+            .unwrap()
+            .ends_with("db.1")
+    );
+    assert_eq!(report["changed"], true, "watchers learn the tables changed");
+    let status = host.call(json!({"op":"status","handle":id})).unwrap()["value"].clone();
+    assert_eq!(status["schema"]["rebuilt"], true);
+    assert!(status["schema"]["pending"].is_null());
+    assert!(
+        host.call(json!({"op":"read","handle":id,"key":{"model":"Entry","identity":{"id":"e"}}}))
+            .unwrap()["value"]
+            .is_null(),
+        "the fresh file is empty"
+    );
+    assert!(path.exists(), "the old file is kept");
+}

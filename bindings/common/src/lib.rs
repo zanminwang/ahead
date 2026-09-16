@@ -20,9 +20,19 @@ impl RuntimeHost {
         if op == "open" {
             // `owner` and `migration` may still be sent by language packages; the
             // row-based client keeps neither, so both are accepted and ignored.
-            let client = Client::open(
-                SqliteStore::open(text(&request, "path")?)?,
+            let discard = request
+                .get("discardPending")
+                .map(|v| {
+                    v.as_bool()
+                        .ok_or_else(|| invalid("discardPending must be bool"))
+                })
+                .transpose()?
+                .unwrap_or(false);
+            let client = Client::open_at(
+                text(&request, "path")?,
                 Schema::from_value(request["schema"].clone())?,
+                Box::new(|p| SqliteStore::open(p)),
+                discard,
             )?;
             self.next = self
                 .next
@@ -40,8 +50,9 @@ impl RuntimeHost {
                     live: LiveSession::default(),
                 },
             );
+            let schema_state = schema_json(self.clients[&handle].client.schema_state());
             return Ok(
-                json!({"value":{"handle":handle,"clientId":client_id},"changed":false,"generation":generation}),
+                json!({"value":{"handle":handle,"clientId":client_id,"schema":schema_state},"changed":false,"generation":generation}),
             );
         }
         let id = read_counter(&request["handle"], true)?;
@@ -274,7 +285,21 @@ impl RuntimeHost {
                         Value::Null
                     }
                     "status" => {
-                        json!({"clientId":e.client.client_id(),"pending":e.client.pending_count()?,"beforeImages":e.client.before_image_count()?,"cursors":e.client.subscriptions()?.into_iter().collect::<BTreeMap<_,_>>(),"channels":e.client.desired_channels()?,"rejections":e.client.rejections()?})
+                        json!({"clientId":e.client.client_id(),"pending":e.client.pending_count()?,"beforeImages":e.client.before_image_count()?,"cursors":e.client.subscriptions()?.into_iter().collect::<BTreeMap<_,_>>(),"channels":e.client.desired_channels()?,"rejections":e.client.rejections()?,"schema":schema_json(e.client.schema_state())})
+                    }
+                    "rebuild" => {
+                        let discard = request
+                            .get("discardPending")
+                            .map(|v| {
+                                v.as_bool()
+                                    .ok_or_else(|| invalid("discardPending must be bool"))
+                            })
+                            .transpose()?
+                            .unwrap_or(false);
+                        let report = e.client.rebuild(discard)?;
+                        e.cycle = SyncCycle::default();
+                        e.live = LiveSession::default();
+                        json!({"oldFile":report.old_file,"newFile":report.new_file,"reason":report.reason,"leftPending":report.left_pending,"leftDirect":report.left_direct})
                     }
                     _ => return Err(invalid(format!("unknown client command {op}"))),
                 }
@@ -284,6 +309,14 @@ impl RuntimeHost {
             json!({"value":value,"changed":generation!=e.client.generation(),"changedTables":e.client.last_changed(),"generation":e.client.generation()}),
         )
     }
+}
+/// The schema check's outcome as language packages report it in `status()`.
+fn schema_json(state: &SchemaState) -> Value {
+    json!({
+        "rebuilt": state.rebuilt,
+        "pending": state.pending.as_ref().map(|p| json!({"oldFile":p.old_file,"reason":p.reason,"pending":p.pending,"direct":p.direct})),
+        "lastRebuild": state.last_rebuild.as_ref().map(|r| json!({"oldFile":r.old_file,"newFile":r.new_file,"reason":r.reason,"leftPending":r.left_pending,"leftDirect":r.left_direct})),
+    })
 }
 fn read_now(request: &Value) -> Result<u64> {
     request

@@ -45,6 +45,8 @@ export function createClient<
       path: string;
       schema: object;
       migration?: { defaults?: RecordValue; replayPull?: boolean };
+      /** Rebuild at once when the schema is incompatible, leaving unsent work in the old file. */
+      discardPending?: boolean;
     }) {
       const result = JSON.parse(
         await native.clientCall(strictJson({ op: "open", ...options })),
@@ -330,6 +332,20 @@ export function createClient<
     }
     status() {
       return this.#exclusive(() => this.#send({ op: "status" }));
+    }
+    /**
+     * Leave an incompatible database behind and open a fresh file for the
+     * schema this client asked for. Refused while unsent mutations remain
+     * unless `discardPending`; the report says what the old file keeps.
+     */
+    rebuild(options: { discardPending?: boolean } = {}) {
+      return this.#exclusive(() =>
+        this.#send({ op: "rebuild", ...options }).then((value) => {
+          this.#events.emit("change");
+          this.#events.emit("work");
+          return value;
+        }),
+      );
     }
     pendingTasks(): Promise<RecordValue[]> {
       return this.#exclusive(() => this.#send({ op: "tasks" }));
