@@ -241,7 +241,23 @@ fn a_handle_response_carries_changes_and_publications_or_a_rejection_and_never_b
     )
     .unwrap_err()
     .to_string();
-    assert!(both.contains("not both"), "{both}");
+    assert!(both.contains("not several"), "{both}");
+    assert_eq!(
+        serde_json::from_value::<Handled>(json!({"error": "boom"})).unwrap(),
+        Handled::Failed {
+            error: "boom".into()
+        }
+    );
+    for refused in [
+        json!({"error": 1}),
+        json!({"error": "boom", "rejection": "x"}),
+        json!({"error": "boom", "changes": [], "publications": []}),
+    ] {
+        assert!(
+            serde_json::from_value::<Handled>(refused.clone()).is_err(),
+            "accepted {refused}"
+        );
+    }
     let none = serde_json::from_value::<Handled>(json!({}))
         .unwrap_err()
         .to_string();
@@ -280,12 +296,20 @@ fn a_load_response_is_rows_or_a_refusal_code() {
             rejection: "task.forbidden".into()
         }
     );
+    assert_eq!(
+        serde_json::from_value::<Loaded>(json!({"error": "boom"})).unwrap(),
+        Loaded::Failed {
+            error: "boom".into()
+        }
+    );
     for refused in [
         json!({}),
         json!({"rejection": ""}),
         json!({"rejection": "Not A Code"}),
         json!({"rows": []}),
         json!(null),
+        json!({"error": 1}),
+        json!({"error": "boom", "rejection": "x"}),
     ] {
         assert!(
             serde_json::from_value::<Loaded>(refused.clone()).is_err(),

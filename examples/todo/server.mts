@@ -76,14 +76,15 @@ export async function createExample() {
     async setTodoDone({ input, tx, publish }) {
       calls++;
       const { identity, patch } = input.todo;
-      // The generated patch type keeps `done` optional, but the runtime refuses a patch without it
-      // as `mutation.invalid` before any handler runs, so this branch only narrows the type.
-      if (typeof patch.done !== "boolean") throw Error("unreachable: patch without done");
-      try {
-        await tx.todo.update({ where: identity, data: { done: patch.done } });
-      } catch (error) {
-        if (prismaCode(error) !== "P2025") throw error;
-        throw new MutationRejected("todo.missing");
+      // An empty patch is a no-op (#49): the record is still read back and
+      // published at a new stamp, but nothing is written.
+      if (typeof patch.done === "boolean") {
+        try {
+          await tx.todo.update({ where: identity, data: { done: patch.done } });
+        } catch (error) {
+          if (prismaCode(error) !== "P2025") throw error;
+          throw new MutationRejected("todo.missing");
+        }
       }
       publish({ channel: CHANNEL });
     },

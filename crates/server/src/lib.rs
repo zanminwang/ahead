@@ -468,8 +468,11 @@ async fn head(host: &impl Host, channel: &str) -> Result<u64> {
 /// Process one push: every mutation runs in its own savepoint, its changed
 /// records are stamped and read back by the loaders in that savepoint, and
 /// the receipt carries the final authority of every record a successful
-/// mutation changed. The receipt is stored before the outer transaction
-/// commits, so a retry answers from storage without running a handler.
+/// mutation changed. An unsupported mutation version, a handler failure, a
+/// loader failure and an undeclared or unretained model read contract each
+/// reject only the mutation they belong to; the rest of the batch stands.
+/// The receipt is stored before the outer transaction commits, so a retry
+/// answers from storage without running a handler.
 pub async fn process_push(
     config: &Config,
     owner: &str,
@@ -478,7 +481,6 @@ pub async fn process_push(
 ) -> Result<String> {
     principal(owner)?;
     let request = PushRequest::decode(bytes).map_err(request_invalid)?;
-    config.check_declared(&request.models)?;
     let locked: Claimed = host
         .call_typed(HostRequest::Claim {
             owner: owner.into(),
@@ -503,7 +505,12 @@ pub async fn process_push(
     if request.batch_sequence != last + 1 {
         return Err(Error::code(code::GAP));
     }
+    let mut rejections = vec![];
+    // The last successful authority per record, in canonical key order.
+    let mut results: BTreeMap<String, ahead_core::AuthorityRecord> = BTreeMap::new();
     for m in &request.mutations {
+        // A mutation naming a version this backend does not serve rejects
+        // only itself; its handler never runs.
         if let (Some(name), Some(v)) = (m.raw["name"].as_str(), version(&m.raw))
             && config.mutations.iter().any(|d| d.name == name)
             && !config
@@ -511,17 +518,12 @@ pub async fn process_push(
                 .iter()
                 .any(|d| d.name == name && d.version == v)
         {
-            return Err(Error::new(
-                code::MUTATION_VERSION_UNSUPPORTED,
-                format!("mutation {} ({name}) version {v} is not served", m.ordinal),
-            )
-            .with_details(json!({"ordinal":m.ordinal,"name":name,"version":v})));
+            rejections.push(Rejection {
+                ordinal: m.ordinal,
+                code: code::MUTATION_VERSION_UNSUPPORTED.into(),
+            });
+            continue;
         }
-    }
-    let mut rejections = vec![];
-    // The last successful authority per record, in canonical key order.
-    let mut results: BTreeMap<String, ahead_core::AuthorityRecord> = BTreeMap::new();
-    for m in &request.mutations {
         // `decode` resolves the same descriptor first, so both refuse together.
         let (name, mutation_version) = match config.descriptor(&m.raw) {
             Ok(d) => (d.name.clone(), d.version),
@@ -558,6 +560,9 @@ pub async fn process_push(
             .await?;
         let outcome = match settlement {
             Handled::Rejected { rejection } => Outcome::Refused(rejection),
+            // A thrown handler error rejects only this mutation; it never
+            // reaches the caller as a business rejection.
+            Handled::Failed { .. } => Outcome::Refused(code::HANDLER_FAILED.into()),
             Handled::Settled {
                 changes,
                 publications,
@@ -705,6 +710,9 @@ pub async fn process_pull(
                 )
                 .with_details(json!({"model":model,"rejection":rejection})));
             }
+            // A loader failure aborts the whole page, same as a thrown error;
+            // per-read isolation for pages is a later spec.
+            Loaded::Failed { error } => return Err(Error::new(code::HOST, error)),
         };
         if loaded.len() != indexes.len() {
             return Err(Error::new(code::LOADER_INVALID, "misaligned loader result"));

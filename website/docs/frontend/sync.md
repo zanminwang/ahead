@@ -115,7 +115,7 @@ When permissions change, publish the affected records to the channels that deliv
 | Empty local query after opening | Desired channel, running connection, loader output and read permission |
 | `queued` with failed prerequisites | Host callback failure; reset its readiness to pending and run it again |
 | `frozen` after a network failure | Connectivity/authentication; retain the frozen bytes for retry |
-| `frozen` long after the network recovered | The receipt was refused locally (it named another client or batch, or omitted an accepted record): the batch is resent as is; check `onError` and the backend's loaders |
+| `frozen` long after the network recovered | Either the server refused the batch on identity or order grounds (401/403/409 `client.owner_mismatch`/`gap`/`overlap`) — the code reaches `onError` and the batch is resent as is because the server never ran it — or a received receipt was refused locally (it named another client or batch, or omitted an accepted record): check `onError` and the backend's loaders |
 | Server values do not update | Whether every affected channel was published to, and whether the handler reported every record it changed with `changes.add` |
 | Local client fails after another process wrote | One active client per SQLite file; close/reopen the stale instance |
 

@@ -56,7 +56,7 @@ impl Sim {
     }
     fn choose(&mut self) -> Option<Action> {
         let running = self.running();
-        let roll = self.rng.below(100);
+        let roll = self.rng.below(101);
         let client = if running.is_empty() {
             None
         } else {
@@ -164,6 +164,7 @@ impl Sim {
                 code: "sim.denied".into(),
             },
             98 => Action::FailNext,
+            99 => Action::BreakNext,
             _ => {
                 if !self.generate_direct || self.known_entries.is_empty() {
                     return Some(Action::Deliver);

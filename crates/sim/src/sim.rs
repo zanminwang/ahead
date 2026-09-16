@@ -124,7 +124,13 @@ pub enum Action {
     RejectNext {
         code: String,
     },
+    /// The next `handle` call fails: the engine rejects just that mutation
+    /// with `handler.failed`, the same as any other business rejection.
     FailNext,
+    /// The next `rollback` (following the rejected or failed mutation it
+    /// pairs with) is a host infrastructure error: the whole delivery fails
+    /// and nothing in it is committed.
+    BreakNext,
 }
 
 pub struct Slot {
@@ -470,6 +476,7 @@ impl Sim {
             }
             Action::RejectNext { code } => self.host.reject_next(&code),
             Action::FailNext => self.host.fail_next(),
+            Action::BreakNext => self.host.break_next(),
         }
         Ok(())
     }

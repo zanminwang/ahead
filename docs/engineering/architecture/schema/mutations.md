@@ -35,7 +35,7 @@ Code: parsing in [compiler/parse.rs](../../../../crates/compiler/src/parse.rs) a
 
 ## 6. Runtime View
 
-An incompatible change to a mutation's input requires `@@version(n+1)`; compatible changes keep the same version. The compiler keeps the previous snapshot, the server keeps a `nameVn` handler for it, and the client keeps its policy, so instances queued before the upgrade still decode. Currently, a batch that names a known mutation with an unregistered version is refused before any handler runs; [P7 / Server Push](../server/engine/push.md#9-architecture-decisions) changes this to per-mutation rejection.
+An incompatible change to a mutation's input requires `@@version(n+1)`; compatible changes keep the same version. The compiler keeps the previous snapshot, the server keeps a `nameVn` handler for it, and the client keeps its policy, so instances queued before the upgrade still decode. A batch that names a known mutation with an unregistered version rejects only that mutation with `mutation_version_unsupported`, without calling its handler; unrelated mutations in the same batch still commit ([P6/P7 / Server Push](../server/engine/push.md#9-architecture-decisions), [#95](https://github.com/zanminwang/ahead/issues/95)).
 
 ## 9. Architecture Decisions
 

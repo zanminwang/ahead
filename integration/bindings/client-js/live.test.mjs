@@ -365,3 +365,19 @@ test('a socket the server closes is reconnected after the backoff, resubscribed,
   assert.equal(upgrades.length,2,'one reconnect; no busy loop');
  }finally{await fixture.close();for(const s of ws.clients)s.terminate();await new Promise(r=>ws.close(r));await new Promise(r=>server.close(r));}
 });
+
+test('an owner-mismatch refusal reaches onError and leaves the batch frozen for a resend',async()=>{
+ const fixture=await openClient();const {client}=fixture;const errors=[];const bodies=[];
+ const server=createServer(async(req,res)=>{const chunks=[];for await(const c of req)chunks.push(c);const body=JSON.parse(Buffer.concat(chunks));
+  bodies.push(body);res.statusCode=403;res.setHeader('content-type','application/json');res.end(JSON.stringify({code:'client.owner_mismatch'}));});
+ await new Promise(r=>server.listen(0,'127.0.0.1',r));
+ try{
+  await client.mutate({name:'Create',operations:[{model:'Entry',op:'create',identity:{id:'live'},values:{text:'local',note:null}}]});
+  assert.equal((await client.status()).pending,1);
+  await client.connect({url:`http://127.0.0.1:${server.address().port}`,token:'secret'},{onError:e=>errors.push(e)});
+  await until(()=>bodies.length>=2,'the frozen batch is resent after the refusal');
+  assert.ok(errors.some(e=>/client\.owner_mismatch/.test(String(e.message))),`the refusal's code reaches onError: ${errors.map(e=>e.message)}`);
+  assert.equal((await client.status()).pending,1,'the refused batch stays pending, not dropped or completed');
+  assert.deepEqual(bodies[1],bodies[0],'the same request body is resent on the next cycle');
+ }finally{await fixture.close();await new Promise(r=>server.close(r));}
+});

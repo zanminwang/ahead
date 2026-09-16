@@ -51,7 +51,8 @@
       "responses": [
         {"variant": "settled", "value": {"changes": [{"model": "Task", "identity": {"id": "t-1"}}, {"model": "Task", "identity": {"id": "t-2"}}], "publications": [{"channel": "shared"}, {"channel": "other", "records": [{"model": "Task", "identity": {"id": "t-1"}}]}]}},
         {"variant": "quiet", "value": {"changes": [], "publications": []}},
-        {"variant": "rejected", "value": {"rejection": "task.refused"}}
+        {"variant": "rejected", "value": {"rejection": "task.refused"}},
+        {"variant": "failed", "value": {"error": "TypeError: cannot read title of undefined"}}
       ]
     },
     {
@@ -59,7 +60,8 @@
       "request": {"op": "load", "model": "Task", "version": 1, "identities": [{"id": "t-1"}, {"id": "t-2"}], "owner": "alice"},
       "responses": [
         {"variant": "rows", "value": [{"id": "t-1", "title": "typed"}, null]},
-        {"variant": "refused", "value": {"rejection": "task.forbidden"}}
+        {"variant": "refused", "value": {"rejection": "task.forbidden"}},
+        {"variant": "failed", "value": {"error": "connection reset while reading tasks"}}
       ]
     },
     {

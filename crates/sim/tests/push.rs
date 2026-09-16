@@ -225,13 +225,52 @@ fn p5_rejection_rolls_back_and_rejects_dependents() {
     sim.check().unwrap();
 }
 
-/// P6: a handler failure aborts the batch; the business state, stamps and channel
-/// head are untouched and the client retries the same bytes.
+/// P6: a handler failure rejects only that mutation; the rest of the batch
+/// commits normally, exactly like any other business rejection.
 #[test]
-fn p6_handler_failure_aborts_the_batch_and_the_client_retries() {
+fn p6_handler_failure_rejects_one_mutation_and_the_batch_commits() {
     let mut sim = setup(26);
     edit(&mut sim, "x");
     sim.apply(Action::FailNext).unwrap();
+    sim.apply(Action::Enqueue {
+        client: 0,
+        mutation: MutationSpec::CreateEntry {
+            id: "e2".into(),
+            text: "yes".into(),
+        },
+    })
+    .unwrap();
+    sim.settle();
+    let rejections = sim.client(0).rejections().unwrap();
+    assert_eq!(rejections.len(), 1);
+    assert_eq!(rejections[0].code, "handler.failed");
+    assert_eq!(sim.read_text(0, &entry_key("e1")).as_deref(), Some("base"));
+    assert_eq!(sim.host.state(&entry_key("e1")).unwrap()["text"], "base");
+    assert_eq!(
+        sim.read_text(0, &entry_key("e2")).as_deref(),
+        Some("yes"),
+        "the other mutation in the batch still commits"
+    );
+    assert_eq!(sim.host.state(&entry_key("e2")).unwrap()["text"], "yes");
+    assert_eq!(sim.host.accepted(), 2, "the initial create and e2's create");
+    assert_eq!(sim.host.rejected(), 1);
+    sim.check().unwrap();
+}
+
+/// A broken transaction (a host infrastructure error on `rollback`, not a
+/// handler rejection) fails the whole delivery: nothing is committed, and the
+/// client's retry with the same bytes executes each mutation exactly once.
+/// `rollback` only runs after a refused mutation, so this pairs `BreakNext`
+/// with a rejection to reach it.
+#[test]
+fn p6_a_broken_transaction_fails_the_delivery_and_the_retry_executes_once() {
+    let mut sim = setup(31);
+    sim.apply(Action::RejectNext {
+        code: "entry.denied".into(),
+    })
+    .unwrap();
+    sim.apply(Action::BreakNext).unwrap();
+    edit(&mut sim, "x");
     sim.apply(Action::Freeze { client: 0 }).unwrap();
     let bytes = match sim.net.pop().unwrap() {
         ahead_sim::net::Message::Push { bytes, .. } => bytes,
@@ -251,6 +290,8 @@ fn p6_handler_failure_aborts_the_batch_and_the_client_retries() {
         bytes,
         "same bytes on retry"
     );
+    // The injected rejection was already consumed on the failed attempt, so
+    // the retry runs the same mutation through to a real commit.
     sim.settle();
     assert_eq!(sim.host.state(&entry_key("e1")).unwrap()["text"], "x");
     assert_eq!(sim.host.stamp(&entry_key("e1")), 2);

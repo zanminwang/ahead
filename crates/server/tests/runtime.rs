@@ -256,11 +256,10 @@ mod refusals {
     #[test]
     fn push_refusals_carry_stable_codes_and_run_no_handler() {
         // (claimed owner, last accepted sequence, batch sequence, version, expected code)
-        let cases: [(&str, u64, u64, Option<u64>, &str); 4] = [
+        let cases: [(&str, u64, u64, Option<u64>, &str); 3] = [
             ("alice", 1, 3, None, code::GAP),
             ("alice", 2, 1, None, code::OVERLAP),
             ("bob", 0, 1, None, code::OWNER_MISMATCH),
-            ("alice", 0, 1, Some(2), code::MUTATION_VERSION_UNSUPPORTED),
         ];
         for (owner, last, batch, version, expected) in cases {
             let host = claimed(owner, last);
@@ -278,15 +277,26 @@ mod refusals {
             );
         }
         let host = claimed("alice", 0);
-        let err = run(ahead_server::process_push(
+        let result = run(ahead_server::process_push(
             &config(),
             "alice",
             &push(1, Some(2)),
             &host,
         ))
-        .unwrap_err();
-        assert_eq!(err.details, json!({"ordinal":1,"name":"edit","version":2}));
-        assert_ne!(err.message, err.code, "the message explains the refusal");
+        .unwrap();
+        let receipt = ahead_core::PushReceipt::decode(result.as_bytes()).unwrap();
+        assert_eq!(
+            receipt.rejections,
+            vec![ahead_core::Rejection {
+                ordinal: 1,
+                code: code::MUTATION_VERSION_UNSUPPORTED.into()
+            }]
+        );
+        assert!(
+            host.handled.lock().unwrap().is_empty(),
+            "an unsupported version never runs the handler"
+        );
+        let host = claimed("alice", 0);
         let accepted = run(ahead_server::process_push(
             &config(),
             "alice",

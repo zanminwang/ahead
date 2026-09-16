@@ -130,6 +130,8 @@ struct State {
     publish_answer: Option<Answer>,
     /// The fields a loader of this version returns; others are the whole row.
     load_fields: BTreeMap<u64, Vec<String>>,
+    /// When set, `rollback` throws instead of restoring the savepoint.
+    fail_rollback: bool,
 }
 /// A scripted in-memory host: a business table keyed by encoded record key,
 /// stamp counters, channel heads, a savepoint stack, stored receipts and a log
@@ -257,6 +259,9 @@ impl Scripted {
                 Value::Null
             }
             HostRequest::Rollback { ordinal } => {
+                if s.fail_rollback {
+                    return Err("rollback failed".into());
+                }
                 // Like SQL `ROLLBACK TO SAVEPOINT`: restores the snapshot and
                 // keeps the savepoint open for the `release` that follows.
                 let (opened, snapshot) = s.savepoints.last().expect("no savepoint to roll back");
@@ -939,21 +944,151 @@ fn a_retried_batch_answers_from_storage_without_running_a_handler() {
     );
 }
 
-/// A declaration of a version this backend does not retain refuses the whole
-/// batch with `model_version_unsupported` before the client row is claimed.
+/// A mutation at an unsupported version is rejected alone; its handler never
+/// runs and the batch commits.
 #[test]
-fn an_unretained_declaration_is_refused_before_claim() {
+fn an_unsupported_version_rejects_only_that_mutation() {
     let host = Scripted::new();
-    for models in [json!({"Entry":9}), json!({"Ghost":1})] {
-        let err = process(
-            &config(),
-            &push_declaring("c", 1, models.clone(), vec![edit(1, "a", "typed")]),
-            &host,
-        )
-        .unwrap_err();
-        assert_eq!(err.code, code::MODEL_VERSION_UNSUPPORTED, "{models}: {err}");
-    }
-    assert!(host.log().is_empty(), "nothing reached the host");
+    host.seed("Entry", "a", json!({"id":"a","text":"old"}));
+    host.seed("Entry", "b", json!({"id":"b","text":"old"}));
+    let mut bad = edit(1, "a", "typed");
+    bad["version"] = json!(9);
+    let body = push(1, vec![bad, edit(2, "b", "kept")]);
+    let receipt = decode(&process(&config(), &body, &host).unwrap());
+    assert_eq!(
+        receipt.rejections,
+        vec![ahead_core::Rejection {
+            ordinal: 1,
+            code: code::MUTATION_VERSION_UNSUPPORTED.into()
+        }]
+    );
+    assert_eq!(receipt.records.len(), 1);
+    assert_eq!(receipt.records[0].identity, json!({"id":"b"}));
+    assert_eq!(host.count("handle"), 1, "ordinal 1's handler never ran");
+    assert_eq!(host.count("saveReceipt"), 1);
+}
+
+/// A thrown handler error answered as `Failed` rejects only that mutation
+/// with `handler.failed`.
+#[test]
+fn a_handler_failure_rejects_only_that_mutation() {
+    let host = Scripted::new();
+    host.seed("Entry", "a", json!({"id":"a","text":"old"}));
+    host.seed("Entry", "b", json!({"id":"b","text":"old"}));
+    host.settle(1, json!({"error":"boom"}));
+    let body = push(1, vec![edit(1, "a", "lost"), edit(2, "b", "kept")]);
+    let receipt = decode(&process(&config(), &body, &host).unwrap());
+    assert_eq!(
+        receipt.rejections,
+        vec![ahead_core::Rejection {
+            ordinal: 1,
+            code: code::HANDLER_FAILED.into()
+        }]
+    );
+    assert_eq!(receipt.records.len(), 1);
+    assert_eq!(receipt.records[0].identity, json!({"id":"b"}));
+    assert_eq!(
+        &host.labels()[..5],
+        [
+            "claim",
+            "savepoint(ordinal 1)",
+            "handle(ordinal 1)",
+            "rollback(ordinal 1)",
+            "release(ordinal 1)"
+        ]
+    );
+}
+
+/// A loader failure answered as `Failed` rejects the mutation with
+/// `loader.failed` and rolls back its writes.
+#[test]
+fn a_loader_failure_rejects_only_that_mutation() {
+    let host = Scripted::new();
+    host.seed("Entry", "a", json!({"id":"a","text":"old"}));
+    host.seed("Entry", "b", json!({"id":"b","text":"old"}));
+    host.answer_load(0, Ok(json!({"error":"loader broke"})));
+    let body = push(1, vec![edit(1, "a", "lost"), edit(2, "b", "kept")]);
+    let receipt = decode(&process(&config(), &body, &host).unwrap());
+    assert_eq!(
+        receipt.rejections,
+        vec![ahead_core::Rejection {
+            ordinal: 1,
+            code: code::LOADER_FAILED.into()
+        }]
+    );
+    assert_eq!(receipt.records.len(), 1);
+    assert_eq!(receipt.records[0].identity, json!({"id":"b"}));
+    assert_eq!(
+        host.business("Entry", "a"),
+        Some(json!({"id":"a","text":"old"})),
+        "the loader failure's business write was rolled back"
+    );
+}
+
+/// A rollback the host cannot perform fails the whole delivery and stores no
+/// receipt; a retry of the same bytes runs the handlers again.
+#[test]
+fn a_failed_rollback_fails_the_delivery() {
+    let host = Scripted::new();
+    host.seed("Entry", "a", json!({"id":"a","text":"old"}));
+    host.settle(1, json!({"error":"boom"}));
+    host.with(|s| s.fail_rollback = true);
+    let body = push(1, vec![edit(1, "a", "lost")]);
+    let err = process(&config(), &body, &host).unwrap_err();
+    assert_eq!(err.code, code::HOST, "{err}");
+    assert_eq!(host.count("saveReceipt"), 0);
+    assert_eq!(host.count("handle"), 1);
+    // Retrying the same batch bytes runs the handler again: nothing was saved.
+    host.with(|s| s.fail_rollback = false);
+    let _ = process(&config(), &body, &host);
+    assert_eq!(host.count("handle"), 2, "the handler ran again on retry");
+}
+
+/// A declared but unretained model version rejects only the mutation that
+/// touches it; the batch is not refused before `claim`.
+#[test]
+fn an_unretained_declaration_rejects_only_the_touching_mutation() {
+    let mut mutations = mutations().as_array().unwrap().clone();
+    mutations.push(
+        json!({"name":"editNote","version":1,"slots":[{"name":"note","model":"Note","operation":"update","cardinality":"single","allowedPatchFields":["text"]}]}),
+    );
+    let config = Config::decode(json!({
+        "schema":{"enums":[],"models":[
+            {"name":"Entry","identity":["id"],"fields":[field("id",false),field("text",false)]},
+            {"name":"Note","identity":["id"],"fields":[field("id",false),field("text",false)]}]},
+        "loaders":["Entry","Note"],
+        "mutations":mutations
+    }))
+    .unwrap();
+    let host = Scripted::new();
+    host.seed("Entry", "a", json!({"id":"a","text":"old"}));
+    host.seed("Note", "n", json!({"id":"n","text":"old"}));
+    let body = push_declaring(
+        "c",
+        1,
+        json!({"Entry":9,"Note":1}),
+        vec![
+            edit(1, "a", "typed"),
+            json!({"ordinal":2,"name":"editNote","operations":[{"model":"Note","op":"update","identity":{"id":"n"},"values":{"text":"new"}}]}),
+        ],
+    );
+    let receipt = decode(&process(&config, &body, &host).unwrap());
+    assert_eq!(
+        receipt.rejections,
+        vec![ahead_core::Rejection {
+            ordinal: 1,
+            code: code::MODEL_VERSION_UNSUPPORTED.into()
+        }]
+    );
+    assert_eq!(
+        receipt
+            .records
+            .iter()
+            .map(|r| (r.model.as_str(), r.identity["id"].as_str().unwrap()))
+            .collect::<Vec<_>>(),
+        [("Note", "n")]
+    );
+    assert_eq!(host.count("claim"), 1, "the request was claimed");
 }
 
 /// Handler `changes` naming a model without a registered loader is a

@@ -120,14 +120,68 @@ test('rejected mutation publishes nothing even though it called publish first',a
  assert.deepEqual(result.rejections,[{ordinal:1,code:'task.refused'}]);
  assert.equal((await pull()).toCursor,head);
 });
-test('unknown error rolls back entire batch including earlier effects and client claim',async()=>{
- const head=(await pull()).toCursor;
- await assert.rejects(()=>backend.push('alice',push('crash',1,[mutation(1,'before','e'),mutation(2,'crash','f')])),/business crash/);
- assert.equal(await count('business_task'),3);assert.equal((await pull()).toCursor,head);assert.equal((await db.$queryRawUnsafe("SELECT * FROM ahead_client WHERE client_id='crash'")).length,0);
+test('a handler that throws rejects only its mutation and reaches onError',async()=>{
+ const errors=[];
+ const crashBackend=createBackend({config,database:prisma(db),authenticate,onError:e=>errors.push(e),handlers:{async edit({input,tx}){
+  await write(tx,input.task.identity.id,input.task.patch.title);
+  if(input.task.patch.title==='crash')throw new Error('business crash');
+ }},loaders:{task:readTasks}});
+ const result=JSON.parse(await crashBackend.push('alice',push('crash',1,[mutation(1,'before','e'),mutation(2,'crash','f'),mutation(3,'after','g')])));
+ assert.deepEqual(result.rejections,[{ordinal:2,code:'handler.failed'}]);
+ assert.deepEqual(result.records,[authority('e',1,{title:'before'}),authority('g',1,{title:'after'})]);
+ assert.equal((await db.$queryRawUnsafe("SELECT * FROM business_task WHERE id='f'")).length,0,'the failed mutation rolled back its write');
+ assert.equal((await db.$queryRawUnsafe("SELECT * FROM ahead_client WHERE client_id='crash'")).length,1,'the batch as a whole still committed');
+ assert.equal(errors.length,1);assert.equal(errors[0].message,'business crash');
 });
-test('unsupported versions abort before handlers, invalid bodies settle with no records',async()=>{
- const before=called;await assert.rejects(()=>backend.push('alice',push('version',1,[mutation(1,'ignored','v'),{...mutation(2,'bad','w'),version:2}])),error=>error instanceof EngineError&&error.code==='mutation_version_unsupported'&&error.details.ordinal===2&&error.details.name==='edit'&&error.details.version===2);assert.equal(called,before);
- const result=JSON.parse(await backend.push('alice',push('invalid',1,[{ordinal:1,name:'absent',operations:[]}])));assert.deepEqual(result,{batchSequence:1,clientId:'invalid',records:[],rejections:[{ordinal:1,code:'mutation.invalid'}]});
+test('a handler whose SQL fails leaves an aborted transaction that the savepoint rollback recovers into one rejection',async()=>{
+ const errors=[];
+ const sqlBackend=createBackend({config,database:prisma(db),authenticate,onError:e=>errors.push(e),handlers:{async edit({input,tx}){
+  await write(tx,input.task.identity.id,input.task.patch.title);
+  // A PostgreSQL error (not a JavaScript one) marks the whole transaction aborted;
+  // only ROLLBACK TO SAVEPOINT can make it usable again for the next mutation.
+  if(input.task.patch.title==='sql')await tx.$executeRawUnsafe('INSERT INTO business_task(id,title) VALUES($1,$2)',input.task.identity.id,'duplicate');
+ }},loaders:{task:readTasks}});
+ const result=JSON.parse(await sqlBackend.push('alice',push('sql-fail',1,[mutation(1,'first','sql-a'),mutation(2,'sql','sql-b'),mutation(3,'third','sql-c')])));
+ assert.deepEqual(result.rejections,[{ordinal:2,code:'handler.failed'}]);
+ assert.deepEqual(result.records,[authority('sql-a',1,{title:'first'}),authority('sql-c',1,{title:'third'})]);
+ assert.equal((await db.$queryRawUnsafe("SELECT * FROM business_task WHERE id='sql-b'")).length,0,'the failed mutation rolled back its write');
+ assert.equal((await db.$queryRawUnsafe("SELECT * FROM business_task WHERE id IN ('sql-a','sql-c')")).length,2,'the mutations around it committed');
+ assert.equal(errors.length,1);assert.match(String(errors[0].message??errors[0]),/23505|already exists/);
+});
+test('a loader that throws during readback rejects only that mutation',async()=>{
+ const errors=[];
+ const throwingBackend=createBackend({config,database:prisma(db),authenticate,onError:e=>errors.push(e),handlers:{async edit({input,tx}){await write(tx,input.task.identity.id,input.task.patch.title);}},loaders:{task:async call=>{if(call.ids.some(id=>id.id==='loader-throw-bad'))throw new Error('loader broke');return readTasks(call);}}});
+ const result=JSON.parse(await throwingBackend.push('alice',push('loader-throw',1,[mutation(1,'ok','loader-throw-ok'),mutation(2,'bad','loader-throw-bad'),mutation(3,'ok2','loader-throw-ok2')])));
+ assert.deepEqual(result.rejections,[{ordinal:2,code:'loader.failed'}]);
+ assert.equal((await db.$queryRawUnsafe("SELECT * FROM business_task WHERE id='loader-throw-bad'")).length,0,'the loader failure rolled back its write');
+ assert.deepEqual(result.records,[authority('loader-throw-ok',1,{title:'ok'}),authority('loader-throw-ok2',1,{title:'ok2'})]);
+ assert.equal(errors.length,1);assert.equal(errors[0].message,'loader broke');
+});
+test('a handler that breaks the transaction still fails the delivery',async()=>{
+ const before=called;let broken=false;
+ const breakingBackend=createBackend({config,database:prisma(db),authenticate,handlers:{async edit({input,tx}){
+  called++;
+  await write(tx,input.task.identity.id,input.task.patch.title);
+  if(!broken){broken=true;try{await tx.$executeRawUnsafe('SELECT 1/0');}catch{}}
+ }},loaders:{task:readTasks}});
+ // The handler swallows its own PostgreSQL error, but the aborted transaction
+ // then poisons the engine's next host call (release/advanceStamp): a whole
+ // delivery failure, not a per-mutation one, whatever shape the error takes.
+ await assert.rejects(()=>breakingBackend.push('alice',push('broken',1,[mutation(1,'break','broken-a')])));
+ assert.equal((await db.$queryRawUnsafe("SELECT * FROM business_task WHERE id='broken-a'")).length,0,'nothing committed');
+ assert.equal((await db.$queryRawUnsafe("SELECT * FROM ahead_client WHERE client_id='broken'")).length,0);
+ const receipt=JSON.parse(await breakingBackend.push('alice',push('broken',1,[mutation(1,'break','broken-a')])));
+ assert.deepEqual(receipt.rejections,[]);
+ assert.equal(called,before+2,'the retry ran the handler again');
+});
+test('a mixed batch rejects the unsupported version alone and commits the rest',async()=>{
+ const before=called;
+ const result=JSON.parse(await backend.push('alice',push('version',1,[{...mutation(1,'ignored','v'),version:2},mutation(2,'committed','w')])));
+ assert.deepEqual(result.rejections,[{ordinal:1,code:'mutation_version_unsupported'}]);
+ assert.equal(called,before+1);
+ assert.deepEqual(result.records,[authority('w',1,{title:'committed'})]);
+ assert.equal((await db.$queryRawUnsafe("SELECT * FROM business_task WHERE id='w'")).length,1);
+ assert.equal((await db.$queryRawUnsafe("SELECT * FROM business_task WHERE id='v'")).length,0);
 });
 test('loaders receive no channel',async()=>{
  await pull('shared',0);assert.ok(loaderCalls.length>1,'pushes and pulls both reached the loader');
@@ -168,7 +222,7 @@ test('a pull reaches the loader of the declared model version and normalizes row
 test('compaction materializes latest state; deletion is aligned null',async()=>{
  await backend.push('alice',push('dedup',2,[mutation(1,'updated')]));await assert.rejects(()=>backend.push('alice',push('dedup',1,[mutation(1,'first')])),/overlap/);
  await backend.transaction(async({tx,notify})=>{await tx.$executeRawUnsafe("DELETE FROM business_task WHERE id='a'");await notify({channel:'shared',records:[{model:'Task',identity:{id:'a'}}]});});
- const page=await pull();assert.equal(page.changes.length,3);assert.deepEqual(page.changes.at(-1).state,null);assert.equal(page.toCursor,5);
+ const page=await pull();assert.equal(page.changes.length,4);assert.deepEqual(page.changes.at(-1).state,null);assert.equal(page.toCursor,6);
  await assert.rejects(()=>pull('shared',999),/cursor ahead/);
 });
 test('50-row pages retain original cursor progression and remainder reaches head',async()=>{
@@ -177,7 +231,7 @@ test('50-row pages retain original cursor progression and remainder reaches head
  let wakeFifty;
  await db.$transaction(async tx=>{const session=backend.bindTransaction(tx);try{for(let i=0;i<51;i++){await tx.$executeRawUnsafe('INSERT INTO business_task(id,title) VALUES($1,$2)',`page-${i}`,'page');await session.notify({channel:'shared',records:[{model:'Task',identity:{id:`page-${i}`}}]});}await session.assertCommittable();wakeFifty=session.afterCommit();}finally{session.close();}},{timeout:20000});
  wakeFifty();
- const first=await pull('shared',5);assert.equal(first.changes.length,50);assert.equal(first.toCursor,55);const last=await pull('shared',55);assert.equal(last.changes.length,1);assert.equal(last.toCursor,56);
+ const first=await pull('shared',6);assert.equal(first.changes.length,50);assert.equal(first.toCursor,56);const last=await pull('shared',56);assert.equal(last.changes.length,1);assert.equal(last.toCursor,57);
 });
 test('concurrent same-client retry executes once under PostgreSQL lock',async()=>{const before=called;const request=push('race',1,[mutation(1,'race','race')]);const receipts=await Promise.all([backend.push('alice',request),backend.push('alice',request)]);assert.equal(receipts[0],receipts[1]);assert.equal(called,before+1);});
 test('publication rollback uses user transaction and rejects unregistered models',async()=>{const before=(await pull('shared',56)).toCursor;await assert.rejects(()=>backend.transaction(async({tx,notify})=>{await notify({channel:'shared',records:[{model:'Task',identity:{id:'rollback'}}]});throw new Error('cancel');}),/cancel/);assert.equal((await pull('shared',56)).toCursor,before);await assert.rejects(()=>backend.transaction(({notify})=>notify({channel:'shared',records:[{model:'Unknown',identity:{id:'x'}}]})),/unregistered loader/);});
@@ -197,7 +251,7 @@ test('HTTP adapter authenticates and serves the real native persistence path',as
  try {
   const denied=await fetch(`${url}/sync/pull`,{method:'POST',body:JSON.stringify({clientId:'c',scope:'shared',fromCursor:0,models:{Task:1}})});assert.equal(denied.status,401);
   const result=await fetch(`${url}/sync/mutations`,{method:'POST',headers:{authorization:'Bearer alice'},body:push('http',1,[mutation(1,'network','http')])});assert.equal(result.status,200);assert.deepEqual((await result.json()).rejections,[]);
-  const page=await fetch(`${url}/sync/pull`,{method:'POST',headers:{authorization:'Bearer alice'},body:JSON.stringify({clientId:'c',scope:'shared',fromCursor:57,models:{Task:1}})});assert.equal(page.status,200);assert.equal((await page.json()).changes[0].state.title,'network');
+  const page=await fetch(`${url}/sync/pull`,{method:'POST',headers:{authorization:'Bearer alice'},body:JSON.stringify({clientId:'c',scope:'shared',fromCursor:58,models:{Task:1}})});assert.equal(page.status,200);assert.equal((await page.json()).changes[0].state.title,'network');
   const bad=await fetch(`${url}/sync/pull`,{method:'POST',headers:{authorization:'Bearer alice'},body:'{'});assert.equal(bad.status,400);
  }finally{await server.close();}
 });
@@ -344,7 +398,7 @@ test('listen answers pull over HTTP with authentication and closes cleanly',asyn
 });
 test('onError captures server-side failures and HTTP responds with {code:"server"}',async()=>{
  const errors=[];
- const boomBackend=createBackend({config,database:prisma(db),authenticate,onError:e=>errors.push(e),handlers:{async edit(){throw new Error('boom')}},loaders:{async task({ids}){return ids.map(()=>null)}}});
+ const boomBackend=createBackend({config,database:prisma(db),authenticate:async()=>{throw new Error('boom')},onError:e=>errors.push(e),handlers:{async edit(){}},loaders:{async task({ids}){return ids.map(()=>null)}}});
  const server=await boomBackend.listen({port:0});
  try{
   const result=await fetch(`${server.url}/sync/mutations`,{method:'POST',headers:{authorization:'Bearer alice'},body:push('boom',1,[mutation(1,'x','boom-a')])});
@@ -383,7 +437,7 @@ test('explicit records publish only those, never join the change set, and are in
  const page=await pull('other',0);assert.deepEqual(page.changes.find(c=>c.identity.id==='pub-only'),{syncId:other+1,model:'Task',identity:{id:'pub-only'},stamp:1,state:null});
  assert.equal(page.changes.some(c=>c.identity.id.startsWith('pub-only-')),false,'the changed records went to shared only');
 });
-test('a loader refusal during push rejects only that mutation; a loader defect aborts the batch',async()=>{
+test('a loader refusal during push rejects only that mutation; so does a thrown loader error',async()=>{
  const make=load=>createBackend({config,database:prisma(db),authenticate,handlers:{async edit({input,tx,publish}){await write(tx,input.task.identity.id,input.task.patch.title);publish({channel:'shared'});}},loaders:{task:load}});
  const refusing=make(async call=>{if(call.ids.some(id=>id.id==='ld-forbidden'))throw new MutationRejected('task.forbidden');return readTasks(call);});
  const receipt=JSON.parse(await refusing.push('alice',push('loader-refuse',1,[mutation(1,'ok','ld-ok'),mutation(2,'hidden','ld-forbidden'),mutation(3,'ok','ld-last')])));
@@ -391,14 +445,15 @@ test('a loader refusal during push rejects only that mutation; a loader defect a
  assert.equal((await db.$queryRawUnsafe("SELECT * FROM business_task WHERE id='ld-forbidden'")).length,0,'the refused mutation rolled back its write');assert.equal(await recordStamp('ld-forbidden'),null,'and its stamp');assert.deepEqual(await invalidations('ld-forbidden'),[],'and its publication');
  const translated=createBackend({config,database:prisma(db),authenticate,translateRejection:()=>'task.translated',handlers:{async edit({input,tx}){await write(tx,input.task.identity.id,input.task.patch.title);}},loaders:{async task(){throw new Error('product read refusal');}}});
  assert.deepEqual(JSON.parse(await translated.push('alice',push('loader-translated',1,[mutation(1,'x','ld-translated')]))).rejections,[{ordinal:1,code:'task.translated'}]);
- await assert.rejects(()=>make(async()=>{throw new Error('loader crash');}).push('alice',push('loader-crash',1,[mutation(1,'x','ld-crash')])),/loader crash/);
- assert.equal((await db.$queryRawUnsafe("SELECT * FROM business_task WHERE id='ld-crash'")).length,0);assert.equal((await db.$queryRawUnsafe("SELECT * FROM ahead_client WHERE client_id='loader-crash'")).length,0);
+ const crashing=JSON.parse(await make(async()=>{throw new Error('loader crash');}).push('alice',push('loader-crash',1,[mutation(1,'x','ld-crash')])));
+ assert.deepEqual(crashing.rejections,[{ordinal:1,code:'loader.failed'}]);
+ assert.equal((await db.$queryRawUnsafe("SELECT * FROM business_task WHERE id='ld-crash'")).length,0);assert.equal((await db.$queryRawUnsafe("SELECT * FROM ahead_client WHERE client_id='loader-crash'")).length,1,'the batch still commits');
 });
-test('publish validates channel and records before the mutation settles',async()=>{
- await assert.rejects(()=>backend.push('alice',push('badchan',1,[mutation(1,'empty-channel','bad-a')])),/publish: channel must be a non-empty string/);
- await assert.rejects(()=>backend.push('alice',push('badrecs',1,[mutation(1,'bad-records','bad-b')])),/publish: records must be an array/);
- await assert.rejects(()=>backend.push('alice',push('badbogus',1,[mutation(1,'bogus-record','bad-c')])),/publish: record must be/);
- assert.equal((await db.$queryRawUnsafe("SELECT * FROM business_task WHERE id IN ('bad-a','bad-b','bad-c')")).length,0);
+test('publish validates channel and records; the invalid call rejects only that mutation as a failure',async()=>{
+ const badchan=JSON.parse(await backend.push('alice',push('badchan',1,[mutation(1,'empty-channel','bad-a')])));assert.equal(badchan.rejections[0].code,'handler.failed');
+ const badrecs=JSON.parse(await backend.push('alice',push('badrecs',1,[mutation(1,'bad-records','bad-b')])));assert.equal(badrecs.rejections[0].code,'handler.failed');
+ const badbogus=JSON.parse(await backend.push('alice',push('badbogus',1,[mutation(1,'bogus-record','bad-c')])));assert.equal(badbogus.rejections[0].code,'handler.failed');
+ assert.equal((await db.$queryRawUnsafe("SELECT * FROM business_task WHERE id IN ('bad-a','bad-b','bad-c')")).length,0,'the failed mutations rolled back their writes');
 });
 test('a handler may keep using the transaction after publish; the publication goes out with the commit',async()=>{
  const deferredBackend=createBackend({config,database:prisma(db),authenticate,handlers:{async edit({input,tx,publish}){
@@ -532,8 +587,8 @@ test('HTTP maps engine codes to statuses: 403, 409 gap/overlap/version fields, 4
   const bobServer=await bobBackend.listen({port:0});
   try{const owner=await fetch(`${bobServer.url}/sync/mutations`,{method:'POST',headers:{authorization:'Bearer bob'},body:push('map',3,[mutation(3,'x','map-a')])});assert.equal(owner.status,403);assert.deepEqual(await owner.json(),{code:'client.owner_mismatch'});}
   finally{await bobServer.close();}
-  const version=await post('/sync/mutations',push('map',3,[{...mutation(3,'x','map-a'),version:7}]));assert.equal(version.status,409);
-  assert.deepEqual(await version.json(),{code:'mutation_version_unsupported',ordinal:3,name:'edit',version:7});
+  const version=await post('/sync/mutations',push('map',3,[{...mutation(3,'x','map-a'),version:7}]));assert.equal(version.status,200,'an unsupported mutation version rejects only that mutation; the batch still settles');
+  assert.deepEqual((await version.json()).rejections,[{ordinal:3,code:'mutation_version_unsupported'}]);
   const ahead=await post('/sync/pull',JSON.stringify({clientId:'c',scope:'shared',fromCursor:1e9,models:{Task:1}}));assert.equal(ahead.status,400);assert.deepEqual(await ahead.json(),{code:'request.invalid'});
   const undeclared=await post('/sync/pull',JSON.stringify({clientId:'c',scope:'shared',fromCursor:0}));assert.equal(undeclared.status,400);assert.deepEqual(await undeclared.json(),{code:'request.invalid'});
   const unretained=await post('/sync/pull',JSON.stringify({clientId:'c',scope:'shared',fromCursor:0,models:{Task:9}}));assert.equal(unretained.status,409);

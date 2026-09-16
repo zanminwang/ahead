@@ -5,9 +5,10 @@
 //! mirror is `packages/server/host-contract.mts` and the shared examples are
 //! `fixtures/protocol/host-operations.json`; a change here belongs in all three.
 //!
-//! `handle` and `load` may answer with a refusal: the engine rolls the
-//! mutation back to its savepoint and records the code as that mutation's
-//! rejection. Every thrown host error still aborts the whole delivery
+//! `handle` and `load` may answer a refusal or a failure: a refusal rolls
+//! the mutation back to its savepoint and records the code as that
+//! mutation's rejection; a failure carries a thrown application error as
+//! data. Every other thrown host error still aborts the whole delivery
 //! ([#95](https://github.com/zanminwang/ahead/issues/95) narrows nothing more).
 use crate::{Error, Host, Result, code, valid_code};
 use ahead_core::read_counter;
@@ -221,38 +222,52 @@ pub struct Invalidation {
 pub type Scanned = Vec<Invalidation>;
 
 /// The answer to `load`: one entry per requested identity, `null` for a record
-/// that does not exist for this caller, or a refusal the engine records as the
-/// mutation's rejection (in a push) or reports for the page (in a pull).
+/// that does not exist for this caller, a refusal the engine records as the
+/// mutation's rejection (in a push) or reports for the page (in a pull), or a
+/// failure carrying a thrown loader error.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged, try_from = "LoadedWire")]
 pub enum Loaded {
     Rows(Vec<Option<Value>>),
     Refused { rejection: String },
+    Failed { error: String },
 }
 
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum LoadedWire {
     Rows(Vec<Option<Value>>),
-    Object(LoadedRefusal),
+    Object(LoadedObject),
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LoadedRefusal {
-    rejection: Value,
+struct LoadedObject {
+    #[serde(default, deserialize_with = "present")]
+    rejection: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    error: Option<Value>,
 }
 impl TryFrom<LoadedWire> for Loaded {
     type Error = String;
     fn try_from(wire: LoadedWire) -> std::result::Result<Self, String> {
         match wire {
             LoadedWire::Rows(rows) => Ok(Self::Rows(rows)),
-            LoadedWire::Object(LoadedRefusal { rejection }) => rejection
-                .as_str()
-                .filter(|code| valid_code(code))
-                .map(|code| Self::Refused {
-                    rejection: code.into(),
-                })
-                .ok_or_else(|| "invalid loader refusal code".into()),
+            LoadedWire::Object(LoadedObject { rejection, error }) => match (rejection, error) {
+                (Some(rejection), None) => rejection
+                    .as_str()
+                    .filter(|code| valid_code(code))
+                    .map(|code| Self::Refused {
+                        rejection: code.into(),
+                    })
+                    .ok_or_else(|| "invalid loader refusal code".into()),
+                (None, Some(error)) => error
+                    .as_str()
+                    .map(|error| Self::Failed {
+                        error: error.into(),
+                    })
+                    .ok_or_else(|| "invalid loader error".into()),
+                _ => Err("a load answer carries rows, a refusal or a failure, not several".into()),
+            },
         }
     }
 }
@@ -291,8 +306,9 @@ pub struct PublicationIntent {
 }
 
 /// The answer to `handle`: the records the handler changed beyond the
-/// uploaded operations and the publications it asked for, or a rejection
-/// code. Carrying both, or neither, is refused.
+/// uploaded operations and the publications it asked for, a rejection code,
+/// or a failure carrying a thrown handler error. Carrying more than one of
+/// these, or none, is refused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged, try_from = "HandledWire")]
 pub enum Handled {
@@ -302,6 +318,9 @@ pub enum Handled {
     },
     Rejected {
         rejection: String,
+    },
+    Failed {
+        error: String,
     },
 }
 
@@ -314,23 +333,32 @@ struct HandledWire {
     publications: Option<Value>,
     #[serde(default, deserialize_with = "present")]
     rejection: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    error: Option<Value>,
 }
 
 impl TryFrom<HandledWire> for Handled {
     type Error = String;
     fn try_from(wire: HandledWire) -> std::result::Result<Self, String> {
-        match (wire.changes, wire.publications, wire.rejection) {
-            (None, None, Some(rejection)) => rejection
+        match (wire.changes, wire.publications, wire.rejection, wire.error) {
+            (None, None, Some(rejection), None) => rejection
                 .as_str()
                 .filter(|code| valid_code(code))
                 .map(|code| Self::Rejected {
                     rejection: code.into(),
                 })
                 .ok_or_else(|| "invalid rejection code".into()),
-            (_, _, Some(_)) => {
-                Err("a settlement carries changes and publications or a rejection, not both".into())
-            }
-            (Some(changes), Some(publications), None) => {
+            (None, None, None, Some(error)) => error
+                .as_str()
+                .map(|error| Self::Failed {
+                    error: error.into(),
+                })
+                .ok_or_else(|| "invalid handler error".into()),
+            (_, _, Some(_), _) | (_, _, _, Some(_)) => Err(
+                "a settlement carries changes and publications, a rejection or a failure, not several"
+                    .into(),
+            ),
+            (Some(changes), Some(publications), None, None) => {
                 let changes: Vec<RecordRef> = serde_json::from_value(changes)
                     .map_err(|error| format!("invalid handler changes: {error}"))?;
                 let publications: Vec<PublicationIntent> = serde_json::from_value(publications)

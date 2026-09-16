@@ -61,6 +61,7 @@ struct State {
     savepoints: Vec<Tables>,
     reject_next: Option<String>,
     fail_next: bool,
+    break_next: bool,
     uppercase_next: bool,
     handler_calls: usize,
     accepted: usize,
@@ -165,8 +166,16 @@ impl MemHost {
     pub fn reject_next(&self, code: &str) {
         self.0.lock().unwrap().reject_next = Some(code.into());
     }
+    /// The next `handle` call is answered `Handled::Failed`: the engine rejects
+    /// just that mutation with `handler.failed` and the rest of the batch stands.
     pub fn fail_next(&self) {
         self.0.lock().unwrap().fail_next = true;
+    }
+    /// The next `rollback` (which follows a rejected or failed mutation) answers
+    /// with a host error instead: an infrastructure failure, not a business
+    /// rejection, so the whole delivery fails and nothing in it is committed.
+    pub fn break_next(&self) {
+        self.0.lock().unwrap().break_next = true;
     }
     /// The next accepted mutation stores its `text` uppercased: the server
     /// "normalizing" a value, so the receipt's authority differs from the optimism.
@@ -538,6 +547,15 @@ impl Host for MemHost {
                     response!(Acknowledged)
                 }
                 HostRequest::Rollback { .. } => {
+                    // A broken transaction: the infrastructure itself fails here,
+                    // rather than the handler answering a business rejection.
+                    // This aborts the whole delivery (see `push`'s rollback-on-error
+                    // logic), so nothing this attempt did survives.
+                    if s.break_next {
+                        s.break_next = false;
+                        s.failed += 1;
+                        return Err("injected broken transaction".into());
+                    }
                     // Mirrors SQL ROLLBACK TO SAVEPOINT: restores the snapshot but leaves
                     // it on the stack. The server always follows with a `release`, which
                     // is the one that pops it (mirroring RELEASE SAVEPOINT).
@@ -566,8 +584,10 @@ impl Host for MemHost {
                     }
                     if s.fail_next {
                         s.fail_next = false;
-                        s.failed += 1;
-                        return Err("injected failure".into());
+                        s.rejected += 1;
+                        return Ok(response!(Handled::Failed {
+                            error: "injected failure".into(),
+                        }));
                     }
                     if let Some(code) = s.reject_next.take() {
                         s.rejected += 1;
@@ -871,9 +891,34 @@ mod tests {
             1,
             "the rollback undid nothing more"
         );
+        // A handler failure is a rejection of that one mutation: the batch
+        // commits, it just carries `handler.failed` in place of a business code.
         host.fail_next();
-        assert!(
+        let failed = PushReceipt::decode(
             host.push("u", &push_bytes("c1", 3, &schema::edit("e1", "boom")))
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(failed.rejections.len(), 1);
+        assert_eq!(failed.rejections[0].code, "handler.failed");
+        assert_eq!(host.state(&entry_key("e1")).unwrap()["text"], "hi");
+        assert_eq!(host.head("a"), 1);
+        assert_eq!(host.stamp(&entry_key("e1")), 1);
+        assert_eq!(
+            host.savepoint_depth(),
+            0,
+            "the rolled-back savepoint must not leak"
+        );
+        // A broken transaction (a host infrastructure error on `rollback`, not
+        // a handler rejection) aborts the whole delivery: nothing is
+        // committed and the client's retry with the same bytes is expected to
+        // reach the handler again. `rollback` only runs after a refused
+        // mutation, so this pairs `break_next` with a rejection to reach it.
+        host.reject_next("entry.denied");
+        host.break_next();
+        assert!(
+            host.push("u", &push_bytes("c1", 4, &schema::edit("e1", "boom")))
                 .is_err()
         );
         assert_eq!(host.state(&entry_key("e1")).unwrap()["text"], "hi");
@@ -884,9 +929,9 @@ mod tests {
             0,
             "the failed batch's savepoint must not leak"
         );
-        // The failed batch left no receipt, so sequence 3 is still next.
+        // The failed batch left no receipt, so sequence 4 is still next.
         let ok = PushReceipt::decode(
-            host.push("u", &push_bytes("c1", 3, &schema::edit("e1", "yes")))
+            host.push("u", &push_bytes("c1", 4, &schema::edit("e1", "yes")))
                 .unwrap()
                 .as_bytes(),
         )

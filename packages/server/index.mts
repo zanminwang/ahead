@@ -340,7 +340,14 @@ export interface BackendOptions<T> {
   >;
   translateRejection?: (error: unknown) => string | null | undefined;
   native?: Native;
-  /** Called for server-side failures that clients only see as `{ code: "server" }`: authenticate throws, persistence faults, loader defects, live drain failures. */
+  /**
+   * Called for every non-business error the host catches: a thrown handler
+   * or loader error (answered as `handler.failed`/`loader.failed`, visible
+   * to the client only as that mutation's rejection code), and every
+   * server-side failure clients see only as `{ code: "server" }` -
+   * authenticate throws, persistence faults, loader defects, live drain
+   * failures.
+   */
   onError?: (error: unknown) => void;
 }
 /** JSON cannot represent nonfinite values or undefined array items. Never turn either into null. */
@@ -502,14 +509,26 @@ export function createBackend<T>(options: BackendOptions<T>) {
     });
   const sessions = new Map<T, Session>();
   const wakes = new WakeHub();
-  /** The rejection code an application error stands for, or the error itself when it stands for none. */
-  const refusal = (error: unknown): { rejection: string } => {
+  /**
+   * Rejection versus failure: a business error a handler or loader raises on
+   * purpose (`MutationRejected`, or one `translateRejection` recognizes)
+   * rejects only that mutation with its stable code. Any other thrown error
+   * is a defect: reported to `onError` and answered as a failure, which also
+   * rejects only that mutation (`handler.failed` or `loader.failed`), but
+   * carries the thrown message as data instead of a machine code. Only a
+   * persistence fault - outside these try blocks - still aborts the whole
+   * delivery.
+   */
+  const refusal = (
+    error: unknown,
+  ): { rejection: string } | { error: string } => {
     const code =
       error instanceof MutationRejected
         ? error.code
         : options.translateRejection?.(error);
-    if (code == null) throw error;
-    return { rejection: new MutationRejected(code).code };
+    if (code != null) return { rejection: new MutationRejected(code).code };
+    options.onError?.(error);
+    return { error: error instanceof Error ? error.message : String(error) };
   };
   const host = (
     tx: T,
@@ -610,8 +629,10 @@ export function createBackend<T>(options: BackendOptions<T>) {
           // A read refusal (`MutationRejected` or a translated error) is
           // answered as data: the engine records it as the mutation's
           // rejection in a push and refuses the page in a pull. Any other
-          // error is a defect and aborts the delivery.
-          let refused: { rejection: string } | undefined;
+          // thrown error is also answered as data - a failure - which the
+          // engine turns into `loader.failed` for the mutation it was
+          // reading back for.
+          let refused: { rejection: string } | { error: string } | undefined;
           let rows: unknown;
           try {
             await options.loaderHooks?.[

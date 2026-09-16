@@ -359,13 +359,15 @@ test('a backend restart on the same database keeps state and delivers work queue
  });
 });
 
-test('a completion request without a boolean done is refused by the runtime as mutation.invalid before the handler runs', async () => {
+test('a completion request without a boolean done is an empty patch: a no-op the handler sees once', async () => {
  await scenario(async ctx => {
   const alice = await ctx.open('alice', 'alice');
   await wait(async () => (await alice.models.todo.get({ id: 'seed-1' })) !== null, 'Alice catches up');
+  const before = ctx.app.handlerCalls;
   await alice.client.mutate({ name: 'SetTodoDone', version: 1, operations: [{ model: 'Todo', op: 'update', identity: { id: 'seed-1' }, values: {} }] });
-  await ctx.rejection(alice, 'mutation.invalid');
-  assert.equal(ctx.app.handlerCalls, 0, 'the handler never sees a patch without done');
-  assert.equal((await ctx.row('seed-1')).done, false);
+  await ctx.settled(alice);
+  assert.equal(ctx.app.handlerCalls, before + 1, 'the handler runs with an empty patch');
+  assert.deepEqual((await alice.status()).rejections, []);
+  assert.equal((await ctx.row('seed-1')).done, false, 'nothing was written');
  });
 });

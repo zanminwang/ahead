@@ -7,8 +7,9 @@
  * (`crates/server/tests/host_contract.rs`,
  * `integration/persistence/server/host-contract.test.mjs`) fail on a one-sided one.
  *
- * `handle` and `load` may answer with a refusal: the engine rolls that mutation
- * back to its savepoint and records the code as its rejection. Every thrown
+ * `handle` and `load` may answer a refusal or a failure: a refusal rolls that
+ * mutation back to its savepoint and records the code as its rejection; a
+ * failure carries a thrown application error as data. Every other thrown
  * host error still aborts the whole delivery.
  */
 
@@ -145,24 +146,30 @@ export type HostRecordRef = {
 export type PublicationIntent = { channel: string; records?: HostRecordRef[] };
 /**
  * The answer to `handle`: the records the handler changed beyond the uploaded
- * operations and the publications it asked for, or a rejection code, never
- * both.
+ * operations and the publications it asked for, a rejection code, or a
+ * failure carrying a thrown handler error — never more than one of these.
  *
- * "Never both" is not something this union can enforce. TypeScript only applies
- * its excess-property check to object literals, so a value that reaches here
- * through a variable satisfies the union with both keys set. Rust enforces it
- * on decode (`HandledWire` in crates/server/src/host.rs), which refuses such an
- * answer with `handler.invalid` rather than reading it as a rejection.
+ * "Never more than one" is not something this union can enforce. TypeScript
+ * only applies its excess-property check to object literals, so a value that
+ * reaches here through a variable satisfies the union with several keys set.
+ * Rust enforces it on decode (`HandledWire` in crates/server/src/host.rs),
+ * which refuses such an answer with `handler.invalid` rather than reading it
+ * as a rejection or a failure.
  */
 export type Handled =
   | { changes: HostRecordRef[]; publications: PublicationIntent[] }
-  | { rejection: string };
+  | { rejection: string }
+  | { error: string };
 /**
  * The answer to `load`: one entry per identity, `null` for a record that does
- * not exist for this caller, or a refusal the engine records as the mutation's
- * rejection (push) or reports for the page (pull).
+ * not exist for this caller, a refusal the engine records as the mutation's
+ * rejection (push) or reports for the page (pull), or a failure carrying a
+ * thrown loader error.
  */
-export type Loaded = (Record<string, unknown> | null)[] | { rejection: string };
+export type Loaded =
+  | (Record<string, unknown> | null)[]
+  | { rejection: string }
+  | { error: string };
 
 /** The answer each operation owes, keyed by `op`. */
 export type HostResponse = {

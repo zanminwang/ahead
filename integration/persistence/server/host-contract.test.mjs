@@ -45,7 +45,7 @@ const fakePersistence=seen=>({
  * Drives the host callback with the fixture requests instead of a real push.
  * Returns [op, response] for every replayed request, plus what the persistence saw.
  */
-async function replay(requests,{reject=false}={}){
+async function replay(requests,{reject=false,fail=false,onError}={}){
  const seen=[],answers=[],handled=[],loaded=[];
  const backend=createBackend({
   config,
@@ -62,6 +62,7 @@ async function replay(requests,{reject=false}={}){
   },
   database:{transaction:body=>body({}),persistence:()=>fakePersistence(seen)},
   authenticate:()=>'alice',
+  onError,
   // The seeded change set (the update slot's t-1) plus one addition, published
   // by default to one channel and explicitly to another: the fixture's settlement.
   handlers:{async edit({input,changes,publish}){
@@ -70,8 +71,9 @@ async function replay(requests,{reject=false}={}){
    publish({channel:'shared'});
    publish({channel:'other',records:[input.task]});
    if(reject)throw new MutationRejected('task.refused');
+   if(fail)throw new Error('boom');
   }},
-  loaders:{async task(call){loaded.push(call);return response('load','rows');}},
+  loaders:{async task(call){loaded.push(call);if(fail)throw new Error('boom');return response('load','rows');}},
  });
  await backend.push('alice','{}');
  return {answers,seen,handled,loaded};
@@ -106,6 +108,22 @@ test('every fixture request replays through the TypeScript host to the fixture a
 test('the same handle request settles as the fixture rejection when the handler refuses',async()=>{
  const {answers}=await replay([entry('handle').request],{reject:true});
  assert.deepEqual(answers,[['handle',response('handle','rejected')]]);
+});
+
+test('a thrown handler error answers as a failure and reaches onError',async()=>{
+ const errors=[];
+ const {answers}=await replay([entry('handle').request],{fail:true,onError:e=>errors.push(e)});
+ assert.equal(answers.length,1);assert.equal(answers[0][0],'handle');
+ assert.equal(typeof answers[0][1].error,'string');
+ assert.equal(errors.length,1);assert.equal(errors[0].message,'boom');
+});
+
+test('a thrown loader error answers as a failure and reaches onError',async()=>{
+ const errors=[];
+ const {answers}=await replay([entry('load').request],{fail:true,onError:e=>errors.push(e)});
+ assert.equal(answers.length,1);assert.equal(answers[0][0],'load');
+ assert.equal(typeof answers[0][1].error,'string');
+ assert.equal(errors.length,1);assert.equal(errors[0].message,'boom');
 });
 
 test('Prisma persistence answers the persistence half and refuses application operations',async()=>{

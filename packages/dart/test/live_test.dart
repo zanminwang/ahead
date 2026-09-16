@@ -1603,4 +1603,83 @@ void moreTests() {
       }
     },
   );
+
+  test(
+    'an owner-mismatch refusal reaches onError and leaves the batch frozen for a resend',
+    () async {
+      final dir = await Directory.systemTemp.createTemp(
+        'ahead-owner-mismatch-',
+      );
+      final schema =
+          jsonDecode(
+                await File('../../fixtures/schemas/entry.json').readAsString(),
+              )
+              as Map<String, dynamic>;
+      final client = await Client.open(
+        path: '${dir.path}/client.sqlite',
+        schema: schema,
+        libraryPath: Platform.environment['AHEAD_LIBRARY']!,
+      );
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final bodies = <Map>[];
+      final errors = <Object>[];
+      server.listen((request) async {
+        final body = jsonDecode(await utf8.decoder.bind(request).join()) as Map;
+        bodies.add(body);
+        request.response.statusCode = 403;
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(jsonEncode({'code': 'client.owner_mismatch'}));
+        await request.response.close();
+      });
+      try {
+        await client.mutate({
+          'name': 'Create',
+          'operations': [
+            {
+              'model': 'Entry',
+              'op': 'create',
+              'identity': {'id': 'live'},
+              'values': {'text': 'local', 'note': null},
+            },
+          ],
+        });
+        expect((await client.status())['pending'], 1);
+        await client.connect(
+          SyncServer(
+            url: 'http://127.0.0.1:${server.port}',
+            token: () => 'secret',
+          ),
+          onError: errors.add,
+        );
+        final deadline = DateTime.now().add(const Duration(seconds: 3));
+        while (DateTime.now().isBefore(deadline) && bodies.length < 2) {
+          await Future<void>.delayed(const Duration(milliseconds: 5));
+        }
+        expect(
+          bodies.length,
+          greaterThanOrEqualTo(2),
+          reason: 'the frozen batch is resent after the refusal',
+        );
+        expect(
+          errors.any((e) => e.toString().contains('client.owner_mismatch')),
+          isTrue,
+          reason: "the refusal's code reaches onError: $errors",
+        );
+        expect(
+          (await client.status())['pending'],
+          1,
+          reason: 'the refused batch stays pending, not dropped or completed',
+        );
+        expect(
+          bodies[1],
+          equals(bodies[0]),
+          reason: 'the same request body is resent on the next cycle',
+        );
+      } finally {
+        await client.close();
+        await server.close(force: true);
+        await dir.delete(recursive: true);
+      }
+    },
+  );
 }

@@ -126,7 +126,9 @@ handlers.edit = {
 };
 ```
 
-A bare function always means v1, never the latest version, so a mutation whose retained versions are not exactly v1 refuses it at startup, as does a missing version, an unknown `v<n>` key or a value that is not a function. A request reaches only the handler of the version it names; there is no fallback. A known but unsupported version fails before any handler executes.
+A bare function always means v1, never the latest version, so a mutation whose retained versions are not exactly v1 refuses it at startup, as does a missing version, an unknown `v<n>` key or a value that is not a function. A request reaches only the handler of the version it names; there is no fallback. A mutation naming a known but unsupported version is rejected `mutation_version_unsupported` without calling any handler; the rest of the batch is unaffected.
+
+Any other error a handler throws — not `MutationRejected`, not a code `translateRejection` maps — rejects that mutation with `handler.failed`, is reported to `onError`, and the rest of the batch commits ([#95](https://github.com/zanminwang/ahead/issues/95)).
 
 ## Loaders
 
@@ -176,11 +178,12 @@ What each item may be:
 | A row object | The record's current state for this user | Delivered with the record's current stamp |
 | `null` | The record does not exist, or this user must not see it | Delivered as a deletion. A newer stamp clears the authoritative row, whichever channel delivered it; the client keeps the stamp so older content cannot bring the record back; pending local operations are replayed on that state. |
 | a thrown `MutationRejected` (or an error `translateRejection` maps to a code) | A refused read | In a push, the mutation whose result is being read back is rejected with that code and rolled back; in a pull, the page fails with `loader.refused` and `onError`, and the client's cursor does not move |
+| any other thrown error, during a push's readback | A failure | The mutation whose result is being read back is rejected with `loader.failed`, is reported to `onError`, and the rest of the batch commits ([#95](https://github.com/zanminwang/ahead/issues/95)) |
 | `undefined`, a missing entry, a non-array result | A defect | The pull fails with `500 server` and `onError`; the client's cursor does not move |
 
 A row object must match the generated model type exactly. Include every non-identity field: a nullable field that is absent reads as `null`, but an absent non-nullable field is a defect. The identity fields may be present. Any other property, such as an extra database column or a relation object, is a defect. Map your rows to the model type rather than returning a wider database row.
 
-Loaders run during synchronization and during a push's readback, not when the app calls local `get`, `query` or `watch`. A malformed result or thrown error fails the request; the backend does not silently skip the failed loader result and advance its cursor.
+Loaders run during synchronization and during a push's readback, not when the app calls local `get`, `query` or `watch`. A malformed result still fails the request outright; the backend does not silently skip the failed loader result and advance its cursor. A thrown error during a push's readback is isolated to that mutation as described above; the same error during a pull still fails the whole page, since loader errors on pull pages are a separate, still-open half of [#95](https://github.com/zanminwang/ahead/issues/95).
 
 ## Publishing
 
@@ -230,17 +233,18 @@ A change allocates one **stamp** per record; publishing allocates a **cursor** i
 
 Codes must match `^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$`, such as `entry.denied`. An invalid code is itself an error. A recognized business rejection rolls back that mutation's business writes, stamps and publications and is included in the receipt. A loader that throws one while a push reads the mutation's results back rejects that mutation the same way. The client rolls back its optimistic change and retains a rejection entry. A network error is not a business rejection and must not cause a duplicate business action.
 
-Unexpected exceptions abort the batch transaction. Do not translate every exception into a rejection: a database outage or programming error should remain a retryable request failure. `onError` receives failures including authentication exceptions, persistence faults, publication errors and live-drain failures.
+Rejection codes appear in a mutation's receipt entry, never in an HTTP status or a thrown request failure: `entry.denied`-style codes you or `translateRejection` produce; `mutation_version_unsupported` for a mutation naming an unregistered version; `model_version_unsupported` for a handler that changed a model the client did not declare or declared at an unretained version; `handler.failed` for any other error a handler threw; `loader.failed` for any other error a loader threw while a push read a mutation's results back. Each rejects only that one mutation; the rest of the batch commits ([#95](https://github.com/zanminwang/ahead/issues/95)).
 
-Protocol refusals are answered with a status and a JSON body chosen by the engine error's `code`. Rewording a message never changes a status.
+Unexpected exceptions that are not one of the above — a persistence fault, a failed `rollback`, or any host callback failure the engine cannot classify as a mutation outcome — abort the whole delivery transaction. Do not translate every exception into a rejection: a database outage or programming error should remain a retryable request failure. `onError` receives failures including authentication exceptions, persistence faults, publication errors, live-drain failures, and every `handler.failed`/`loader.failed` error (the underlying thrown error, not just the code).
+
+Protocol refusals are answered with a status and a JSON body chosen by the engine error's `code`. Rewording a message never changes a status. `mutation_version_unsupported` and `model_version_unsupported` no longer abort a push at the HTTP level — see the rejection codes above; `model_version_unsupported` stays a whole-request `409` for pull and live subscribe, which still check declarations up front.
 
 | Code | HTTP status | Meaning |
 | --- | --- | --- |
 | `request.invalid` | 400 | Malformed body, or a pull cursor ahead of the channel head |
 | `client.owner_mismatch` | 403 | The client identity belongs to another user |
 | `gap`, `overlap` | 409 | The batch sequence is not the next one and not a retry of the last |
-| `mutation_version_unsupported` | 409 | A mutation version this backend does not serve; the body adds `ordinal`, `name` and `version` |
-| `model_version_unsupported` | 409 | A model read contract this backend does not serve: the client declared an unknown model or an unretained version (body adds `model` and `version`), or a page holds a model the client did not declare (body adds `model`). On the WebSocket the handshake closes with `1002` and this code as the reason. Inside a push, a handler changing a model the client did not declare rejects that mutation with this code instead. |
+| `model_version_unsupported` | 409 | Pull and live subscribe only: a model read contract this backend does not serve — the client declared an unknown model or an unretained version (body adds `model` and `version`), or a page holds a model the client did not declare (body adds `model`). On the WebSocket the handshake closes with `1002` and this code as the reason. Inside a push, this is a per-mutation rejection code instead (above), not an HTTP status. |
 | `loader.refused` | 500 `{ code: "server" }` | A loader refused a read while a page was being served; the `EngineError` with the model and code goes to `onError`. In a push the same refusal is the mutation's rejection, not a request failure. |
 | `handler.invalid` | 500 `{ code: "server" }` | The handler's settlement could not be used: an invalid rejection code, or a change or publication naming a record without a model or an object identity |
 | anything else | 500 `{ code: "server" }` | A server-side failure; the `EngineError` or thrown error goes to `onError` |

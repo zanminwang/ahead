@@ -22,8 +22,9 @@ pub mod code {
     pub const MUTATION_VERSION_UNSUPPORTED: &str = "mutation_version_unsupported";
     /// A model read contract this backend does not serve: the client declared
     /// a model or version that is not retained, or a page holds a model the
-    /// client did not declare. Refuses the whole request today; per-read
-    /// isolation is [#95](https://github.com/zanminwang/ahead/issues/95).
+    /// client did not declare. In a push this rejects only the mutation that
+    /// touched the model; a page still fails whole (per-read isolation for
+    /// pages is [#95](https://github.com/zanminwang/ahead/issues/95)).
     pub const MODEL_VERSION_UNSUPPORTED: &str = "model_version_unsupported";
     /// The owner is blank.
     pub const PRINCIPAL_INVALID: &str = "principal.invalid";
@@ -37,6 +38,12 @@ pub mod code {
     pub const STORAGE_INVALID: &str = "storage.invalid";
     /// A handler settled a mutation with an invalid rejection code or checkpoint.
     pub const HANDLER_INVALID: &str = "handler.invalid";
+    /// The handler threw an error that is not a business rejection; the error
+    /// reached `onError`. Rejects only that mutation.
+    pub const HANDLER_FAILED: &str = "handler.failed";
+    /// A loader threw an error that is not a business rejection; the error
+    /// reached `onError`. Rejects only the mutation it was reading back for.
+    pub const LOADER_FAILED: &str = "loader.failed";
     /// A loader is not registered for the model.
     pub const LOADER_UNREGISTERED: &str = "loader.unregistered";
     /// A loader returned rows the schema cannot accept.
