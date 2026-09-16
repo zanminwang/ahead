@@ -337,13 +337,14 @@ impl<S: ClientStore> Client<S> {
             ddl::Layout::Current => {
                 store.execute_batch(ddl::FRAMEWORK_DDL)?;
                 match schema_store::read_descriptor(&mut store)? {
-                    None => match Self::open(store, schema.clone()) {
-                        Ok(client) => client,
-                        Err(e) => {
-                            let mut store = factory(&file)?;
+                    // A database from before descriptors were stored: only its
+                    // tables can say whether it fits. Any other open failure is
+                    // an error, never a reason to switch files.
+                    None => match ddl::incompatibility(&mut store, &schema)? {
+                        None => Self::open(store, schema.clone())?,
+                        Some(reason) => {
                             let pending = count_rows(&mut store, "ahead_mutation")?;
                             drop(store);
-                            let reason = e.to_string();
                             Self::rebuild_beside(
                                 &path, &factory, &file, &schema, &reason, pending, 0,
                             )?
@@ -384,9 +385,10 @@ impl<S: ClientStore> Client<S> {
         Ok(client)
     }
     /// Create `<path>.<n>`, initialise it for `schema`, carry the old file's
-    /// subscriptions over at cursor 0, and point the sidecar at it. Numbered
-    /// files the sidecar does not name are abandoned rebuilds and are removed;
-    /// the old file itself is kept.
+    /// subscriptions over at cursor 0, and point the sidecar at it. Files are
+    /// numbered upward: a numbered file above the one in use was never pointed
+    /// at (an interrupted rebuild) and is removed; the file in use and every
+    /// earlier generation are kept.
     fn rebuild_beside(
         path: &std::path::Path,
         factory: &dyn Fn(&std::path::Path) -> Result<S>,
@@ -396,8 +398,9 @@ impl<S: ClientStore> Client<S> {
         left_pending: usize,
         left_direct: usize,
     ) -> Result<Self> {
+        let in_use = schema_store::file_number(path, old_file);
         for stray in schema_store::numbered_files(path) {
-            if stray != old_file {
+            if schema_store::file_number(path, &stray) > in_use {
                 schema_store::remove_database_files(&stray);
             }
         }

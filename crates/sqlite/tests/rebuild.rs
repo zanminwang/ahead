@@ -304,3 +304,68 @@ fn a_current_layout_file_without_a_descriptor_adopts_the_schema_it_opens_with() 
         "reconciliation failed, so the file is rebuilt beside"
     );
 }
+
+fn breaking_again() -> Schema {
+    let mut v = serde_json::to_value(breaking()).unwrap();
+    v["models"][0]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name":"owner","nullable":false,"type":{"kind":"scalar","name":"string"}}));
+    Schema::from_value(v).unwrap()
+}
+
+/// Every earlier generation survives later rebuilds: only a numbered file
+/// above the one in use (never pointed at) is removed, and numbers only grow.
+#[test]
+fn earlier_generations_survive_later_rebuilds() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    drop(open_at(&path, schema()));
+    drop(open_at(&path, breaking()));
+    assert_eq!(sidecar(&path).as_deref(), Some("db.1"));
+    drop(open_at(&path, breaking_again()));
+    assert_eq!(sidecar(&path).as_deref(), Some("db.2"));
+    assert!(path.exists(), "the first generation is kept");
+    assert_eq!(
+        numbered(dir.path()),
+        vec!["db.1".to_string(), "db.2".to_string()]
+    );
+    // The application deletes the oldest numbered generation; numbering still grows.
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(dir.path().join(format!("db.1{suffix}")));
+    }
+    drop(open_at(&path, schema()));
+    assert_eq!(sidecar(&path).as_deref(), Some("db.3"));
+    assert_eq!(
+        numbered(dir.path()),
+        vec!["db.2".to_string(), "db.3".to_string()]
+    );
+}
+
+/// A database from before descriptors were stored opens in place when its
+/// tables fit, and records the descriptor; it is rebuilt only when they do not.
+#[test]
+fn a_database_without_a_descriptor_is_rebuilt_only_when_its_tables_do_not_fit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    drop(open_at(&path, schema()));
+    {
+        let mut store = SqliteStore::open(&path).unwrap();
+        store.execute("DELETE FROM ahead_schema", &[]).unwrap();
+    }
+    let mut c = open_at(&path, wider());
+    assert!(!c.schema_state().rebuilt, "compatible tables open in place");
+    assert!(sidecar(&path).is_none());
+    assert!(descriptor(&mut c).contains("extra"));
+    drop(c);
+    {
+        let mut store = SqliteStore::open(&path).unwrap();
+        store.execute("DELETE FROM ahead_schema", &[]).unwrap();
+    }
+    let c = open_at(&path, breaking());
+    assert!(
+        c.schema_state().rebuilt,
+        "a missing required column rebuilds"
+    );
+    assert_eq!(sidecar(&path).as_deref(), Some("db.1"));
+}

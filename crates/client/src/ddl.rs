@@ -240,6 +240,42 @@ fn existing<S: ClientStore>(store: &mut S, table: &str) -> Result<Option<Existin
     }))
 }
 
+/// Why the tables in `store` cannot be reconciled with `schema`, if they
+/// cannot: the same refusals [`reconcile`] makes, found by reading only. A
+/// storage failure is an error, never a reason, so a caller can tell an
+/// incompatible layout from a database that merely failed to answer.
+pub fn incompatibility<S: ClientStore>(store: &mut S, schema: &Schema) -> Result<Option<String>> {
+    for model in &schema.models {
+        let Some(current) = existing(store, &model.name)? else {
+            continue;
+        };
+        if current.identity != model.identity {
+            return Ok(Some(format!("identity columns of {} changed", model.name)));
+        }
+        for field in &model.fields {
+            match current.columns.get(&field.name) {
+                Some(ty) if ty == storage_type(&field.value_type) => {}
+                Some(ty) => {
+                    return Ok(Some(format!(
+                        "column {}.{} is {ty} in the database but {} in the schema",
+                        model.name,
+                        field.name,
+                        storage_type(&field.value_type)
+                    )));
+                }
+                None if !field.nullable && field.default.is_none() => {
+                    return Ok(Some(format!(
+                        "column {}.{} is not nullable and has no default",
+                        model.name, field.name
+                    )));
+                }
+                None => {}
+            }
+        }
+    }
+    Ok(None)
+}
+
 pub fn reconcile<S: ClientStore>(store: &mut S, schema: &Schema) -> Result<()> {
     for model in &schema.models {
         let Some(current) = existing(store, &model.name)? else {

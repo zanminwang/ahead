@@ -50,20 +50,32 @@ pub fn set_current_file(path: &Path, file: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `<path>.<n>` for the smallest `n >= 1` that names no existing file.
+/// The generation number of `file`: 0 for `path` itself, `n` for `<path>.<n>`.
+pub fn file_number(path: &Path, file: &Path) -> u64 {
+    let base = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    file.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix(&format!("{base}.")))
+        .and_then(|rest| rest.parse().ok())
+        .unwrap_or(0)
+}
+
+/// `<path>.<n>` one above every existing numbered file, so numbers only grow
+/// even after the application deletes an old generation.
 pub fn next_free_file(path: &Path) -> PathBuf {
     let base = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let mut n = 1;
-    loop {
-        let candidate = path.with_file_name(format!("{base}.{n}"));
-        if !candidate.exists() {
-            return candidate;
-        }
-        n += 1;
-    }
+    let highest = numbered_files(path)
+        .iter()
+        .map(|f| file_number(path, f))
+        .max()
+        .unwrap_or(0);
+    path.with_file_name(format!("{base}.{}", highest + 1))
 }
 
 /// Every `<path>.<n>` file beside `path`, whatever its state.
