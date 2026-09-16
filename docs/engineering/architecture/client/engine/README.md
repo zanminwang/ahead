@@ -14,6 +14,20 @@ The engine is the client's sync logic. It has no memory between calls: every ope
 
 ## How the parts work together
 
+```mermaid
+flowchart LR
+    W["Writes<br/>visible row + before image"] --> Q["Push<br/>queue → frozen batch"]
+    Q -- "request bytes" --> SRV(("server"))
+    SRV -- "receipt: records @stamp" --> S["Settlement<br/>stage by stamp, remove batch, replay"]
+    SRV -- "page: changes @stamp" --> P["Pull<br/>stage by stamp, advance cursor"]
+    S --> A["authority applier<br/>newer stamp wins"]
+    P --> A
+    A --> W
+```
+
+A receipt and a page for the same change carry the same stamp; whichever arrives second rewrites nothing.
+
+
 One local edit passes through all four:
 
 1. **Write.** [Local operations](local-operations/README.md) applies the edit to the visible table, keeps the server's last row in a before image, and stores the mutation in the queue.
