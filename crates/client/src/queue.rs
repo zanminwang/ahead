@@ -25,6 +25,9 @@ pub struct QueuedOp {
 pub struct Queued {
     pub ordinal: u64,
     pub push: Option<u64>,
+    /// A replay of one of its operations failed over newer authority; the
+    /// base is visible and the mutation is still sent.
+    pub diverged: bool,
     pub mutation: Mutation,
 }
 
@@ -179,7 +182,7 @@ impl<S: ClientStore> Engine<'_, S> {
     fn queued_where(&mut self, filter: &str, params: &[Value]) -> Result<Vec<Queued>> {
         let mutations = self.rows(
             &format!(
-                "SELECT ordinal, name, version, push FROM ahead_mutation {filter} ORDER BY ordinal"
+                "SELECT ordinal, name, version, push, diverged FROM ahead_mutation {filter} ORDER BY ordinal"
             ),
             params,
         )?;
@@ -233,6 +236,7 @@ impl<S: ClientStore> Engine<'_, S> {
             result.push(Queued {
                 ordinal,
                 push: row[3].as_u64(),
+                diverged: row[4].as_u64().unwrap_or(0) != 0,
                 mutation,
             });
         }
@@ -256,6 +260,16 @@ impl<S: ClientStore> Engine<'_, S> {
             .into_values()
             .flatten()
             .collect())
+    }
+    /// Mark a queued mutation as diverged; completion or rejection removes
+    /// the row and with it the mark.
+    pub fn set_diverged(&mut self, ordinal: u64) -> Result<()> {
+        self.exec(
+            "ahead_mutation",
+            "UPDATE ahead_mutation SET diverged=1 WHERE ordinal=?",
+            &[json!(ordinal)],
+        )?;
+        Ok(())
     }
     pub fn dirty(&mut self, key: &RecordKey) -> Result<bool> {
         Ok(self

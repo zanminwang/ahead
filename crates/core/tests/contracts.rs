@@ -71,21 +71,23 @@ fn independent_schemas_load_without_business_rust_types() {
 }
 
 #[test]
-fn wire_names_remain_legacy_and_counters_are_safe() {
-    let page=PullPage::decode(br#"{"scope":"book:1","fromCursor":0,"toCursor":2,"changes":[{"syncId":2,"model":"Entry","identity":{"id":"x"},"stamp":2,"state":null}],"future":true}"#).unwrap();
-    assert_eq!(page.channel, "book:1");
-    assert_eq!(page.to_cursor, 2);
+fn a_page_names_its_channels_and_keeps_unknown_fields_out_of_the_records() {
+    let page=PullPage::decode(br#"{"cursors":{"book:1":{"from":0,"to":2,"head":2}},"changes":[{"model":"Entry","identity":{"id":"x"},"stamp":2,"state":null}],"future":true}"#).unwrap();
+    assert_eq!(page.channels().collect::<Vec<_>>(), ["book:1"]);
+    assert_eq!(page.cursors["book:1"].to, 2);
     let wire: Value = serde_json::from_slice(&page.encode().unwrap()).unwrap();
-    assert_eq!(wire["scope"], "book:1");
-    assert!(wire.get("channel").is_none());
+    assert!(wire.get("scope").is_none());
+    assert!(wire["changes"][0].get("syncId").is_none());
     assert!(
-        PullPage::decode(
-            br#"{"scope":"a","fromCursor":0,"toCursor":9007199254740992,"changes":[]}"#
-        )
-        .is_err()
+        wire["changes"][0].get("error").is_none(),
+        "no error is no field"
     );
     assert!(
-        PullPage::decode(br#"{"scope":"a","fromCursor":2,"toCursor":1,"changes":[]}"#).is_err()
+        PullPage::decode(br#"{"cursors":{"a":{"from":0,"to":9007199254740992,"head":9007199254740992}},"changes":[]}"#)
+            .is_err()
+    );
+    assert!(
+        PullPage::decode(br#"{"cursors":{"a":{"from":2,"to":1,"head":1}},"changes":[]}"#).is_err()
     );
 }
 
@@ -158,20 +160,14 @@ fn receipt_wire_round_trips_and_carries_authority_without_a_cursor() {
     assert!(receipt.answers("device-1", 4));
     assert!(!receipt.answers("device-1", 5));
     assert!(!receipt.answers("device-2", 4));
-    // A channel change is the same authority plus a delivery cursor; converting
-    // it discards only the cursor, and no cursor is ever invented the other way.
-    let change = RecordChange {
-        cursor: 9,
-        model: "Entry".into(),
-        identity: json!({"id":"e"}),
-        stamp: 12,
-        state: json!({"text":"Hello","note":null}),
-    };
-    let authority: AuthorityRecord = change.into();
-    assert_eq!(authority, receipt.records[0]);
+    // A page change is the same type: a page's record decodes as a receipt's.
+    let page = PullPage::decode(br#"{"cursors":{"a":{"from":8,"to":9,"head":9}},"changes":[{"model":"Entry","identity":{"id":"e"},"stamp":12,"state":{"text":"Hello","note":null}}]}"#).unwrap();
+    assert_eq!(page.changes[0], receipt.records[0]);
     let wire: Value = serde_json::from_slice(&receipt.encode().unwrap()).unwrap();
     assert!(wire["records"][0].get("syncId").is_none());
     assert!(wire.get("requiredCheckpoints").is_none());
+    // A receipt never carries a read failure.
+    assert!(PushReceipt::decode(br#"{"clientId":"d","batchSequence":1,"rejections":[],"records":[{"model":"Entry","identity":{"id":"e"},"stamp":1,"error":"loader.failed"}]}"#).is_err());
 }
 
 #[test]
@@ -216,12 +212,72 @@ fn received_state_supports_additive_schema_evolution() {
 #[test]
 fn server_pull_request_accepts_js_integer_number_spellings() {
     for number in ["0.0", "1e0", "-0"] {
-        let wire = format!(
-            "{{\"clientId\":\"c\",\"scope\":\"s\",\"fromCursor\":{number},\"models\":{{\"Entry\":1}}}}"
-        );
+        let wire = format!("{{\"cursors\":{{\"s\":{number}}},\"models\":{{\"Entry\":1}}}}");
         assert!(PullRequest::decode(wire.as_bytes()).is_ok(), "{number}");
     }
 }
+
+#[test]
+fn pull_page_fixture_cases_decode_as_declared() {
+    let fixture: Value =
+        serde_json::from_str(include_str!("../../../fixtures/protocol/pull-page.json")).unwrap();
+    let canonical = &fixture["canonical"];
+    let page = PullPage::decode(canonical["wire"].as_str().unwrap().as_bytes()).unwrap();
+    assert_eq!(
+        page.channels().collect::<Vec<_>>(),
+        canonical["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        page.changes.len(),
+        canonical["changes"].as_u64().unwrap() as usize
+    );
+    assert_eq!(page.changes[2].error.as_deref(), Some("loader.failed"));
+    assert!(!page.cursors["book:demo"].continues(), "at head");
+    assert!(
+        PullPage::decode(br#"{"cursors":{"a":{"from":0,"to":50,"head":80}},"changes":[]}"#)
+            .unwrap()
+            .cursors["a"]
+            .continues()
+    );
+    assert!(page.changes[2].is_error() && page.changes[2].state.is_null());
+    assert_eq!(
+        String::from_utf8(page.encode().unwrap()).unwrap(),
+        canonical["wire"].as_str().unwrap(),
+        "the canonical bytes are stable"
+    );
+    for case in fixture["page"].as_array().unwrap() {
+        let decoded = PullPage::decode(case["wire"].as_str().unwrap().as_bytes());
+        assert_eq!(
+            decoded.is_ok(),
+            case["valid"].as_bool().unwrap(),
+            "{}: {decoded:?}",
+            case["name"]
+        );
+        if let Ok(page) = decoded {
+            assert_eq!(
+                PullPage::decode(&page.encode().unwrap()).unwrap(),
+                page,
+                "{}",
+                case["name"]
+            );
+        }
+    }
+    for case in fixture["request"].as_array().unwrap() {
+        let decoded = PullRequest::decode(case["wire"].as_str().unwrap().as_bytes());
+        assert_eq!(
+            decoded.is_ok(),
+            case["valid"].as_bool().unwrap(),
+            "{}: {decoded:?}",
+            case["name"]
+        );
+    }
+}
+
 #[test]
 fn shared_wire_fixtures_preserve_counter_boundaries() {
     let fixture: Value = serde_json::from_str(include_str!(
@@ -249,7 +305,7 @@ fn field_default_and_record_stamp_round_trip_and_ahead_prefix_is_rejected() {
     assert_eq!(plain.default, None);
     assert!(!serde_json::to_string(&plain).unwrap().contains("default"));
     let page = PullPage::decode(
-        br#"{"scope":"c","fromCursor":0,"toCursor":1,"changes":[{"syncId":1,"model":"E","identity":{"id":"e"},"stamp":7,"state":null}]}"#,
+        br#"{"cursors":{"c":{"from":0,"to":1,"head":1}},"changes":[{"model":"E","identity":{"id":"e"},"stamp":7,"state":null}]}"#,
     )
     .unwrap();
     assert_eq!(page.changes[0].stamp, 7);
@@ -259,7 +315,7 @@ fn field_default_and_record_stamp_round_trip_and_ahead_prefix_is_rejected() {
             .contains(r#""stamp":7"#)
     );
     let unstamped = PullPage::decode(
-        br#"{"scope":"c","fromCursor":0,"toCursor":1,"changes":[{"syncId":1,"model":"E","identity":{"id":"e"},"state":null}]}"#,
+        br#"{"cursors":{"c":{"from":0,"to":1,"head":1}},"changes":[{"model":"E","identity":{"id":"e"},"state":null}]}"#,
     );
     assert!(unstamped.unwrap_err().to_string().contains("stamp"));
     let bad = Schema::from_value(
@@ -414,7 +470,7 @@ fn push_batches_hold_one_to_twenty_mutations_with_distinct_ordinals() {
 }
 
 #[test]
-fn push_and_pull_requests_refuse_a_blank_client_id() {
+fn push_requests_refuse_a_blank_client_id_and_pulls_carry_none() {
     let mutations = json!([{"ordinal":1,"name":"edit","operations":[]}]);
     for blank in ["", "   "] {
         let push =
@@ -423,12 +479,6 @@ fn push_and_pull_requests_refuse_a_blank_client_id() {
         assert!(
             PushRequest::decode(push.as_bytes()).is_err(),
             "push {blank:?}"
-        );
-        let pull =
-            json!({"clientId":blank,"scope":"a","fromCursor":0,"models":{"Entry":1}}).to_string();
-        assert!(
-            PullRequest::decode(pull.as_bytes()).is_err(),
-            "pull {blank:?}"
         );
     }
     let push = json!({"clientId":"c","batchSequence":1,"models":{"Entry":1},"mutations":mutations})
@@ -439,10 +489,17 @@ fn push_and_pull_requests_refuse_a_blank_client_id() {
         PushRequest::decode(missing.as_bytes()).is_err(),
         "missing clientId"
     );
+    let pull = json!({"cursors":{"a":0},"models":{"Entry":1}}).to_string();
+    let request = PullRequest::decode(pull.as_bytes()).unwrap();
+    assert_eq!(
+        String::from_utf8(request.encode().unwrap()).unwrap(),
+        r#"{"cursors":{"a":0},"models":{"Entry":1}}"#,
+        "a pull identifies no client"
+    );
 }
 
 #[test]
-fn shared_limits_are_defined_once_and_a_page_continues_only_when_full() {
+fn shared_limits_are_defined_once_and_apply_per_channel() {
     let fixture: Value = serde_json::from_str(include_str!(
         "../../../fixtures/protocol/live-messages.json"
     ))
@@ -450,23 +507,34 @@ fn shared_limits_are_defined_once_and_a_page_continues_only_when_full() {
     assert_eq!(fixture["limits"]["pushMutations"], limits::PUSH_MUTATIONS);
     assert_eq!(fixture["limits"]["pushBytes"], limits::PUSH_BYTES);
     assert_eq!(fixture["limits"]["pullChanges"], limits::PULL_CHANGES);
-    let page = |count: usize| {
+    let page = |channels: usize, count: usize| {
         let changes: Vec<Value> = (1..=count)
-            .map(|i| json!({"syncId":i,"model":"Entry","identity":{"id":i.to_string()},"stamp":i,"state":null}))
+            .map(
+                |i| json!({"model":"Entry","identity":{"id":i.to_string()},"stamp":i,"state":null}),
+            )
             .collect();
-        json!({"scope":"book","fromCursor":0,"toCursor":count.max(1),"changes":changes}).to_string()
+        let cursors: serde_json::Map<String, Value> = (0..channels)
+            .map(|c| {
+                (
+                    format!("c{c}"),
+                    json!({"from":0,"to":count.max(1),"head":count.max(1)}),
+                )
+            })
+            .collect();
+        json!({"cursors":cursors,"changes":changes}).to_string()
     };
-    let below = PullPage::decode(page(limits::PULL_CHANGES - 1).as_bytes()).unwrap();
-    assert!(!below.continues(), "a short page reaches the head");
-    let full = PullPage::decode(page(limits::PULL_CHANGES).as_bytes()).unwrap();
-    assert!(full.continues(), "a full page may leave changes behind");
-    let err = PullPage::decode(page(limits::PULL_CHANGES + 1).as_bytes()).unwrap_err();
+    assert!(PullPage::decode(page(1, limits::PULL_CHANGES).as_bytes()).is_ok());
+    let err = PullPage::decode(page(1, limits::PULL_CHANGES + 1).as_bytes()).unwrap_err();
     assert!(err.to_string().contains("exceeds 50"), "{err}");
-    assert!(!PullPage::decode(page(0).as_bytes()).unwrap().continues());
+    assert!(
+        PullPage::decode(page(2, limits::PULL_CHANGES * 2).as_bytes()).is_ok(),
+        "the cap is per channel"
+    );
+    assert!(PullPage::decode(page(2, limits::PULL_CHANGES * 2 + 1).as_bytes()).is_err());
 }
 
 #[test]
-fn live_frames_decode_as_acknowledgement_or_page_and_scopes_normalize() {
+fn live_frames_decode_as_acknowledgement_or_page_and_channels_normalize() {
     let fixture: Value = serde_json::from_str(include_str!(
         "../../../fixtures/protocol/live-messages.json"
     ))
@@ -476,7 +544,12 @@ fn live_frames_decode_as_acknowledgement_or_page_and_scopes_normalize() {
         match SubscribeRequest::decode(wire) {
             Ok(request) => {
                 assert_eq!(case["valid"], true, "{}", case["name"]);
-                assert_eq!(json!(request.scopes), case["scopes"], "{}", case["name"]);
+                assert_eq!(
+                    json!(request.channels),
+                    case["channels"],
+                    "{}",
+                    case["name"]
+                );
                 assert_eq!(json!(request.models), case["models"], "{}", case["name"]);
                 let again = SubscribeRequest::decode(&request.encode().unwrap()).unwrap();
                 assert_eq!(again, request, "encoding is canonical: {}", case["name"]);
@@ -489,7 +562,7 @@ fn live_frames_decode_as_acknowledgement_or_page_and_scopes_normalize() {
         match SubscriptionAck::decode(wire) {
             Ok(ack) => {
                 assert_eq!(case["valid"], true, "{}", case["name"]);
-                assert_eq!(json!(ack.scopes), case["scopes"], "{}", case["name"]);
+                assert_eq!(json!(ack.cursors), case["cursors"], "{}", case["name"]);
                 assert_eq!(
                     SubscriptionAck::decode(&ack.encode().unwrap()).unwrap(),
                     ack
@@ -509,44 +582,29 @@ fn live_frames_decode_as_acknowledgement_or_page_and_scopes_normalize() {
     }
     let models = std::collections::BTreeMap::from([("Task".to_string(), 1)]);
     let request = SubscribeRequest::new(vec!["b".into(), "a".into()], models.clone()).unwrap();
-    assert!(
-        SubscriptionAck::new(vec!["a".into(), "b".into()])
-            .unwrap()
-            .confirms(&request)
-    );
-    assert!(
-        !SubscriptionAck::new(vec!["a".into()])
-            .unwrap()
-            .confirms(&request)
-    );
-    assert!(
-        !SubscriptionAck::new(vec!["a".into(), "b".into(), "c".into()])
-            .unwrap()
-            .confirms(&request)
-    );
+    let heads = |pairs: &[(&str, u64)]| {
+        SubscriptionAck::new(pairs.iter().map(|(c, h)| (c.to_string(), *h)).collect()).unwrap()
+    };
+    assert!(heads(&[("a", 4), ("b", 0)]).confirms(&request));
+    assert!(!heads(&[("a", 4)]).confirms(&request));
+    assert!(!heads(&[("a", 4), ("b", 0), ("c", 1)]).confirms(&request));
     // The server's frame is the acknowledgement the client decodes, byte for byte.
     assert_eq!(
-        String::from_utf8(
-            SubscriptionAck::new(vec!["b".into(), "a".into()])
-                .unwrap()
-                .encode()
-                .unwrap()
-        )
-        .unwrap(),
-        r#"{"rejections":[],"scopes":["a","b"],"type":"subscribed"}"#
+        String::from_utf8(heads(&[("b", 0), ("a", 4)]).encode().unwrap()).unwrap(),
+        r#"{"cursors":{"a":4,"b":0},"type":"subscribed"}"#
     );
 }
 
 #[test]
 fn pull_and_subscribe_declare_the_read_contracts_and_refuse_a_missing_or_bad_declaration() {
     // The declaration is the same object on both paths: one positive version per model.
-    let good = json!({"clientId":"c","scope":"a","fromCursor":0,"models":{"Task":2,"Note":1}});
+    let good = json!({"cursors":{"a":0},"models":{"Task":2,"Note":1}});
     let request = PullRequest::decode(good.to_string().as_bytes()).unwrap();
     assert_eq!(request.models.get("Task"), Some(&2));
     assert_eq!(request.models.get("Note"), Some(&1));
     assert_eq!(
         String::from_utf8(request.encode().unwrap()).unwrap(),
-        r#"{"clientId":"c","fromCursor":0,"models":{"Note":1,"Task":2},"scope":"a"}"#,
+        r#"{"cursors":{"a":0},"models":{"Note":1,"Task":2}}"#,
         "canonical: models sorted by name"
     );
     for (name, models) in [
@@ -569,7 +627,7 @@ fn pull_and_subscribe_declare_the_read_contracts_and_refuse_a_missing_or_bad_dec
             PullRequest::decode(pull.to_string().as_bytes()).is_err(),
             "pull {name}"
         );
-        let mut subscribe = json!({"type":"subscribe","scopes":["a"],"models":{"Task":1}});
+        let mut subscribe = json!({"type":"subscribe","channels":["a"],"models":{"Task":1}});
         if models.is_null() {
             subscribe.as_object_mut().unwrap().remove("models");
         } else {

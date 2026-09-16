@@ -132,10 +132,54 @@ export async function startConnection(
 /** What Rust asks the live lane's host to do ([`LiveAction`] in the client crate). */
 export type LiveAction =
   | { type: "open"; epoch: number; subscribe: string }
-  | { type: "request"; epoch: number; channel: string; body: string }
+  | { type: "request"; epoch: number; body: string }
   | { type: "close"; epoch: number; reason: string | null }
   | { type: "wake"; lane: "push" }
+  | { type: "report"; reports: ReportDetails[] }
   | { type: "wait"; millis: number };
+/** Why one record or one queued mutation could not be applied as delivered. */
+export type ReportKind = "readFailed" | "skipped" | "conflict" | "diverged";
+export type ReportDetails = {
+  kind: ReportKind;
+  model: string;
+  identity: Record<string, unknown>;
+  stamp: number;
+  /** `readFailed`: the server's code (`loader.failed`, or the refusal code). */
+  code?: string;
+  /** `diverged`: the queued mutation whose replay failed; it is still sent. */
+  ordinal?: number;
+  detail?: unknown;
+};
+/**
+ * A delivery the client could not apply, handed to `onError`. The client stays
+ * consistent: a `readFailed` or `skipped` record keeps its local content and
+ * stamp, a `conflict` keeps the local content, a `diverged` mutation shows the
+ * server's row and is still sent.
+ */
+export class AheadReport extends Error {
+  readonly kind: ReportKind;
+  readonly model: string;
+  readonly identity: Record<string, unknown>;
+  readonly stamp: number;
+  readonly code: string | undefined;
+  readonly ordinal: number | undefined;
+  readonly detail: unknown;
+  constructor(report: ReportDetails) {
+    super(
+      `${report.kind}: ${report.model} ${JSON.stringify(report.identity)} at stamp ${report.stamp}` +
+        (report.code ? ` (${report.code})` : "") +
+        (report.ordinal !== undefined ? ` (mutation ${report.ordinal})` : ""),
+    );
+    this.name = "AheadReport";
+    this.kind = report.kind;
+    this.model = report.model;
+    this.identity = report.identity;
+    this.stamp = report.stamp;
+    this.code = report.code;
+    this.ordinal = report.ordinal;
+    this.detail = report.detail;
+  }
+}
 export type LiveCommand = (
   event: Record<string, unknown>,
 ) => Promise<LiveAction[]>;
@@ -254,6 +298,10 @@ export async function startLiveLane(
       }
       case "wake":
         wakePush();
+        return;
+      case "report":
+        for (const report of action.reports)
+          options.onError?.(new AheadReport(report));
         return;
       case "wait":
         clearTimer();

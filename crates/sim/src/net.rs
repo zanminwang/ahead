@@ -13,9 +13,9 @@ pub enum Message {
         sequence: u64,
         bytes: Vec<u8>,
     },
+    /// One pull for every channel the client subscribes to.
     Pull {
         client: usize,
-        channel: String,
         bytes: Vec<u8>,
     },
     Page {

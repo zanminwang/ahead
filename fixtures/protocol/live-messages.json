@@ -1,31 +1,152 @@
 {
-  "limits": {"pushMutations": 20, "pushBytes": 262144, "pullChanges": 50},
-  "subscribe": [
-    {"name": "normalized: deduplicated and sorted by UTF-16 units", "wire": "{\"type\":\"subscribe\",\"scopes\":[\"b\",\"a\",\"b\",\"\\ud83d\\ude00\",\"\\uffff\"],\"models\":{\"Task\":1,\"Note\":2}}", "valid": true, "scopes": ["a", "b", "\ud83d\ude00", "\uffff"], "models": {"Note": 2, "Task": 1}},
-    {"name": "one scope", "wire": "{\"type\":\"subscribe\",\"scopes\":[\"only\"],\"models\":{\"Task\":1,\"Note\":2}}", "valid": true, "scopes": ["only"], "models": {"Note": 2, "Task": 1}},
-    {"name": "no scopes", "wire": "{\"type\":\"subscribe\",\"scopes\":[],\"models\":{\"Task\":1}}", "valid": false},
-    {"name": "empty scope", "wire": "{\"type\":\"subscribe\",\"scopes\":[\"a\",\"\"],\"models\":{\"Task\":1}}", "valid": false},
-    {"name": "cursors are refused", "wire": "{\"type\":\"subscribe\",\"scopes\":[\"a\"],\"cursors\":{\"a\":1},\"models\":{\"Task\":1}}", "valid": false},
-    {"name": "wrong type", "wire": "{\"type\":\"subscribed\",\"scopes\":[\"a\"],\"models\":{\"Task\":1}}", "valid": false},
-    {"name": "scope must be a string", "wire": "{\"type\":\"subscribe\",\"scopes\":[1],\"models\":{\"Task\":1}}", "valid": false},
-    {"name": "models are required", "wire": "{\"type\":\"subscribe\",\"scopes\":[\"a\"]}", "valid": false},
-    {"name": "a model version must be positive", "wire": "{\"type\":\"subscribe\",\"scopes\":[\"a\"],\"models\":{\"Task\":0}}", "valid": false},
-    {"name": "models must be an object", "wire": "{\"type\":\"subscribe\",\"scopes\":[\"a\"],\"models\":[]}", "valid": false}
-  ],
-  "acknowledgement": [
-    {"name": "confirms the requested set", "wire": "{\"type\":\"subscribed\",\"scopes\":[\"a\",\"b\"],\"rejections\":[]}", "valid": true, "scopes": ["a", "b"]},
-    {"name": "order and duplicates do not matter", "wire": "{\"type\":\"subscribed\",\"scopes\":[\"b\",\"a\",\"a\"],\"rejections\":[]}", "valid": true, "scopes": ["a", "b"]},
-    {"name": "unknown fields are ignored", "wire": "{\"type\":\"subscribed\",\"scopes\":[\"a\"],\"rejections\":[],\"head\":7}", "valid": true, "scopes": ["a"]},
-    {"name": "a rejection is unsupported", "wire": "{\"type\":\"subscribed\",\"scopes\":[\"a\"],\"rejections\":[{\"scope\":\"a\"}]}", "valid": false},
-    {"name": "rejections must be present", "wire": "{\"type\":\"subscribed\",\"scopes\":[\"a\"]}", "valid": false},
-    {"name": "wrong type", "wire": "{\"type\":\"subscribe\",\"scopes\":[\"a\"],\"rejections\":[]}", "valid": false},
-    {"name": "scopes required", "wire": "{\"type\":\"subscribed\",\"rejections\":[]}", "valid": false}
-  ],
-  "frame": [
-    {"name": "acknowledgement carries a type", "wire": "{\"type\":\"subscribed\",\"scopes\":[\"a\"],\"rejections\":[]}", "kind": "acknowledged"},
-    {"name": "a page never carries a type", "wire": "{\"scope\":\"a\",\"fromCursor\":3,\"toCursor\":3,\"changes\":[]}", "kind": "page"},
-    {"name": "a typed page is not a page", "wire": "{\"type\":\"page\",\"scope\":\"a\",\"fromCursor\":3,\"toCursor\":3,\"changes\":[]}", "kind": "invalid"},
-    {"name": "a malformed page", "wire": "{\"scope\":\"a\",\"fromCursor\":4,\"toCursor\":3,\"changes\":[]}", "kind": "invalid"},
-    {"name": "not an object", "wire": "[]", "kind": "invalid"}
-  ]
+ "limits": {
+  "pushMutations": 20,
+  "pushBytes": 262144,
+  "pullChanges": 50
+ },
+ "subscribe": [
+  {
+   "name": "normalized: deduplicated and sorted by UTF-16 units",
+   "wire": "{\"type\":\"subscribe\",\"channels\":[\"b\",\"a\",\"b\",\"\\ud83d\\ude00\",\"\\uffff\"],\"models\":{\"Task\":1,\"Note\":2}}",
+   "valid": true,
+   "channels": [
+    "a",
+    "b",
+    "\ud83d\ude00",
+    "\uffff"
+   ],
+   "models": {
+    "Note": 2,
+    "Task": 1
+   }
+  },
+  {
+   "name": "one channel",
+   "wire": "{\"type\":\"subscribe\",\"channels\":[\"only\"],\"models\":{\"Task\":1,\"Note\":2}}",
+   "valid": true,
+   "channels": [
+    "only"
+   ],
+   "models": {
+    "Note": 2,
+    "Task": 1
+   }
+  },
+  {
+   "name": "no channels",
+   "wire": "{\"type\":\"subscribe\",\"channels\":[],\"models\":{\"Task\":1}}",
+   "valid": false
+  },
+  {
+   "name": "empty channel",
+   "wire": "{\"type\":\"subscribe\",\"channels\":[\"a\",\"\"],\"models\":{\"Task\":1}}",
+   "valid": false
+  },
+  {
+   "name": "cursors are refused",
+   "wire": "{\"type\":\"subscribe\",\"channels\":[\"a\"],\"cursors\":{\"a\":1},\"models\":{\"Task\":1}}",
+   "valid": false
+  },
+  {
+   "name": "legacy scopes are refused",
+   "wire": "{\"type\":\"subscribe\",\"scopes\":[\"a\"],\"models\":{\"Task\":1}}",
+   "valid": false
+  },
+  {
+   "name": "wrong type",
+   "wire": "{\"type\":\"subscribed\",\"channels\":[\"a\"],\"models\":{\"Task\":1}}",
+   "valid": false
+  },
+  {
+   "name": "channel must be a string",
+   "wire": "{\"type\":\"subscribe\",\"channels\":[1],\"models\":{\"Task\":1}}",
+   "valid": false
+  },
+  {
+   "name": "models are required",
+   "wire": "{\"type\":\"subscribe\",\"channels\":[\"a\"]}",
+   "valid": false
+  },
+  {
+   "name": "a model version must be positive",
+   "wire": "{\"type\":\"subscribe\",\"channels\":[\"a\"],\"models\":{\"Task\":0}}",
+   "valid": false
+  },
+  {
+   "name": "models must be an object",
+   "wire": "{\"type\":\"subscribe\",\"channels\":[\"a\"],\"models\":[]}",
+   "valid": false
+  }
+ ],
+ "acknowledgement": [
+  {
+   "name": "carries every channel's head",
+   "wire": "{\"type\":\"subscribed\",\"cursors\":{\"a\":47,\"b\":0}}",
+   "valid": true,
+   "cursors": {
+    "a": 47,
+    "b": 0
+   }
+  },
+  {
+   "name": "unknown fields are ignored",
+   "wire": "{\"type\":\"subscribed\",\"cursors\":{\"a\":1},\"head\":7}",
+   "valid": true,
+   "cursors": {
+    "a": 1
+   }
+  },
+  {
+   "name": "a head must be a counter",
+   "wire": "{\"type\":\"subscribed\",\"cursors\":{\"a\":-1}}",
+   "valid": false
+  },
+  {
+   "name": "cursors required",
+   "wire": "{\"type\":\"subscribed\"}",
+   "valid": false
+  },
+  {
+   "name": "no channels",
+   "wire": "{\"type\":\"subscribed\",\"cursors\":{}}",
+   "valid": false
+  },
+  {
+   "name": "legacy scopes are refused",
+   "wire": "{\"type\":\"subscribed\",\"scopes\":[\"a\"],\"rejections\":[]}",
+   "valid": false
+  },
+  {
+   "name": "wrong type",
+   "wire": "{\"type\":\"subscribe\",\"cursors\":{\"a\":1}}",
+   "valid": false
+  }
+ ],
+ "frame": [
+  {
+   "name": "acknowledgement carries a type",
+   "wire": "{\"type\":\"subscribed\",\"cursors\":{\"a\":3}}",
+   "kind": "acknowledged"
+  },
+  {
+   "name": "a page never carries a type",
+   "wire": "{\"cursors\":{\"a\":{\"from\":3,\"to\":3,\"head\":3}},\"changes\":[]}",
+   "kind": "page"
+  },
+  {
+   "name": "a typed page is not a page",
+   "wire": "{\"type\":\"page\",\"cursors\":{\"a\":{\"from\":3,\"to\":3,\"head\":3}},\"changes\":[]}",
+   "kind": "invalid"
+  },
+  {
+   "name": "a malformed page",
+   "wire": "{\"cursors\":{\"a\":{\"from\":4,\"to\":3,\"head\":3}},\"changes\":[]}",
+   "kind": "invalid"
+  },
+  {
+   "name": "not an object",
+   "wire": "[]",
+   "kind": "invalid"
+  }
+ ]
 }

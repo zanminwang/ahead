@@ -1,0 +1,155 @@
+{
+ "comment": "Pull pages both sides must decode alike. One page names every channel it covers with the cursor it starts after and the cursor it reaches; its changes are receipt-shaped records (model, identity, stamp, state or error) delivered once each, with no channel and no cursor on a record. Canonical encoding always writes state (null for a deletion or a read failure) and writes error only when set.",
+ "canonical": {
+  "wire": "{\"changes\":[{\"identity\":{\"id\":\"e\"},\"model\":\"Entry\",\"stamp\":12,\"state\":{\"note\":null,\"text\":\"Hello\"}},{\"identity\":{\"id\":\"f\"},\"model\":\"Entry\",\"stamp\":3,\"state\":null},{\"error\":\"loader.failed\",\"identity\":{\"id\":\"g\"},\"model\":\"Entry\",\"stamp\":5,\"state\":null}],\"cursors\":{\"book:demo\":{\"from\":42,\"head\":47,\"to\":47},\"inbox:alice\":{\"from\":7,\"head\":9,\"to\":9}}}",
+  "channels": [
+   "book:demo",
+   "inbox:alice"
+  ],
+  "changes": 3
+ },
+ "page": [
+  {
+   "name": "two channels, a shared record once, a deletion and a read failure",
+   "wire": "{\"cursors\":{\"book:demo\":{\"from\":42,\"to\":47,\"head\":47},\"inbox:alice\":{\"from\":7,\"to\":9,\"head\":9}},\"changes\":[{\"model\":\"Entry\",\"identity\":{\"id\":\"e\"},\"stamp\":12,\"state\":{\"text\":\"Hello\",\"note\":null}},{\"model\":\"Entry\",\"identity\":{\"id\":\"f\"},\"stamp\":3,\"state\":null},{\"model\":\"Entry\",\"identity\":{\"id\":\"g\"},\"stamp\":5,\"error\":\"loader.failed\"}]}",
+   "valid": true
+  },
+  {
+   "name": "nothing changed",
+   "wire": "{\"cursors\":{\"book:demo\":{\"from\":47,\"to\":47,\"head\":47}},\"changes\":[]}",
+   "valid": true
+  },
+  {
+   "name": "error with explicit null state",
+   "wire": "{\"cursors\":{\"a\":{\"from\":0,\"to\":1,\"head\":1}},\"changes\":[{\"model\":\"Entry\",\"identity\":{\"id\":\"g\"},\"stamp\":5,\"state\":null,\"error\":\"todo.forbidden\"}]}",
+   "valid": true
+  },
+  {
+   "name": "safe maximum cursors",
+   "wire": "{\"cursors\":{\"a\":{\"from\":9007199254740991,\"to\":9007199254740991,\"head\":9007199254740991}},\"changes\":[]}",
+   "valid": true
+  },
+  {
+   "name": "duplicate record",
+   "wire": "{\"cursors\":{\"a\":{\"from\":0,\"to\":2,\"head\":2}},\"changes\":[{\"model\":\"Entry\",\"identity\":{\"id\":\"e\"},\"stamp\":1,\"state\":null},{\"model\":\"Entry\",\"identity\":{\"id\":\"e\"},\"stamp\":2,\"state\":null}]}",
+   "valid": false
+  },
+  {
+   "name": "page moves backwards",
+   "wire": "{\"cursors\":{\"a\":{\"from\":4,\"to\":3,\"head\":3}},\"changes\":[]}",
+   "valid": false
+  },
+  {
+   "name": "no channels",
+   "wire": "{\"cursors\":{},\"changes\":[]}",
+   "valid": false
+  },
+  {
+   "name": "empty channel name",
+   "wire": "{\"cursors\":{\"\":{\"from\":0,\"to\":1,\"head\":1}},\"changes\":[]}",
+   "valid": false
+  },
+  {
+   "name": "state and error together",
+   "wire": "{\"cursors\":{\"a\":{\"from\":0,\"to\":1,\"head\":1}},\"changes\":[{\"model\":\"Entry\",\"identity\":{\"id\":\"g\"},\"stamp\":5,\"state\":{\"text\":\"x\"},\"error\":\"loader.failed\"}]}",
+   "valid": false
+  },
+  {
+   "name": "error is not a code",
+   "wire": "{\"cursors\":{\"a\":{\"from\":0,\"to\":1,\"head\":1}},\"changes\":[{\"model\":\"Entry\",\"identity\":{\"id\":\"g\"},\"stamp\":5,\"error\":\"Not A Code\"}]}",
+   "valid": false
+  },
+  {
+   "name": "neither state nor error",
+   "wire": "{\"cursors\":{\"a\":{\"from\":0,\"to\":1,\"head\":1}},\"changes\":[{\"model\":\"Entry\",\"identity\":{\"id\":\"g\"},\"stamp\":5}]}",
+   "valid": false
+  },
+  {
+   "name": "stamp missing",
+   "wire": "{\"cursors\":{\"a\":{\"from\":0,\"to\":1,\"head\":1}},\"changes\":[{\"model\":\"Entry\",\"identity\":{\"id\":\"g\"},\"state\":null}]}",
+   "valid": false
+  },
+  {
+   "name": "stamp zero",
+   "wire": "{\"cursors\":{\"a\":{\"from\":0,\"to\":1,\"head\":1}},\"changes\":[{\"model\":\"Entry\",\"identity\":{\"id\":\"g\"},\"stamp\":0,\"state\":null}]}",
+   "valid": false
+  },
+  {
+   "name": "cursor overflow",
+   "wire": "{\"cursors\":{\"a\":{\"from\":0,\"to\":9007199254740992,\"head\":9007199254740992}},\"changes\":[]}",
+   "valid": false
+  },
+  {
+   "name": "cursor negative",
+   "wire": "{\"cursors\":{\"a\":{\"from\":-1,\"to\":0,\"head\":0}},\"changes\":[]}",
+   "valid": false
+  },
+  {
+   "name": "legacy single-channel page",
+   "wire": "{\"scope\":\"a\",\"fromCursor\":0,\"toCursor\":1,\"changes\":[{\"syncId\":1,\"model\":\"Entry\",\"identity\":{\"id\":\"e\"},\"stamp\":1,\"state\":null}]}",
+   "valid": false
+  },
+  {
+   "name": "cursors missing",
+   "wire": "{\"changes\":[]}",
+   "valid": false
+  },
+  {
+   "name": "changes missing",
+   "wire": "{\"cursors\":{\"a\":{\"from\":0,\"to\":1,\"head\":1}}}",
+   "valid": false
+  },
+  {
+   "name": "to past head",
+   "wire": "{\"cursors\":{\"a\":{\"from\":0,\"to\":5,\"head\":4}},\"changes\":[]}",
+   "valid": false
+  },
+  {
+   "name": "head missing",
+   "wire": "{\"cursors\":{\"a\":{\"from\":0,\"to\":1}},\"changes\":[]}",
+   "valid": false
+  },
+  {
+   "name": "a continuing channel",
+   "wire": "{\"cursors\":{\"a\":{\"from\":0,\"to\":50,\"head\":80}},\"changes\":[]}",
+   "valid": true
+  }
+ ],
+ "request": [
+  {
+   "name": "two channels",
+   "wire": "{\"models\":{\"Entry\":2,\"Comment\":1},\"cursors\":{\"book:demo\":42,\"inbox:alice\":7}}",
+   "valid": true
+  },
+  {
+   "name": "cursor zero is a fresh channel",
+   "wire": "{\"models\":{\"Entry\":1},\"cursors\":{\"a\":0}}",
+   "valid": true
+  },
+  {
+   "name": "client id is not part of a pull",
+   "wire": "{\"clientId\":\"c\",\"models\":{\"Entry\":1},\"cursors\":{\"a\":0}}",
+   "valid": true
+  },
+  {
+   "name": "no channels",
+   "wire": "{\"models\":{\"Entry\":1},\"cursors\":{}}",
+   "valid": false
+  },
+  {
+   "name": "models missing",
+   "wire": "{\"cursors\":{\"a\":0}}",
+   "valid": false
+  },
+  {
+   "name": "cursor negative",
+   "wire": "{\"models\":{\"Entry\":1},\"cursors\":{\"a\":-1}}",
+   "valid": false
+  },
+  {
+   "name": "legacy single-channel request",
+   "wire": "{\"clientId\":\"c\",\"scope\":\"a\",\"fromCursor\":0,\"models\":{\"Entry\":1}}",
+   "valid": false
+  }
+ ]
+}

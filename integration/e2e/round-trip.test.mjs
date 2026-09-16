@@ -109,9 +109,12 @@ test('built-in live catch-up pages, dependent pushes, watches, offline reconnect
   await wait(async()=>(await writer.query('Entry')).length>=56,'writer catchup');
   const observed=[];const unwatch=reader.watch('Entry',{},rows=>observed.push(rows));
   let overlapped=false;
+  // Pulls carry no client id. The writer is caught up: its cursor equals the
+  // head its acknowledgement carries, so it never pulls again and every pull
+  // seen from here on is the reader's.
   globalThis.fetch=async(url,init)=>{
    const response=await fetchOriginal(url,init);
-   if(String(url).endsWith('/sync/pull') && JSON.parse(init.body).clientId===reader.clientId){
+   if(String(url).endsWith('/sync/pull')){
     pullRequests.push(JSON.parse(init.body));
     if(!overlapped){
      overlapped=true;
@@ -125,7 +128,7 @@ test('built-in live catch-up pages, dependent pushes, watches, offline reconnect
   await wait(async()=>(await reader.query('Entry')).length>=56 && (await reader.read('Entry',{id:'entry-1'}))?.text==='during catchup','multi-page catchup');
   assert.ok(observed.some(rows=>rows.length>=56));
   assert.ok(pullRequests.length>=2,'more than 50 records catch up via HTTP pages');
-  assert.equal(pullRequests[0].fromCursor,0);
+  assert.deepEqual(pullRequests[0].cursors,{'book:demo':0});
   const caughtUpPulls=pullRequests.length;
   // Queue two edits to the same record. Each batch completes from its own receipt
   // (no channel page is awaited); the second push must follow the first without
@@ -171,7 +174,7 @@ test('built-in live catch-up pages, dependent pushes, watches, offline reconnect
   await writer.mutate({name:'Edit',operations:[{model:'Entry',op:'update',identity:{id:'paged-54'},values:{text:'missed remote'}}]});await wait(async()=>(await writer.status()).pending===0,'remote offline edit');
   await connection.resume();await wait(async()=>(await reader.status()).pending===0 && (await reader.read('Entry',{id:'paged-54'}))?.text==='missed remote','offline reconnect');
   assert.equal((await reader.read('Entry',{id:'entry-1'})).text,'offline reconciled');
-  assert.equal(pullRequests[caughtUpPulls].fromCursor,saved,'reconnect HTTP starts at persisted cursor');
+  assert.equal(pullRequests[caughtUpPulls].cursors['book:demo'],saved,'reconnect HTTP starts at persisted cursor');
   assert.equal(errors.length,0);
   unwatch();await connection.close();
   const root=fileURLToPath(new URL('../..',import.meta.url));

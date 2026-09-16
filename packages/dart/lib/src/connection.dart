@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math';
 import 'live.dart';
 
@@ -331,6 +332,10 @@ class LiveLane implements LaneControls {
         if (reason != null) onError?.call(StateError(reason as String));
       case 'wake':
         _wakePush();
+      case 'report':
+        for (final report in action['reports'] as List<dynamic>) {
+          onError?.call(AheadReport.fromJson(report as Map<String, dynamic>));
+        }
       case 'wait':
         _clearTimer();
         _timer = Timer(Duration(milliseconds: action['millis'] as int), () {
@@ -382,4 +387,48 @@ class LiveLane implements LaneControls {
     _clearTimer();
     await _dispatch({'event': 'stop'});
   }
+}
+
+/// A delivery the client could not apply, handed to `onError`. The client
+/// stays consistent: a `readFailed` or `skipped` record keeps its local
+/// content and stamp, a `conflict` keeps the local content, a `diverged`
+/// mutation shows the server's row and is still sent.
+class AheadReport implements Exception {
+  AheadReport({
+    required this.kind,
+    required this.model,
+    required this.identity,
+    required this.stamp,
+    this.code,
+    this.ordinal,
+    this.detail,
+  });
+  factory AheadReport.fromJson(Map<String, dynamic> json) => AheadReport(
+    kind: json['kind'] as String,
+    model: json['model'] as String,
+    identity: Map<String, dynamic>.from(json['identity'] as Map),
+    stamp: json['stamp'] as int,
+    code: json['code'] as String?,
+    ordinal: json['ordinal'] as int?,
+    detail: json['detail'],
+  );
+
+  /// `readFailed`, `skipped`, `conflict` or `diverged`.
+  final String kind;
+  final String model;
+  final Map<String, dynamic> identity;
+  final int stamp;
+
+  /// `readFailed`: the server's code (`loader.failed`, or the refusal code).
+  final String? code;
+
+  /// `diverged`: the queued mutation whose replay failed; it is still sent.
+  final int? ordinal;
+  final Object? detail;
+
+  @override
+  String toString() =>
+      'AheadReport($kind: $model ${jsonEncode(identity)} at stamp $stamp'
+      '${code == null ? '' : ' ($code)'}'
+      '${ordinal == null ? '' : ' (mutation $ordinal)'})';
 }

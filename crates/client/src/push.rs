@@ -1,5 +1,5 @@
 //! Freeze pushes from queued rows and complete them from their receipts.
-use crate::authority::{Disposition, Held};
+use crate::authority::Held;
 use crate::engine::Engine;
 use crate::queue::Queued;
 use crate::store::ClientStore;
@@ -225,23 +225,23 @@ impl<S: ClientStore> Engine<'_, S> {
         }
         // Authority is staged while the queue still says which records hold a
         // base; equal stamps compare against that base, not the optimism.
+        // Each record fails alone, as on a page: one this client cannot
+        // apply is reported and never holds the receipt, and so the queue,
+        // back.
         for record in &receipt.records {
-            match self.stage_authority(record, &mut affected)? {
-                Disposition::Applied => report.applied += 1,
-                Disposition::Older | Disposition::Same => {}
-                Disposition::Conflict { local, incoming } => {
-                    report.conflicts += 1;
-                    report.diagnostics.push(json!({
-                        "model": record.model, "identity": record.identity, "stamp": record.stamp,
-                        "batch": sequence, "local": local, "incoming": incoming,
-                    }));
+            let (applied, entry) = self.stage_isolated(record, &mut affected)?;
+            report.applied += usize::from(applied);
+            report.reports.extend(entry.map(|mut entry| {
+                if let Value::Object(detail) = &mut entry.detail {
+                    detail.insert("batch".into(), json!(sequence));
                 }
-            }
+                entry
+            }));
         }
         affected.extend(self.mark_rejected(&receipt.rejections)?);
         let completed: Vec<u64> = accepted.iter().map(|q| q.ordinal).collect();
         self.delete_mutations(&completed)?;
-        self.rebuild_held(&affected)?;
+        report.reports.extend(self.rebuild_held(&affected)?);
         self.set_last_completed_push(push)?;
         Ok(report)
     }
@@ -249,7 +249,8 @@ impl<S: ClientStore> Engine<'_, S> {
     /// keep a durable record of why, and rebuild the rows they touched.
     pub fn remove_rejected(&mut self, rejections: &[Rejection]) -> Result<()> {
         let affected = self.mark_rejected(rejections)?;
-        self.rebuild_held(&affected)
+        self.rebuild_held(&affected)?;
+        Ok(())
     }
     /// Record the rejections, drop their mutations and lifecycle dependents,
     /// and return the records they touched for the caller to rebuild.

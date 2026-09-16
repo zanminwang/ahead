@@ -6,7 +6,7 @@ Three runtimes exchange the same messages: Rust, TypeScript and Dart. The protoc
 
 ## 2. Architecture Constraints
 
-Wire names are inherited from the reference implementation and must not change: `scope` is a channel and `syncId` a cursor. Every counter (cursor, stamp, batch sequence, ordinal, version) is an integer in `0..=2^53−1` so JavaScript reads it exactly.
+Wire names are short and stable: `channels` and `cursors` name channels and their positions, `stamp` is a record's version. Every counter (cursor, stamp, batch sequence, ordinal, version) is an integer in `0..=2^53−1` so JavaScript reads it exactly.
 
 ## 5. Building Block View
 
@@ -20,13 +20,13 @@ Wire names are inherited from the reference implementation and must not change: 
 
 **Errors.** Core has one error kind carrying a message. The server runtime has a structured error `{code, message, details?}` whose codes the HTTP layer maps to statuses ([SDKs / Bindings](../sdks/bindings.md), [Server / Connection / Transport](../server/connection/transport.md)).
 
-**Shared fixtures.** [fixtures/protocol/counter-boundaries.json](../../../../fixtures/protocol/counter-boundaries.json) lists the pull counter boundary cases both sides must agree on; [fixtures/protocol/receipt-authority.json](../../../../fixtures/protocol/receipt-authority.json) does the same for receipts ([Push](push.md)).
+**Shared fixtures.** [fixtures/protocol/counter-boundaries.json](../../../../fixtures/protocol/counter-boundaries.json) lists the pull counter boundary cases both sides must agree on; [fixtures/protocol/pull-page.json](../../../../fixtures/protocol/pull-page.json) the page cases ([Pull](pull.md)); [fixtures/protocol/receipt-authority.json](../../../../fixtures/protocol/receipt-authority.json) the receipt cases ([Push](push.md)).
 
 Code: [core/lib.rs](../../../../crates/core/src/lib.rs) (`canonical_json`), [core/protocol.rs](../../../../crates/core/src/protocol.rs) (`counter`, `read_counter`, `limits`), [core/schema.rs](../../../../crates/core/src/schema.rs) (`RecordKey`, state and patch validation).
 
 ## 8. Crosscutting Concepts
 
-Three limits are shared by both sides but not negotiated on the wire: 20 mutations and 256 KiB per push, 50 changes per pull page. They are defined once, in `limits` of [core/protocol.rs](../../../../crates/core/src/protocol.rs), and every consumer reads them from there: the push request decoder and the client's [batching](../client/engine/push/batching.md), the client's page-end rule (`PullPage::continues`) and the [server pull](../server/engine/pull.md) scan. A page with more than 50 changes is refused by `PullPage::validate`. Making the limits configurable is [#11](https://github.com/zanminwang/ahead/issues/11).
+Three limits are shared by both sides but not negotiated on the wire: 20 mutations and 256 KiB per push, 50 changes per channel in a pull page. They are defined once, in `limits` of [core/protocol.rs](../../../../crates/core/src/protocol.rs), and every consumer reads them from there: the push request decoder and the client's [batching](../client/engine/push/batching.md), the per-channel continuation rule (`CursorRange::continues`) and the [server pull](../server/engine/pull.md) scan. A page with more than 50 changes per named channel is refused by `PullPage::validate`. Making the limits configurable is [#11](https://github.com/zanminwang/ahead/issues/11).
 
 Host resource limits are not protocol rules and stay with each transport: 1 MiB HTTP bodies and WebSocket frames on the server, 8 MiB WebSocket frames and the page buffers on the clients ([Client transport](../client/connection/transport.md), [Server transport](../server/connection/transport.md)).
 
@@ -34,10 +34,10 @@ Host resource limits are not protocol rules and stay with each transport: 1 MiB 
 
 ## 10. Quality Requirements
 
-- **Encoding is byte-identical to JavaScript's: key order, number spelling and unknown-field preservation**. Evidence: [core/tests/contracts.rs](../../../../crates/core/tests/contracts.rs) `canonical_numbers_match_javascript_and_utf16_key_order`, `wire_names_remain_legacy_and_counters_are_safe`, `server_pull_request_accepts_js_integer_number_spellings`, `shared_wire_fixtures_preserve_counter_boundaries`.
+- **Encoding is byte-identical to JavaScript's: key order, number spelling and unknown-field preservation**. Evidence: [core/tests/contracts.rs](../../../../crates/core/tests/contracts.rs) `canonical_numbers_match_javascript_and_utf16_key_order`, `a_page_names_its_channels_and_keeps_unknown_fields_out_of_the_records`, `server_pull_request_accepts_js_integer_number_spellings`, `shared_wire_fixtures_preserve_counter_boundaries`.
 - **A received state tolerates extra fields and refuses missing required ones**. Evidence: `received_state_supports_additive_schema_evolution`, `state_is_complete_but_patch_preserves_absent_and_null`.
 
-Executed 2026-09-15: `cargo test -p ahead-core --locked` passed with the tests above.
+Executed 2026-09-16: `cargo test -p ahead-core --locked` passed with the tests above.
 
 ## 11. Risks and Technical Debt
 

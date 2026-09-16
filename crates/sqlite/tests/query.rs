@@ -3,6 +3,7 @@ use ahead_client::*;
 use ahead_sqlite::SqliteStore;
 use common::*;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 #[test]
 fn query_normalizes_filters_orders_nulls_and_resolves_relationships() {
@@ -117,18 +118,11 @@ fn transport_pulls_only_subscribed_channels_and_the_receipt_completes_the_push()
     let first = cycle.next(&mut c).unwrap().unwrap();
     assert_eq!(first.kind, "pull");
     let request = PullRequest::decode(first.body.as_bytes()).unwrap();
-    assert_eq!(request.channel, "book");
+    assert_eq!(request.cursors, BTreeMap::from([("book".to_string(), 0)]));
     cycle
         .complete(
             &mut c,
-            &PullPage {
-                channel: "book".into(),
-                from_cursor: 0,
-                to_cursor: 0,
-                changes: vec![],
-            }
-            .encode()
-            .unwrap(),
+            &multi(&[("book", 0, 0, 0)], vec![]).encode().unwrap(),
         )
         .unwrap();
     assert!(

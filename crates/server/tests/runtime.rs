@@ -47,47 +47,62 @@ fn historical_known_field_outside_capability_is_refused() {
 }
 
 #[test]
-fn live_subscribe_requires_one_subscribe_frame_and_normalizes_scopes() {
+fn live_subscribe_requires_one_subscribe_frame_and_normalizes_channels() {
     let decoded = ahead_server::live::decode_subscribe(
-        br#"{"type":"subscribe","scopes":["shared","alice","shared"],"models":{"Task":1}}"#,
+        br#"{"type":"subscribe","channels":["shared","alice","shared"],"models":{"Task":1}}"#,
     )
     .unwrap();
-    assert_eq!(decoded.scopes, vec!["alice", "shared"]);
+    assert_eq!(decoded.channels, vec!["alice", "shared"]);
     assert_eq!(decoded.models.get("Task"), Some(&1));
     assert!(
         ahead_server::live::decode_subscribe(
-            br#"{"type":"other","scopes":["a"],"models":{"Task":1}}"#
+            br#"{"type":"other","channels":["a"],"models":{"Task":1}}"#
         )
         .is_err()
     );
     assert!(
         ahead_server::live::decode_subscribe(
-            br#"{"type":"subscribe","scopes":[],"models":{"Task":1}}"#
+            br#"{"type":"subscribe","channels":[],"models":{"Task":1}}"#
         )
         .is_err()
     );
     assert!(
-        ahead_server::live::decode_subscribe(br#"{"type":"subscribe","scopes":["a"]}"#).is_err(),
+        ahead_server::live::decode_subscribe(br#"{"type":"subscribe","channels":["a"]}"#).is_err(),
         "models are required"
     );
 }
 
 #[test]
-fn live_page_progression_uses_wire_cursor_and_fifty_row_boundary() {
+fn live_page_progression_checks_every_channel_it_asked_for() {
     let full = json!({
-        "scope":"shared", "fromCursor":7, "toCursor":57,
-        "changes": (8..=57).map(|sync_id| json!({
-            "syncId":sync_id,"model":"Task","identity":{"id":sync_id},"stamp":sync_id,"state":null
+        "cursors": {"shared": {"from":7, "to":57, "head":90}},
+        "changes": (8..=57).map(|i| json!({
+            "model":"Task","identity":{"id":i},"stamp":i,"state":null
         })).collect::<Vec<_>>()
     });
-    let progress = ahead_server::live::page_progress(&full.to_string(), "shared", 7).unwrap();
-    assert_eq!(progress.to_cursor, 57);
-    assert!(progress.continues);
-
-    let tail = json!({"scope":"shared","fromCursor":57,"toCursor":60,"changes":[]});
-    let progress = ahead_server::live::page_progress(&tail.to_string(), "shared", 57).unwrap();
-    assert_eq!(progress.to_cursor, 60);
-    assert!(!progress.continues);
+    let asked = std::collections::BTreeMap::from([("shared".to_string(), 7)]);
+    let progress = ahead_server::live::page_progress(&full.to_string(), &asked).unwrap();
+    assert_eq!(progress.cursors["shared"].to, 57);
+    assert!(progress.cursors["shared"].continues());
+    let tail = json!({"cursors":{"shared":{"from":57,"to":60,"head":60}},"changes":[]});
+    let at_57 = std::collections::BTreeMap::from([("shared".to_string(), 57)]);
+    let progress = ahead_server::live::page_progress(&tail.to_string(), &at_57).unwrap();
+    assert!(!progress.cursors["shared"].continues());
+    let wrong = json!({"cursors":{"shared":{"from":57,"to":60,"head":60}},"changes":[]});
+    let asked = std::collections::BTreeMap::from([("shared".to_string(), 7)]);
+    assert_eq!(
+        ahead_server::live::page_progress(&wrong.to_string(), &asked)
+            .unwrap_err()
+            .code,
+        ahead_server::code::LIVE_INVALID_PAGE
+    );
+    let other = json!({"cursors":{"other":{"from":7,"to":7,"head":7}},"changes":[]});
+    assert_eq!(
+        ahead_server::live::page_progress(&other.to_string(), &asked)
+            .unwrap_err()
+            .code,
+        ahead_server::code::LIVE_INVALID_PAGE
+    );
 }
 #[test]
 fn startup_rejects_invalid_patch_capabilities() {
@@ -319,8 +334,7 @@ mod refusals {
         assert_eq!(err.code, code::REQUEST_INVALID);
         let err = run(ahead_server::process_pull(&config(), "alice", b"[]", &host)).unwrap_err();
         assert_eq!(err.code, code::REQUEST_INVALID);
-        let ahead =
-            json!({"clientId":"c","scope":"a","fromCursor":7,"models":{"Task":1}}).to_string();
+        let ahead = json!({"cursors":{"a":7},"models":{"Task":1}}).to_string();
         let err = run(ahead_server::process_pull(
             &config(),
             "alice",
@@ -338,7 +352,7 @@ mod refusals {
         ))
         .unwrap_err();
         assert_eq!(err.code, code::PRINCIPAL_INVALID);
-        let err = ahead_server::live::decode_subscribe(br#"{"type":"other","scopes":["a"]}"#)
+        let err = ahead_server::live::decode_subscribe(br#"{"type":"other","channels":["a"]}"#)
             .unwrap_err();
         assert_eq!(err.code, code::REQUEST_INVALID);
     }

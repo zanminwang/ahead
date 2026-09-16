@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createServerConnection} from '../../../packages/client-react-native/live.mts';
 const tick=()=>new Promise(r=>setImmediate(r));
-const subscribe=JSON.stringify({type:'subscribe',scopes:['scope'],models:{Entry:1}});
+const subscribe=JSON.stringify({type:'subscribe',channels:['scope'],models:{Entry:1}});
 const handlers=(over={})=>({message:async()=>{},overflow:async()=>{},closed:()=>{},...over});
 class Socket {
   static last;
@@ -41,7 +41,7 @@ test('acknowledgement validation belongs to Rust, so transport delivers every te
   const frames=[],abort=new AbortController();
   createServerConnection({url:'http://localhost',token:'alice'},Socket).open(subscribe,abort.signal,handlers({message:async frame=>frames.push(frame)}));
   await tick();const socket=Socket.last;socket.onopen();
-  const invalidAck=JSON.stringify({type:'subscribed',scopes:['other'],rejections:[]});
+  const invalidAck=JSON.stringify({type:'subscribed',cursors:{other:0}});
   socket.frame(invalidAck);socket.frame('not JSON');await tick();
   assert.deepEqual(frames,[invalidAck,'not JSON']);assert.notEqual(socket.closed,true);abort.abort();
 });

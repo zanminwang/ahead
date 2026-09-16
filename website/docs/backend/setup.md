@@ -90,7 +90,9 @@ A successful Handler returns nothing; its return value is ignored. The receipt c
 
 ## Loaders and Pull
 
-Wire vocabulary remains `scope` and `syncId`. Loaders return one state object or null for every identity, in precisely the supplied order. A missing or unauthorized row is null. Loader defects and refusals fail the request; they never skip rows or move the cursor past an error. Pull scans at most 50 compacted invalidations and materializes their current state with each record's current stamp.
+Loaders return one state object or null for every identity, in precisely the supplied order. A missing or unauthorized row is null. One pull covers every channel the client follows and delivers a record published to several of them once. Each channel scans at most 50 compacted invalidations, and the pull materializes their current state with each record's current stamp.
+
+A record that cannot be read fails alone ([#95](https://github.com/zanminwang/ahead/issues/95)). When a Loader throws or refuses a batch, Ahead retries each identity on its own. The record that still fails is delivered as an error change carrying `loader.failed` or the refusal code, and the rest of the page is served. The failure is reported to `onError`, which defaults to `console.error`. The client keeps its copy of that record and reports it. The record is corrected the next time you publish it. A Loader that returns the wrong number of entries is retried the same way, and a row that does not match the model type fails only its record with `loader.invalid`.
 
 Run `integration/persistence/server/run.sh` for the disposable PostgreSQL/Prisma integration suite. Its database is created, used, and destroyed by the runner.
 

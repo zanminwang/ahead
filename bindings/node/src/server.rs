@@ -179,12 +179,12 @@ pub fn live_close(handle: i64) -> Result<()> {
 pub async fn pull_live(
     config_json: String,
     owner: String,
-    scope: String,
-    from_cursor: f64,
+    cursors_json: String,
     models_json: String,
     callback: ThreadsafeFunction<String, Promise<String>, String, Status, false>,
 ) -> Result<String> {
-    // The engine validates the declaration again when it decodes the pull.
+    // The engine validates the declaration and the cursors again when it
+    // decodes the pull.
     let models: std::collections::BTreeMap<String, u64> = serde_json::from_str(&models_json)
         .map_err(|_| {
             reason(ahead_server::Error::new(
@@ -192,21 +192,17 @@ pub async fn pull_live(
                 "invalid live models",
             ))
         })?;
-    if !from_cursor.is_finite()
-        || from_cursor.fract() != 0.0
-        || from_cursor < 0.0
-        || from_cursor > 9_007_199_254_740_991.0
-    {
-        return Err(reason(ahead_server::Error::new(
-            ahead_server::code::REQUEST_INVALID,
-            "invalid live cursor",
-        )));
-    }
+    let cursors: std::collections::BTreeMap<String, u64> = serde_json::from_str(&cursors_json)
+        .map_err(|_| {
+            reason(ahead_server::Error::new(
+                ahead_server::code::REQUEST_INVALID,
+                "invalid live cursors",
+            ))
+        })?;
     let result = ahead_server::live::pull(
         &config(&config_json)?,
         &owner,
-        &scope,
-        from_cursor as u64,
+        &cursors,
         &models,
         &CallbackHost(callback),
     )
