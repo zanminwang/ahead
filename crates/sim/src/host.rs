@@ -1,4 +1,4 @@
-//! The server's persistence, in memory. Mirrors packages/persistence-prisma/index.mts
+//! The server's persistence, in memory. Mirrors packages/postgres/src/persistence.mts
 //! closely enough that ahead_server cannot tell the difference: per-client receipts,
 //! per-channel heads, one invalidation row per (channel, record) carrying the latest
 //! cursor, and one stamp counter per record that only a business change advances.

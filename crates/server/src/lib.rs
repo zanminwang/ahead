@@ -8,7 +8,6 @@ use ahead_core::{
     limits, read_counter,
 };
 pub use error::{Error, code};
-use host::Stamped;
 use host::{Acknowledged, Claimed, Handled, Head, HostExt, HostRequest, Invalidation, Loaded};
 use readback::{Changes, Outcome};
 use serde::{Deserialize, Serialize};
@@ -738,59 +737,39 @@ pub async fn process_pull(
     };
     String::from_utf8(page.encode().map_err(internal)?).map_err(internal)
 }
-pub async fn publish(
+/// Settle a business change made outside a handler, in the application's
+/// transaction: the same `{changes, publications}` shape a handler answers
+/// with. Every changed record gets its next stamp and the publications go
+/// out at those stamps; nothing is read back, since no client is waiting for
+/// a receipt. Answers `[{model, identity, stamp}]` for the changed records.
+pub async fn settle_external(
     config: &Config,
-    changes: &Value,
-    channels: &Value,
+    settlement: &Value,
     host: &impl Host,
 ) -> Result<Value> {
-    let publish_invalid = |m: &str| Error::new(code::PUBLISH_INVALID, m);
-    let changes = changes
-        .as_array()
-        .ok_or_else(|| publish_invalid("changes must be array"))?;
-    let channels = channels
-        .as_array()
-        .ok_or_else(|| publish_invalid("channels must be array"))?;
-    let mut selected = BTreeSet::new();
-    for channel in channels {
-        selected.insert(
-            channel
-                .as_str()
-                .ok_or_else(|| publish_invalid("channel must be string"))?,
-        );
+    let settled: Handled = serde_json::from_value(settlement.clone())
+        .map_err(|e| Error::new(code::PUBLISH_INVALID, e.to_string()))?;
+    let Handled::Settled {
+        changes,
+        publications,
+    } = settled
+    else {
+        return Err(Error::new(
+            code::PUBLISH_INVALID,
+            "an external settlement carries changes and publications",
+        ));
+    };
+    let mut set = Changes::new();
+    for record in &changes {
+        readback::insert(&mut set, readback::resolve(config, record)?)?;
     }
-    let mut keys = BTreeMap::new();
-    for change in changes {
-        let model = change["model"]
-            .as_str()
-            .ok_or_else(|| publish_invalid("model required"))?;
-        if !config.loaders.iter().any(|m| m == model) {
-            return Err(Error::new(code::LOADER_UNREGISTERED, "unregistered loader"));
-        }
-        let key = config
-            .schema
-            .record_key(model, &change["identity"])
-            .map_err(|e| publish_invalid(&e.to_string()))?;
-        keys.insert(key.encoded().map_err(internal)?, key);
-    }
-    // An external notification reports a business change: each record gets
-    // one new stamp, and every selected channel distributes that same version.
-    let mut stamps = BTreeMap::new();
-    for (encoded, key) in &keys {
-        let Stamped(stamp) = host
-            .call_typed(HostRequest::AdvanceStamp {
-                model: key.model.clone(),
-                identity_key: key.encoded_identity().map_err(internal)?,
+    let stamps = readback::allocate_stamps(&set, host).await?;
+    readback::publish_intents(config, &set, &stamps, &publications, host).await?;
+    Ok(Value::Array(
+        set.iter()
+            .map(|(encoded, key)| {
+                json!({"model": key.model, "identity": key.identity, "stamp": stamps[encoded]})
             })
-            .await?;
-        stamps.insert(encoded.clone(), stamp);
-    }
-    let mut result = vec![];
-    for channel in selected {
-        for (encoded, key) in &keys {
-            readback::publish_one(host, channel, key, stamps[encoded]).await?;
-        }
-        result.push(json!({"scope":channel,"syncId":head(host,channel).await?}));
-    }
-    Ok(Value::Array(result))
+            .collect(),
+    ))
 }

@@ -97,9 +97,9 @@ test('built-in live catch-up pages, dependent pushes, watches, offline reconnect
  const wait=async(predicate,label)=>{const deadline=Date.now()+10000;while(Date.now()<deadline){if(await predicate())return;await new Promise(r=>setTimeout(r,5));}throw Error(`${label}: ${errors.map(String)}`);};
  try{
   await app.initialize();const server=await app.listen(0);
-  await app.backend.transaction(async({tx,notify})=>{
-   for(let i=0;i<55;i++)await tx.entry.upsert({where:{id:`paged-${i}`},create:{id:`paged-${i}`,text:`record ${i}`},update:{text:`record ${i}`}});
-   await notify({channel:'book:demo',records:Array.from({length:55},(_,i)=>({model:'Entry',identity:{id:`paged-${i}`}}))});
+  await app.backend.transaction(async({tx,changes,publish})=>{
+   for(let i=0;i<55;i++){await tx.entry.upsert({where:{id:`paged-${i}`},create:{id:`paged-${i}`,text:`record ${i}`},update:{text:`record ${i}`}});changes.add({model:'Entry',identity:{id:`paged-${i}`}});}
+   publish({channel:'book:demo'});
   });
   reader=await Client.open({path:join(directory,'reader.sqlite'),schema:app.schema});
   writer=await Client.open({path:join(directory,'writer.sqlite'),schema:app.schema});

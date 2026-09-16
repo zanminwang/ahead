@@ -31,7 +31,7 @@ export const loaders: Loaders<Tx> = {
 
 // main.ts
 import { createBackend, devAuth } from './generated/backend.ts';
-import { prisma } from '../../packages/persistence-prisma/index.mts';
+import { prisma } from '../../packages/postgres/index.mts';
 import { handlers } from './handlers.ts';
 import { loaders } from './loaders.ts';
 
@@ -68,20 +68,21 @@ Publish to every channel that provides a record whenever that record changes, in
 
 ## Background jobs
 
-Outside a Handler there is no readback and no receipt, so a change must be published to reach clients. Use `backend.transaction`; it advances the stamp of every record named, publishes it to the channel inside the same transaction as your writes, and wakes live subscribers after commit:
+Outside a Handler there is no readback and no receipt, so a change must be published to reach clients. Use `backend.transaction`; its body gets the same `changes` and `publish` as a Handler, the framework stamps and publishes what it collected inside the same transaction as your writes, and wakes live subscribers after commit:
 
 ```ts
-await backend.transaction(async ({ tx, notify }) => {
+await backend.transaction(async ({ tx, changes, publish }) => {
   await tx.entry.update({ where: { id: 'entry-1' }, data: { text: 'From a job' } });
-  await notify({ channel: 'book:demo', records: [Entry({ id: 'entry-1' })] });
+  changes.add(Entry({ id: 'entry-1' }));
+  publish({ channel: 'book:demo' });
 });
 ```
 
-If your framework already owns the transaction, see [externally owned transactions](api.md#externally-owned-transactions).
+See [background writes](api.md#background-writes).
 
 ## Transaction ownership
 
-The outer transaction belongs to the application. Persistence, Handler, and Loader callbacks all receive that same transaction. The runner must provide a coherent snapshot (Repeatable Read or stronger), roll back on rejected promises, and retry serialization conflicts. `prismaTransactions` supplies this contract.
+The outer transaction belongs to the application. Persistence, Handler, and Loader callbacks all receive that same transaction. The runner must provide a coherent snapshot (Repeatable Read or stronger), roll back on rejected promises, and retry serialization conflicts. Every shim of [`@ahead/postgres`](database.md) supplies this contract.
 
 ## Mutation results
 
