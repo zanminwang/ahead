@@ -2,6 +2,19 @@
 
 See the [component documentation index](architecture/README.md) for individual design documents.
 
+## Core
+
+Four parts carry the product's promises: offline writes that are never lost, at-most-once execution, and convergence. Design discussions start here; everything else adapts to them.
+
+| Core part | Why |
+| --- | --- |
+| [Protocol](architecture/protocol/README.md) | The wire contract the two engines agree on: receipts, pages, stamps, cursors. Changing it changes the product. |
+| [Client / Engine](architecture/client/engine/README.md) | Optimistic writes, the mutation queue, authority applied by stamp, completion from receipts. |
+| [Server / Engine](architecture/server/engine/README.md) | Per-mutation execution and readback, publication, receipts, pages by cursor. The client engine's counterpart. |
+| [Server / Backend interface](architecture/server/backend-interface.md) | The host contract between application handlers/loaders and the engine: what a backend author writes. |
+
+The compiler is a tool, the SDKs and connections carry bytes, storage and persistence are adapters, the schema is input. They are marked ★ in the tree and shaded in the graph below.
+
 ## Components
 
 The tree stops at three levels: Ahead, a component, a part. A part that has internal structure keeps its own tree in its README and owns every page below it; nothing deeper appears here.
@@ -12,7 +25,7 @@ The tree stops at three levels: Ahead, a component, a part. A part that has inte
   - **[Relations](architecture/schema/relations.md)** — References, inverse relations and deletion rules.
   - **[Mutations](architecture/schema/mutations.md)** — Operation groups, argument bindings, versions and sequencing.
   - **[Prerequisites](architecture/schema/prerequisites.md)** — Prerequisite declarations and references.
-- **[Protocol](architecture/protocol/README.md)** — Language-independent push, pull, receipt and subscription message formats.
+- ★ **[Protocol](architecture/protocol/README.md)** — Language-independent push, pull, receipt and subscription message formats.
   - **[Common](architecture/protocol/common.md)** — Shared fields, counters and encoding conventions.
   - **[Push](architecture/protocol/push.md)** — Mutation batches, receipts carrying record authority, and rejections.
   - **[Pull](architecture/protocol/pull.md)** — Requests, record changes, cursors and pagination.
@@ -26,12 +39,12 @@ The tree stops at three levels: Ahead, a component, a part. A part that has inte
   - **[Bindings](architecture/sdks/bindings.md)** — Bridge calls, arguments, results, errors and events between the language and Rust.
 - **[Client runtime (Rust)](architecture/client/README.md)** — Local state, storage and sync.
   - **[Frontend interface](architecture/client/frontend-interface.md)** — Expose reads, writes, subscriptions and status to SDKs.
-  - **[Engine](architecture/client/engine/README.md)** — Local reads and writes, the mutation queue, completion from receipts and page application.
+  - ★ **[Engine](architecture/client/engine/README.md)** — Local reads and writes, the mutation queue, completion from receipts and page application.
   - **[Storage](architecture/client/storage/README.md)** — Execute Engine-requested SQL and transactions; table layout and reconciliation.
   - **[Connection](architecture/client/connection/README.md)** — HTTP/WebSocket transport and the controller that decides when to push, stream, catch up and retry.
 - **[Server runtime (Rust)](architecture/server/README.md)** — Sync protocol and backend execution.
-  - **[Backend interface](architecture/server/backend-interface.md)** — Invoke application handlers and loaders through one typed host contract.
-  - **[Engine](architecture/server/engine/README.md)** — Process mutations, read their results back, publish, serve pulls and produce receipts.
+  - ★ **[Backend interface](architecture/server/backend-interface.md)** — Invoke application handlers and loaders through one typed host contract.
+  - ★ **[Engine](architecture/server/engine/README.md)** — Process mutations, read their results back, publish, serve pulls and produce receipts.
   - **[Persistence](architecture/server/persistence.md)** — Persist sync metadata within the application's transaction; no business logic.
   - **[Connection](architecture/server/connection/README.md)** — HTTP/WebSocket transport, subscriptions and streaming.
 
@@ -39,7 +52,7 @@ The tree stops at three levels: Ahead, a component, a part. A part that has inte
 
 Components and their parts; each part's own structure is drawn in its README. Both connection controllers are Rust: the client's live session (`LiveSession`) and the server's subscription controller (`Subscriptions`); the language packages execute their actions and keep no sync decision.
 
-Solid lines show composition; dashed lines are labeled with contract use or data flow.
+Solid lines show composition; dashed lines are labeled with contract use or data flow. Shaded nodes are the core parts.
 
 ```mermaid
 flowchart LR
@@ -78,7 +91,9 @@ flowchart LR
     SC -. uses .-> PRO
 
     classDef contract fill:#edf4ff,stroke:#6485b5,color:#243247;
-    class SCH,PRO contract;
+    classDef core fill:#fff3e0,stroke:#c77700,color:#3d2600,stroke-width:2px;
+    class SCH contract;
+    class PRO,CE,SE,SB core;
 ```
 
 ## Code map
