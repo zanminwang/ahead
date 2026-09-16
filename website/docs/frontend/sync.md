@@ -60,9 +60,9 @@ You can send mutations without subscribing to any channel. The receipt still cor
     await client.connection!.resume();
     ```
 
-This assumes `GeneratedClient.open` was given `server` and the record has already arrived locally. Without it the client is local-only until you connect its raw runtime. Dart uses the same `pause`/`resume` methods with its typed mutation arguments.
+This assumes `GeneratedClient.open` was given `server` and the record has already arrived locally. Without it the client is local-only until you call `client.connect`. Dart uses the same `pause`/`resume` methods with its typed mutation arguments.
 
-A local transaction's completion confirms local commit. It does not mean the server has accepted the operation. Display pending and rejected state using [recordStatus](runtime.md#pending-work-and-recovery) when that distinction matters to the UI.
+A local transaction's completion confirms local commit. It does not mean the server has accepted the operation. Display pending and rejected state using the record's [syncState](runtime.md#pending-work-and-recovery) when that distinction matters to the UI.
 
 You can close and reopen the same local database without losing queued changes. Keep the same backend database as well: replacing a backend's receipt/cursor history with an empty database is a reset, not a temporary network interruption. The tutorial's `offline` / `online` commands preserve both databases.
 
@@ -75,19 +75,21 @@ If a handler rejects the mutation, Ahead removes that mutation's optimistic cont
 === "TypeScript"
 
     ```ts
-    const { rejections } = await client.client.recordStatus('Entry', { id: 'entry-1' });
+    const { rejections } = await client.models.entry.syncState({ id: 'entry-1' });
     console.log(rejections);
     // After handling the rejection in your UI:
-    await client.client.dismissRejection(rejectionOrdinal);
+    await client.dismissRejection(rejectionOrdinal);
     ```
 
 === "Flutter"
 
     ```dart
-    final status = await client.client.recordStatus('Entry', {'id': 'entry-1'});
-    print(status['rejections']);
+    final state = await client.models.entry.syncState(
+      const EntryIdentity(id: 'entry-1'),
+    );
+    print(state.rejections);
     // After handling the rejection in your UI:
-    await client.client.dismissRejection(rejectionOrdinal);
+    await client.dismissRejection(rejectionOrdinal);
     ```
 
 `rejectionOrdinal` is taken from the rejection you handled. Dismissing only clears the inbox entry. Retrying the business action means creating a new mutation after resolving its cause. `drop(ordinal)` is for eligible unsent mutations; it cannot cancel a request whose server outcome is unknown.
@@ -96,7 +98,7 @@ If a handler rejects the mutation, Ahead removes that mutation's optimistic cont
 
 Provide `onError` to record background failures, and `refreshAuth` if your credentials can expire. Let the runtime retry frozen work; do not generate a new mutation merely because the original request timed out. The backend may already have committed it and retained its receipt.
 
-Use `wake()` after an application event that should prompt another scheduling check. Use `resume()` after explicitly pausing. A closed connection cannot resume; create a new one through `client.client.connect` or reopen the owning client.
+Use `wake()` after an application event that should prompt another scheduling check. Use `resume()` after explicitly pausing. A closed connection cannot resume; create a new one with `client.connect` or reopen the client.
 
 On connection or reconnection, Ahead establishes the WebSocket subscription, then catches up over HTTP from each channel's persisted cursor. It queues changes arriving during catch-up and continues with WebSocket updates once caught up. Both sources use the same Rust page processing: covered pages are discarded, overlapping pages apply their unseen changes, and gaps trigger HTTP recovery from saved progress. Subscription changes replace the session; pages from replaced or canceled sessions cannot update local data.
 

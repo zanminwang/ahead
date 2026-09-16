@@ -147,7 +147,9 @@ For a `Comment.book` relationship, `client.models.comment.book(commentIdentity)`
 
 `transaction<T>(callback)` returns the callback's result after local commit. Throwing or a failed operation rolls it back. Await each operation, including nested callbacks; unfinished work is rejected. Inside the callback, use `tx.models` for reads that must see earlier writes in the same transaction. Calling the outer `client` for a read from inside its transaction can wait behind that transaction.
 
-`GeneratedTransaction` exposes `models`, `mutate`, and the underlying `transaction` port. For raw SQL or nested savepoints, use the [runtime Transaction API](runtime.md#transactions-and-savepoints); these methods are not all declared on the TypeScript generated `WritePort`.
+`GeneratedTransaction` exposes `models`, `mutate`, and the underlying `transaction`. For nested savepoints, see [transactions and savepoints](runtime.md#transactions-and-savepoints).
+
+A single mutation does not need an explicit transaction: `client.mutate.edit(args)` runs in its own local transaction and returns the ordinal.
 
 ## Mutations
 
@@ -216,9 +218,10 @@ A channel name must match what your backend publishes to. A subscription is a re
 
 ## Status and lifecycle
 
-- `client.status()` returns runtime diagnostics, including pending count and rejections. It does not send network requests.
-- `client.connection` is the optional connection created by `open`. It is `undefined` / `null` when `server` was omitted. See [connection controls](runtime.md#connection-controls).
-- `client.client` exposes the generic runtime for methods such as `recordStatus` or `runPrerequisites`.
+- `client.syncState()` returns the client's pending count, cursors, channels and rejections; `client.models.<name>.syncState(identity)` returns one record's pending mutations and rejections, typed by the model. Neither sends network requests. See [pending work and recovery](runtime.md#pending-work-and-recovery).
+- `client.clientId` is this database's durable client identity.
+- `client.connection` is the connection created by `open` or `client.connect`. It is `undefined` / `null` when there is none. See [connection controls](runtime.md#connection-controls).
+- Recovery, prerequisite and escape-hatch members (`dismissRejection`, `drop`, `pendingTasks`, `setReadiness`, `runPrerequisites`, `querySpec`, `readSql`) are on the same object; see the [client runtime reference](runtime.md).
 - `await client.close()` stops the connection and releases the local database handle. Close the client when its owning application scope ends; cancel individual watchers when their views end. Calls after close fail.
 
 ## Generated data types

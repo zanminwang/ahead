@@ -20,7 +20,7 @@ The `migration` option supplies field defaults and can request a pull replay whe
 | --- | --- |
 | A request times out | Let sync retry the persisted frozen request. The backend may already have committed it. |
 | Frozen work remains pending | Check connectivity and authentication; a receipt Ahead cannot apply is refused and the batch resent, so check `onError` on both sides. |
-| A mutation is rejected | Display its code, inspect `recordStatus`, then dismiss the handled rejection. |
+| A mutation is rejected | Display its code, inspect the record's `syncState`, then dismiss the handled rejection. |
 | A prerequisite fails | Resolve its cause, reset its readiness to `pending`, then run its callback again. |
 | Another client wrote to the same file | Close the stale instance and reopen it; keep one active client per file. |
 
