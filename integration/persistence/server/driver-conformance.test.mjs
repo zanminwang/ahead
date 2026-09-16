@@ -52,7 +52,7 @@ for(const shim of shims){
   assert.deepEqual(receipt.records,[{identity:{id:p('t')},model:'Task',stamp:1,state:{title:'typed'}}]);
   assert.deepEqual(await q('SELECT title FROM conformance_task WHERE id=$1',[p('t')]),[{title:'typed'}]);
   assert.equal(Number((await q('SELECT sequence FROM ahead_client WHERE client_id=$1',[p('c')]))[0].sequence),1);
-  const page=JSON.parse(await backend.pull('alice',JSON.stringify({clientId:p('c'),scope:p('shared'),fromCursor:0,models:{Task:1}})));
+  const page=JSON.parse(await backend.pull('alice',JSON.stringify({cursors:{[p('shared')]:0},models:{Task:1}})));
   assert.equal(page.changes.length,1);assert.deepEqual(page.changes[0].state,{title:'typed'});assert.equal(page.changes[0].stamp,1);
   assert.equal(await backend.push('alice',JSON.stringify({clientId:p('c'),batchSequence:1,models:{Task:1},mutations:[{ordinal:1,name:'edit',operations:[]}]})),JSON.stringify(receipt),'a retry answers from the stored receipt');
  });
