@@ -913,12 +913,14 @@ fn count_direct<S: ClientStore>(store: &mut S, schema: &Schema) -> Result<usize>
             .iter()
             .map(|k| format!("'{}', m.{}", k.replace('\'', "''"), ddl::quote(k)))
             .collect();
+        // A row with no stamp and no pending operation reached this file only
+        // through a direct write: nothing will ever send it.
+        let identity = format!("json_object({})", pairs.join(", "));
         let sql = format!(
-            "SELECT COUNT(*) FROM {} m WHERE NOT EXISTS (SELECT 1 FROM ahead_record r WHERE r.model = ? AND r.identity = json_object({}))",
+            "SELECT COUNT(*) FROM {} m WHERE NOT EXISTS (SELECT 1 FROM ahead_record r WHERE r.model = ? AND r.identity = {identity}) AND NOT EXISTS (SELECT 1 FROM ahead_mutation_operation o WHERE o.model = ? AND o.identity = {identity})",
             ddl::quote(&model.name),
-            pairs.join(", ")
         );
-        let rows = store.query_committed(&sql, &[json!(model.name)])?;
+        let rows = store.query_committed(&sql, &[json!(model.name), json!(model.name)])?;
         total += rows.rows.first().and_then(|r| r[0].as_u64()).unwrap_or(0) as usize;
     }
     Ok(total)

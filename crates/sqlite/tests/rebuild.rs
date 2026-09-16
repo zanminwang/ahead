@@ -187,7 +187,10 @@ fn unsent_work_keeps_the_old_file_open_until_it_is_sent_then_rebuild_switches() 
     assert!(!c.schema_state().rebuilt);
     let pending = c.schema_state().pending.clone().unwrap();
     assert_eq!(pending.pending, 1);
-    assert_eq!(pending.direct, 1, "the seeded row has no stamp");
+    assert_eq!(
+        pending.direct, 0,
+        "the seeded row is covered by its pending mutation"
+    );
     assert!(pending.reason.contains("due"));
     assert_eq!(sidecar(&path), None);
     assert_eq!(
@@ -250,8 +253,8 @@ fn discarding_pending_work_reports_what_the_old_file_keeps() {
     let report = c.rebuild(true).unwrap();
     assert_eq!(report.left_pending, 1);
     assert_eq!(
-        report.left_direct, 2,
-        "both direct rows stay in the old file"
+        report.left_direct, 1,
+        "the row only a direct write created stays behind; the seeded row belongs to its pending mutation"
     );
     assert!(report.old_file.ends_with("db"));
     assert!(report.new_file.ends_with("db.1"));

@@ -135,6 +135,8 @@ pub enum Action {
 
 pub struct Slot {
     pub path: PathBuf,
+    /// The schema this slot opens with; `Sim::upgrade` replaces it.
+    pub schema: ahead_core::Schema,
     pub client: Option<Client<SqliteStore>>,
     pub enqueued: Vec<u64>,
     pub receipts: BTreeMap<u64, PushReceipt>,
@@ -204,8 +206,16 @@ pub const OWNER: &str = "u";
 /// in `Sim::settle`.
 type SimSnapshot = (usize, u64, Vec<(String, u64)>);
 
-fn open(path: &PathBuf) -> Client<SqliteStore> {
-    Client::open(SqliteStore::open(path).unwrap(), schema::schema()).unwrap()
+/// Opens through the file-selection path (sidecar, descriptor, compatibility), the
+/// way an SDK does, so a restart after a rebuild lands on the rebuilt file.
+fn open(path: &PathBuf, schema: &ahead_core::Schema, discard_pending: bool) -> Client<SqliteStore> {
+    Client::open_at(
+        path,
+        schema.clone(),
+        Box::new(|p| SqliteStore::open(p)),
+        discard_pending,
+    )
+    .unwrap()
 }
 
 pub fn parse_key(s: &str) -> RecordKey {
@@ -223,9 +233,11 @@ impl Sim {
         let clients = (0..clients)
             .map(|i| {
                 let path = dir.path().join(format!("client-{i}.sqlite"));
+                let schema = schema::schema();
                 Slot {
-                    client: Some(open(&path)),
+                    client: Some(open(&path, &schema, false)),
                     path,
+                    schema,
                     enqueued: vec![],
                     receipts: BTreeMap::new(),
                     pushes: BTreeMap::new(),
@@ -255,6 +267,55 @@ impl Sim {
     }
     pub fn check(&mut self) -> Result<(), String> {
         crate::invariants::check(self)
+    }
+    /// Reopen a running client with `schema` the way an app upgrade does: an
+    /// identical or additive schema opens in place; an incompatible one is rebuilt
+    /// beside, unless unsent work keeps the old file open (`discard_pending` leaves
+    /// that work behind). A rebuilt file is a new client to the simulation: the
+    /// slot's push bookkeeping and the high-water marks start over, since nothing
+    /// in the old file belongs to it.
+    pub fn upgrade(
+        &mut self,
+        client: usize,
+        schema: ahead_core::Schema,
+        discard_pending: bool,
+    ) -> ahead_client::SchemaState {
+        self.clients[client].client = None;
+        self.clients[client].schema = schema;
+        let slot = &self.clients[client];
+        let reopened = open(&slot.path, &slot.schema, discard_pending);
+        let state = reopened.schema_state().clone();
+        self.clients[client].client = Some(reopened);
+        if state.rebuilt {
+            self.forget(client);
+        }
+        state
+    }
+    /// `Client::rebuild` on a client whose old file was kept open for unsent work.
+    pub fn rebuild(
+        &mut self,
+        client: usize,
+        discard_pending: bool,
+    ) -> Result<ahead_client::RebuildReport, String> {
+        let report = self
+            .client(client)
+            .rebuild(discard_pending)
+            .map_err(|e| e.to_string())?;
+        self.forget(client);
+        Ok(report)
+    }
+    fn forget(&mut self, client: usize) {
+        let slot = &mut self.clients[client];
+        slot.enqueued.clear();
+        slot.receipts.clear();
+        slot.pushes.clear();
+        slot.crash_state = None;
+        for generation in slot.generations.values_mut() {
+            *generation += 1;
+        }
+        self.seen_stamps.retain(|(i, _), _| *i != client);
+        self.seen_cursors.retain(|(i, _), _| *i != client);
+        self.direct_writes.retain(|(i, _)| *i != client);
     }
     pub fn client(&mut self, i: usize) -> &mut Client<SqliteStore> {
         self.clients[i].client.as_mut().expect("client is crashed")
@@ -400,8 +461,9 @@ impl Sim {
             }
             Action::Restart { client } => {
                 if self.clients[client].client.is_none() {
-                    let path = self.clients[client].path.clone();
-                    self.clients[client].client = Some(open(&path));
+                    let slot = &self.clients[client];
+                    let reopened = open(&slot.path, &slot.schema, false);
+                    self.clients[client].client = Some(reopened);
                     if let Some(before) = self.clients[client].crash_state.take() {
                         crate::invariants::no_pending_operation_is_lost_on_reopen(
                             self, client, &before,
