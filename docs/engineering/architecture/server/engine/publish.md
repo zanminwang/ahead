@@ -1,8 +1,8 @@
-# Notify
+# Publish
 
 ## 1. Introduction and Goals
 
-Notify is how a change becomes visible to pull. Publishing a record to a channel gives it a new position in that channel, at the record's current version, inside the same transaction as the change, and wakes live subscribers once that transaction commits. Publishing distributes a version; it does not create one.
+Publish is how a change becomes visible to pull. Publishing a record to a channel gives it a new position in that channel, at the record's current version, inside the same transaction as the change, and wakes live subscribers once that transaction commits. Publishing distributes a version; it does not create one.
 
 ## 3. Context and Scope
 

@@ -54,7 +54,8 @@ arc42 [does not prescribe a universal required/optional checklist](https://faq.a
 
 ### Splitting components
 
-- Follow the [component tree](../engineering/architecture.md). Keep simple components in one file; split complex components by responsibility.
+- Follow the [component tree](../engineering/architecture.md). It has three levels and no more: Ahead, a component, a part. A part with internal structure keeps its own tree, "how the parts work together" and code map in its README; pages below a part never appear in the top-level tree, graph or code map.
+- Keep simple components in one file; split complex components by responsibility.
 - Decide what each parent needs to explain. A grouping may need only a brief description and links; when the children leave their collaboration unclear, explain it in the parent's README without repeating their details. Do not require a full document at every level.
 - Preserve agreed ownership boundaries. After splitting, update the tree, graph, code map and incoming links.
 
