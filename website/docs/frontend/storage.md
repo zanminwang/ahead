@@ -18,7 +18,7 @@ Each database records the schema it was built for. Opening it with a newer gener
 | A new model, or a new nullable field | Applied in place; cached records, queued mutations and frozen request bytes are preserved. |
 | Anything else: a required field, a removed or retyped field, a changed identity, unique constraint, relation, enum or model version, a removed model, or a file from an earlier Ahead runtime | The file is left untouched and a fresh database is opened beside it (`<path>.1`, `<path>.2`, …). A small `<path>.current` file names the one in use. The new database keeps the old subscriptions and synchronises from the beginning. |
 
-Before switching, the runtime looks at the old database's unsent mutations. If there are any, it keeps that database open so they can still be sent; `status().schema.pending` reports how many remain and why the schema is incompatible. When they are sent, call `rebuild()`. If they cannot be sent, call `rebuild({ discardPending: true })`: the report tells you how many mutations and local-only records stay in the old file. Nothing is copied between schemas, and the runtime never deletes an old file; delete the numbered files you no longer need. See [opening and schema changes](runtime.md#opening-and-schema-changes) for the calls. Update your backend tables separately through your database's migration process.
+Before switching, the runtime looks at the old database's unsent mutations. If there are any, it keeps that database open so they can still be sent; `syncState().schema.pending` reports how many remain and why the schema is incompatible. When they are sent, call `rebuild()`. If they cannot be sent, call `rebuild({ discardPending: true })`: the report tells you how many mutations and local-only records stay in the old file. Nothing is copied between schemas, and the runtime never deletes an old file; delete the numbered files you no longer need. See [opening and schema changes](runtime.md#opening-and-schema-changes) for the calls. Update your backend tables separately through your database's migration process.
 
 ## Recover pending work
 
@@ -26,7 +26,7 @@ Before switching, the runtime looks at the old database's unsent mutations. If t
 | --- | --- |
 | A request times out | Let sync retry the persisted frozen request. The backend may already have committed it. |
 | Frozen work remains pending | Check connectivity and authentication; a receipt Ahead cannot apply is refused and the batch resent, so check `onError` on both sides. |
-| A mutation is rejected | Display its code, inspect `recordStatus`, then dismiss the handled rejection. |
+| A mutation is rejected | Display its code, inspect the record's `syncState`, then dismiss the handled rejection. |
 | A prerequisite fails | Resolve its cause, reset its readiness to `pending`, then run its callback again. |
 | Another client wrote to the same file | Close the stale instance and reopen it; keep one active client per file. |
 

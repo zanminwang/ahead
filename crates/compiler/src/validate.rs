@@ -262,6 +262,34 @@ fn strings(values: &[Value]) -> Vec<String> {
 }
 
 /// Check the declarations and resolve them into the typed schema.
+/// Top-level identifiers the generated TypeScript and Dart clients, or the
+/// runtime packages they import, declare. A model or enum with one of these
+/// names would collide with them in the generated file.
+const GENERATED_NAMES: &[&str] = &[
+    "Channels",
+    "Client",
+    "ClientSyncState",
+    "Connection",
+    "GeneratedClient",
+    "GeneratedTransaction",
+    "LiveModels",
+    "LivePort",
+    "Mutate",
+    "MutatePort",
+    "MutationName",
+    "PendingMutation",
+    "Present",
+    "ReadPort",
+    "RebuildReport",
+    "Rejection",
+    "RuntimeConnection",
+    "SyncServer",
+    "SyncState",
+    "Transaction",
+    "TxModels",
+    "WritePort",
+];
+
 pub fn validate(d: &Declarations) -> Result<Validated, String> {
     let eof = d.end;
     let enums: Vec<Enum> = d
@@ -297,6 +325,12 @@ pub fn validate(d: &Declarations) -> Result<Validated, String> {
     for (name, pos) in &declared_names {
         if !seen_names.insert(*name) {
             return Err(at(*pos, format!("duplicate declaration {name}")));
+        }
+        if GENERATED_NAMES.contains(name) {
+            return Err(at(
+                *pos,
+                format!("{name} is a name the generated client uses; choose another"),
+            ));
         }
     }
     for m in &d.models {

@@ -38,7 +38,7 @@ try {
       } else if (line === "online") {
         await client.connection!.resume();
         console.log("Sync resumed.");
-      } else if (line === "status") console.log(await client.status());
+      } else if (line === "status") console.log(await client.syncState());
     } catch (error) {
       console.error(String(error));
     }

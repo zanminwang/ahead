@@ -19,6 +19,10 @@ try {
  if(filtered.length!==1)throw Error('typed query normalization');
  await client.transaction(async tx=>{await tx.mutate.addBook({book:{id:'b',title:'Book'}});await tx.mutate.addComment({comment:{id:'c',bookId:'b',text:'Comment'}});});
  if((await client.models.comment.book({id:'c'}))?.id!=='b')throw Error('forward relation');
+ const ordinal=await client.mutate.editEntry({entry:{identity:{id},values:{note:'outside'}}});
+ const state=await client.models.entry.syncState({id});
+ if(!state.pending.some(p=>p.ordinal===ordinal&&p.name==='EditEntry'&&p.phase==='queued'))throw Error('typed record sync state');
+ if((await client.syncState()).pending<1||client.clientId==='')throw Error('client sync state');
  if((await client.models.book.comments({id:'b'})).length!==1)throw Error('inverse relation');
  await client.transaction(async tx=>{await tx.models.book.create({id:'local',title:'Local only'});await tx.models.book.update({id:'local'},{title:'Local edited'});});
  if((await client.models.book.get({id:'local'}))?.title!=='Local edited')throw Error('local write');
@@ -39,5 +43,5 @@ Client.open=async options=>(opened=await originalOpen.call(Client,options));
 try{
  await assert.rejects(GeneratedClient.open({path:join(failedDirectory,'state.sqlite'),server:{url:'http://[',token:'secret'}}),/Invalid URL/);
  assert.ok(opened);
- await assert.rejects(opened.status(),/client_closed/);
+ await assert.rejects(opened.syncState(),/client_closed/);
 }finally{Client.open=originalOpen;await opened?.close();await rm(failedDirectory,{recursive:true,force:true});}

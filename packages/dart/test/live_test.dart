@@ -513,7 +513,7 @@ void main() {
           beforeOverlap,
           reason: 'overlap applies directly without HTTP',
         );
-        expect((await client.status())['cursors']['scope'], 2);
+        expect((await client.syncState())['cursors']['scope'], 2);
         sockets.last.add(
           jsonEncode({
             ...page('duplicate', 1),
@@ -764,7 +764,7 @@ void main() {
         token.complete('secret');
         final deadline = DateTime.now().add(const Duration(seconds: 3));
         while (DateTime.now().isBefore(deadline) &&
-            (await second.status())['pending'] != 0 &&
+            (await second.syncState())['pending'] != 0 &&
             errors.isEmpty) {
           await Future<void>.delayed(const Duration(milliseconds: 5));
         }
@@ -773,7 +773,7 @@ void main() {
           isEmpty,
           reason: 'pausing another client must not cancel this push',
         );
-        expect((await second.status())['pending'], 0);
+        expect((await second.syncState())['pending'], 0);
         expect(requests, 1);
         expect(
           (await second.read('Entry', {'id': 'local'}))?['text'],
@@ -983,7 +983,7 @@ void moreTests() {
           0,
           reason: 'no HTTP catch-up without an acknowledged WebSocket',
         );
-        await until(() async => (await client.status())['pending'] == 0);
+        await until(() async => (await client.syncState())['pending'] == 0);
         expect(
           pulls,
           0,
@@ -1009,7 +1009,7 @@ void moreTests() {
         );
         expect(pushes, 1, reason: 'the receipt was not re-requested');
         expect(pulls, greaterThanOrEqualTo(1));
-        expect((await client.status())['pending'], 0);
+        expect((await client.syncState())['pending'], 0);
         await connection.close();
       } finally {
         await client.close();
@@ -1109,9 +1109,9 @@ void moreTests() {
         head = 202;
         gate.complete();
         await until(
-          () async => (await client.status())['cursors']['scope'] >= 201,
+          () async => (await client.syncState())['cursors']['scope'] >= 201,
         );
-        expect((await client.status())['cursors']['scope'], 202);
+        expect((await client.syncState())['cursors']['scope'], 202);
         expect(
           (await client.read('Entry', {'id': 'live'}))?['text'],
           'head 202',
@@ -1263,11 +1263,11 @@ void moreTests() {
           () => accepted.isCompleted && pushes >= 1,
           'both lanes recovered',
         );
-        var status = await client.status();
+        var status = await client.syncState();
         final settled = DateTime.now().add(const Duration(seconds: 5));
         while (status['pending'] != 0 && DateTime.now().isBefore(settled)) {
           await Future<void>.delayed(const Duration(milliseconds: 5));
-          status = await client.status();
+          status = await client.syncState();
         }
         expect(status['pending'], 0);
         expect(
@@ -1512,9 +1512,9 @@ void moreTests() {
         head = 12;
         gate.complete();
         await until(
-          () async => (await client.status())['cursors']['scope'] >= 11,
+          () async => (await client.syncState())['cursors']['scope'] >= 11,
         );
-        expect((await client.status())['cursors']['scope'], 12);
+        expect((await client.syncState())['cursors']['scope'], 12);
         expect(
           (await client.read('Entry', {'id': 'live'}))?['text'],
           'head 12',
@@ -1587,7 +1587,7 @@ void moreTests() {
             },
           ],
         });
-        expect((await client.status())['pending'], 1);
+        expect((await client.syncState())['pending'], 1);
         await client.connect(
           SyncServer(
             url: 'http://127.0.0.1:${server.port}',
@@ -1610,7 +1610,7 @@ void moreTests() {
           reason: "the refusal's code reaches onError: $errors",
         );
         expect(
-          (await client.status())['pending'],
+          (await client.syncState())['pending'],
           1,
           reason: 'the refused batch stays pending, not dropped or completed',
         );
@@ -1748,7 +1748,7 @@ void moreTests() {
           'first',
           reason: 'a read failure keeps the local content',
         );
-        expect((await client.status())['cursors']['scope'], 3);
+        expect((await client.syncState())['cursors']['scope'], 3);
         // A queued edit whose replay fails over new authority: the server's
         // row is visible, the edit is reported diverged and still sent.
         errors.clear();
@@ -1779,9 +1779,9 @@ void moreTests() {
           isNull,
           reason: "the server's row (a deletion) is visible",
         );
-        expect((await client.status())['pending'], 1);
+        expect((await client.syncState())['pending'], 1);
         allowPush = true;
-        await until(() async => (await client.status())['pending'] == 0);
+        await until(() async => (await client.syncState())['pending'] == 0);
         expect(
           (await client.read('Entry', {'id': 'live'}))?['text'],
           'edited offline',
@@ -1802,7 +1802,7 @@ void moreTests() {
             },
           ],
         });
-        await until(() async => (await client.status())['pending'] == 0);
+        await until(() async => (await client.syncState())['pending'] == 0);
         final skipped = errors.whereType<AheadReport>().single;
         expect(skipped.kind, 'skipped');
         expect(skipped.identity, {'id': 'odd'});

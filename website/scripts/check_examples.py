@@ -38,9 +38,8 @@ def check():
         directory = Path(temp)
         ts = directory / 'examples.mts'
         ts.write_text('''import { GeneratedClient, Edit, schema } from '../../../integration/e2e/fixtures/round-trip/generated/client.ts';
-import { Client } from '../../client-js/index.mts';
+import type { Transaction } from '../../client-js/index.mts';
 declare const client: GeneratedClient;
-declare const raw: Client;
 declare const backendUrl: string;
 declare let accessToken: string;
 declare function renewAccessToken(): Promise<string>;
@@ -62,7 +61,6 @@ import 'dart:io';
 import 'package:ahead/ahead.dart';
 import '../../../integration/e2e/fixtures/round-trip/generated/generated.dart';
 late GeneratedClient client;
-late Client raw;
 late StreamSubscription<List<Entry>> subscription;
 late HttpClient http;
 void render(List<Entry> entries) {}

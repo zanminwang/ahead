@@ -74,7 +74,7 @@ void main() {
         expect(task['state'], 'failed');
         expect(task['name'], 'Upload');
         expect(task['error'], 'Bad state: offline');
-        final status = await client.recordStatus('Entry', {'id': 'e'});
+        final status = await client.recordSyncState('Entry', {'id': 'e'});
         final prerequisite =
             (status['pending'] as List).first['prerequisites'].first;
         expect(prerequisite['error'], 'Bad state: offline');

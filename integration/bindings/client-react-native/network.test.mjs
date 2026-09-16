@@ -52,14 +52,14 @@ test('mobile transport authenticates real HTTP/WS and streams without polling',a
     assert.equal(authorization,'Bearer alice');
     assert.equal(requests[0].authorization,'Bearer alice');
     assert.equal(requests[0].url,'/sync/pull');
-    await until(async()=>(await client.status()).cursors.scope===1);
+    await until(async()=>(await client.syncState()).cursors.scope===1);
     const change={cursors:{scope:{from:1,to:2,head:2}},changes:[{model:'Entry',identity:{id:'one'},stamp:1,state:{text:'live',note:null}}]};
     peer.send(JSON.stringify(change));
     await until(async()=>(await client.read('Entry',{id:'one'}))?.text==='live');
     peer.send(JSON.stringify(change));
     await new Promise(r=>setTimeout(r,100));
     assert.equal(requests.length,1,'ordinary/duplicate live pages must not issue pull requests');
-    assert.equal((await client.status()).cursors.scope,2);
+    assert.equal((await client.syncState()).cursors.scope,2);
     await client.close();
     const before=requests.length;
     await new Promise(r=>setTimeout(r,50));

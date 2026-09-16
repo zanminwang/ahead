@@ -15,13 +15,13 @@ test('an incompatible schema keeps unsent work in the old file until it is sent,
  const path = join(dir, 'client.sqlite');
  try {
   let client = await Client.open({ path, schema });
-  assert.equal((await client.status()).schema.rebuilt, false);
+  assert.equal((await client.syncState()).schema.rebuilt, false);
   await client.transaction(tx => tx.direct({ model: 'Entry', op: 'create', identity: { id: 'e' }, values: { text: 'A' } }));
   await client.mutate({ name: 'Edit', operations: [{ model: 'Entry', op: 'update', identity: { id: 'e' }, values: { text: 'B' } }] });
   assert.notEqual(await client.freeze(), null);
   await client.close();
   client = await Client.open({ path, schema: breaking });
-  let status = await client.status();
+  let status = await client.syncState();
   assert.equal(status.schema.rebuilt, false);
   assert.equal(status.schema.pending.pending, 1, 'the old file is kept open for its unsent work');
   assert.match(status.schema.pending.reason, /due/);
@@ -29,7 +29,7 @@ test('an incompatible schema keeps unsent work in the old file until it is sent,
   const report = await client.rebuild({ discardPending: true });
   assert.equal(report.leftPending, 1);
   assert.match(report.newFile, /client\.sqlite\.1$/);
-  status = await client.status();
+  status = await client.syncState();
   assert.equal(status.schema.rebuilt, true);
   assert.equal(status.schema.pending, null);
   assert.equal(status.pending, 0);
@@ -39,7 +39,7 @@ test('an incompatible schema keeps unsent work in the old file until it is sent,
   await client.close();
   // Reopening follows the sidecar to the new file.
   client = await Client.open({ path, schema: breaking });
-  assert.equal((await client.status()).schema.rebuilt, false);
+  assert.equal((await client.syncState()).schema.rebuilt, false);
   await client.close();
  } finally { await rm(dir, { recursive: true, force: true }); }
 });

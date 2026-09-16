@@ -1,5 +1,6 @@
 import type {Handlers,Loaders,EntryV1} from './backend.ts';
-import {CreateEntry,EditEntry,RemoveEntries,decodeEntry,encodeEntry,EntryModel,EntryLiveModel,GeneratedTransaction,type Entry,type ReadPort,type LivePort,type WritePort} from './generated.ts';
+import type {GeneratedClient} from './client.ts';
+import {CreateEntry,EditEntry,RemoveEntries,decodeEntry,encodeEntry,EntryModel,EntryLiveModel,GeneratedTransaction,Mutate,type Entry,type ReadPort,type LivePort,type WritePort,type MutationName,type SyncState} from './generated.ts';
 const row:Entry={id:'123e4567-e89b-42d3-a456-426614174000',title:'hello',note:null,at:new Date('2026-01-01T00:00:00Z'),tags:['x'],status:'active'};
 function check(v:unknown,m:string){if(!v)throw Error(m)}
 const create=CreateEntry({entry:row});
@@ -17,8 +18,17 @@ if(false){
  entries.query({orderBy:[{field:'status',direction:'ascending'}]});
  // @ts-expect-error date filter must be a Date
  entries.query({where:{at:'2026-01-01'}});
- const live:LivePort={...reads,watch(){return ()=>{}}};
+ const live:LivePort={...reads,watch(){return ()=>{}},async syncState(){return {pending:[],rejections:[]}}};
  new EntryLiveModel(live).watch({},(rows)=>rows[0]?.at.getTime());
+ // A record's sync state is typed by model: the identity is the model's, pending names are the schema's mutations.
+ const state:Promise<SyncState>=new EntryLiveModel(live).syncState({id:row.id});
+ void state.then(s=>{const name:MutationName=s.pending[0]!.name;const diverged:boolean|undefined=s.pending[0]!.diverged;void name;void diverged;});
+ // @ts-expect-error syncState takes the model's identity
+ new EntryLiveModel(live).syncState({title:'x'});
+ // @ts-expect-error a pending name is one of the schema's mutations
+ const unknown:SyncState['pending'][number]={ordinal:1,name:'NoSuchMutation',phase:'queued',prerequisites:[]};
+ // Mutations run outside a transaction through any port that can enqueue one.
+ const direct:Promise<number>=new Mutate({async mutate(){return 1}}).editEntry({entry:{identity:{id:row.id},values:{note:null}}});
  const writes:WritePort={...reads,async mutate(){return 1},async direct(){}};
  // @ts-expect-error watch is not available inside a transaction
  new GeneratedTransaction(writes).models.entry.watch({},()=>{});
@@ -73,3 +83,13 @@ if(false){
 const tx=new GeneratedTransaction({...reads,async mutate(m){check(JSON.stringify(m)===JSON.stringify(create),'forwarding');return 1},async direct(op){check(JSON.stringify(op)===JSON.stringify({model:'Entry',op:'delete',identity:{id:row.id}}),'local write');}});
 async function main(){check((await tx.models.entry.get({id:row.id}))?.at instanceof Date,'read decode');check((await tx.models.entry.query()).length===1,'query facade');check(await tx.mutate.createEntry({entry:row})===1,'mutate facade');await tx.models.entry.delete({id:row.id});}
 main();
+// The generated client carries the schema check and the rebuild call.
+type Rebuilt=Awaited<ReturnType<GeneratedClient['rebuild']>>;
+type SchemaCheck=Awaited<ReturnType<GeneratedClient['syncState']>>['schema'];
+const rebuildShape=(report:Rebuilt,state:SchemaCheck):[number,number,boolean]=>[report.leftPending,report.leftDirect,state.rebuilt];
+void rebuildShape;
+function misuse(app:GeneratedClient){
+ // @ts-expect-error rebuild takes an options object
+ void app.rebuild(true);
+}
+void misuse;

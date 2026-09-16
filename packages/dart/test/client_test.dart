@@ -223,7 +223,7 @@ void main() {
       });
       try {
         var client = await fixture.open();
-        expect((await client.status())['schema']['rebuilt'], false);
+        expect((await client.syncState())['schema']['rebuilt'], false);
         await seed(client);
         await client.mutate({
           'name': 'Edit',
@@ -237,7 +237,7 @@ void main() {
           schema: breaking,
           libraryPath: Platform.environment['AHEAD_LIBRARY']!,
         );
-        var status = await client.status();
+        var status = await client.syncState();
         expect(status['schema']['rebuilt'], false);
         expect(status['schema']['pending']['pending'], 1);
         expect(status['schema']['pending']['reason'], contains('due'));
@@ -245,7 +245,7 @@ void main() {
         final report = await client.rebuild(discardPending: true);
         expect(report['leftPending'], 1);
         expect(report['newFile'], endsWith('db.1'));
-        status = await client.status();
+        status = await client.syncState();
         expect(status['schema']['rebuilt'], true);
         expect(status['schema']['pending'], isNull);
         expect(await text(client), isNull);

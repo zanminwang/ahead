@@ -9,6 +9,14 @@ export type {
   ConnectionOptions,
 } from "../client-js/connection.mts";
 export type { ServerOptions } from "../client-js/live.mts";
+export type {
+  ClientSyncState,
+  ModelSyncState,
+  PendingMutation,
+  RebuildReport,
+  Rejection,
+  SchemaState,
+} from "../client-js/runtime.mts";
 
 const native = requireNativeModule<{
   clientCall(request: string): Promise<string>;

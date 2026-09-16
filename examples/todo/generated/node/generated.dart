@@ -127,6 +127,8 @@ class UserModel { final ReadPort port; UserModel(this.port);
 }
 class UserLiveModel extends UserModel { final Client client; UserLiveModel(this.client) : super(client);
  Stream<List<User>> watch({UserFilter? where}) => client.watch('User', where:where?.toRecord()??{}).map((rows) => rows.map(User.fromRecord).toList());
+ /// This record's sync state: its pending mutations and retained rejections. Local only.
+ Future<SyncState> syncState(UserIdentity identity) async => SyncState.fromRecord(await client.recordSyncState('User', identity.toRecord()));
 }
 class UserTxModel extends UserModel { final WritePort writer; UserTxModel(this.writer) : super(writer);
  Future<void> create(User value) { final state=value.toRecord(); for (final key in value.identity.toRecord().keys) { state.remove(key); } return writer.direct({'model':'User','op':'create','identity':value.identity.toRecord(),'values':state}); }
@@ -140,13 +142,15 @@ class TodoModel { final ReadPort port; TodoModel(this.port);
 }
 class TodoLiveModel extends TodoModel { final Client client; TodoLiveModel(this.client) : super(client);
  Stream<List<Todo>> watch({TodoFilter? where}) => client.watch('Todo', where:where?.toRecord()??{}).map((rows) => rows.map(Todo.fromRecord).toList());
+ /// This record's sync state: its pending mutations and retained rejections. Local only.
+ Future<SyncState> syncState(TodoIdentity identity) async => SyncState.fromRecord(await client.recordSyncState('Todo', identity.toRecord()));
 }
 class TodoTxModel extends TodoModel { final WritePort writer; TodoTxModel(this.writer) : super(writer);
  Future<void> create(Todo value) { final state=value.toRecord(); for (final key in value.identity.toRecord().keys) { state.remove(key); } return writer.direct({'model':'Todo','op':'create','identity':value.identity.toRecord(),'values':state}); }
  Future<void> update(TodoIdentity identity, TodoPatch patch) => writer.direct({'model':'Todo','op':'update','identity':identity.toRecord(),'values':patch.toRecord()});
  Future<void> delete(TodoIdentity identity) => writer.direct({'model':'Todo','op':'delete','identity':identity.toRecord()});
 }
-class Mutate { final WritePort port; Mutate(this.port);
+class Mutate { final MutatePort port; Mutate(this.port);
  Future<int> addTodo({required Todo todo}) => port.mutate(_addTodo(todo:todo));
  Future<int> setTodoDone({required SetTodoDoneTodoUpdate todo}) => port.mutate(_setTodoDone(todo:todo));
 }
@@ -163,17 +167,41 @@ class Channels { final Client client; Channels(this.client);
  Future<void> unsubscribe(String channel) => client.unsubscribe(channel);
 }
 class GeneratedTransaction { final Transaction transaction; late final TxModels models = TxModels(transaction); late final Mutate mutate = Mutate(transaction); GeneratedTransaction(this.transaction); }
-class GeneratedClient { final Client client; final RuntimeConnection? connection; late final LiveModels models = LiveModels(client); late final Channels channels = Channels(client);
+class GeneratedClient {
+ /// The runtime handle (internal); application code uses the members below.
+ final Client client; RuntimeConnection? connection; late final LiveModels models = LiveModels(client);
+ /// Each mutation runs in its own local transaction and returns its ordinal.
+ late final Mutate mutate = Mutate(client);
+ late final Channels channels = Channels(client);
  GeneratedClient._(this.client, this.connection);
  /// Opens the local database at [path]. With a [server], the connection starts immediately and retries on its own.
- static Future<GeneratedClient> open({required String path, SyncServer? server, String? libraryPath, Map<String,dynamic>? migration, void Function(Object)? onError, Future<void> Function()? refreshAuth}) async {
-  final client = await Client.open(path:path, schema:schema, libraryPath:libraryPath, migration:migration);
+ static Future<GeneratedClient> open({required String path, SyncServer? server, String? libraryPath, Map<String,dynamic>? migration, bool discardPending = false, void Function(Object)? onError, Future<void> Function()? refreshAuth}) async {
+  final client = await Client.open(path:path, schema:schema, libraryPath:libraryPath, migration:migration, discardPending:discardPending);
   try {
   final connection = server == null ? null : await client.connect(server, onError:onError, refreshAuth:refreshAuth);
   return GeneratedClient._(client, connection);
   } catch (_) { try { await client.close(); } catch (_) {} rethrow; }
  }
  Future<T> transaction<T>(Future<T> Function(GeneratedTransaction tx) body) => client.transaction((tx) => body(GeneratedTransaction(tx)));
- Future<Map<String,dynamic>> status() => client.status();
+ /// This device's durable client identity.
+ String get clientId => client.clientId;
+ /// The client's sync state: a local snapshot, not a network probe.
+ Future<Map<String,dynamic>> syncState() => client.syncState();
+ /// Leave an incompatible database behind for a fresh file; refused while unsent work remains unless [discardPending].
+ Future<Map<String,dynamic>> rebuild({bool discardPending = false}) => client.rebuild(discardPending: discardPending);
+ /// Remove a handled rejection from the local inbox; it is not retried.
+ Future<void> dismissRejection(int ordinal) => client.dismissRejection(ordinal);
+ /// Remove unsent work and recompute local state; frozen work cannot be dropped.
+ Future<void> drop(int ordinal) => client.drop(ordinal);
+ Future<List<Map<String,dynamic>>> pendingTasks() => client.pendingTasks();
+ /// Mark a prerequisite task by its opaque key: `ready`, `pending` or `failed`.
+ Future<void> setReadiness(String key, String state) => client.setReadiness(key, state);
+ Future<void> runPrerequisites(Map<String, Future<void> Function(Map<String,dynamic>)> handlers) => client.runPrerequisites(handlers);
+ /// Start the background connection when `open` was called without a server.
+ Future<RuntimeConnection> connect(SyncServer server, {void Function(Object)? onError, Future<void> Function()? refreshAuth}) async => connection = await client.connect(server, onError:onError, refreshAuth:refreshAuth);
+ /// Escape hatch: an untyped structured query.
+ Future<List<Map<String,dynamic>>> querySpec(String model, Map<String,dynamic> query) => client.querySpec(model, query);
+ /// Escape hatch: read-only SQL over the local database.
+ Future<List<Map<String,dynamic>>> readSql(String sql, {List<dynamic> parameters = const []}) => client.readSql(sql, parameters: parameters);
  Future<void> close() => client.close();
 }

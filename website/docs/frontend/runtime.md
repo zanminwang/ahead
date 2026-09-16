@@ -1,39 +1,36 @@
 # Client runtime
 
-The generated client delegates to a generic runtime, available as `client.client`. Most applications use the [generated model APIs](client-api.md); use this reference for SQL, connection control, recovery or a custom integration. TypeScript returns promises and Dart returns futures unless stated otherwise. Native validation failures reject the call; Dart reports them as `StateError`.
+The generated client is the whole client: besides the [typed model and mutation APIs](client-api.md) it carries the runtime members described here, for escape-hatch reads, savepoints, connection control, recovery and prerequisites. TypeScript returns promises and Dart returns futures unless stated otherwise. Native validation failures reject the call; Dart reports them as `StateError`.
 
 ## Opening and schema changes
-
-TypeScript imports `Client` from `packages/client-js/index.mts` in a source checkout. Dart imports `package:ahead/ahead.dart` through the local package dependency described in the [client setup guide](setup.md).
 
 === "TypeScript"
 
     ```ts
-    const raw = await Client.open({ path: 'local.sqlite', schema });
+    const client = await GeneratedClient.open({ path: 'local.sqlite' });
     ```
 
 === "Flutter"
 
     ```dart
-    final raw = await Client.open(
-      path: 'local.sqlite', schema: schema,
+    final client = await GeneratedClient.open(
+      path: 'local.sqlite',
       libraryPath: '/absolute/path/to/libahead_dart.dylib',
     );
     ```
 
-`schema` is the compiler's generated descriptor. `clientId` is a read-only, persistent identity for that database, used for retry deduplication. Use one active client per database and a separate file per signed-in user. Do not duplicate a database and then let both copies independently send mutations under the same client identity.
+The compiled schema is embedded in the generated client. `client.clientId` is a read-only, persistent identity for that database, used for retry deduplication. Use one active client per database and a separate file per signed-in user. Do not duplicate a database and then let both copies independently send mutations under the same client identity.
 
-When the descriptor you pass differs from the one the database was built for, the runtime decides at open ([local storage](storage.md)): an added model or nullable field is applied in place; anything else leaves the file untouched and opens a fresh database file beside it, `local.sqlite.1`, which resynchronises from the backend. If the old file still holds unsent mutations, it stays open for them instead; `status().schema.pending` tells you, and once they are sent you call `rebuild()`:
+When the schema compiled into the client differs from the one the database was built for, the runtime decides at open ([local storage](storage.md)): an added model or nullable field is applied in place; anything else leaves the file untouched and opens a fresh database file beside it, `local.sqlite.1`, which resynchronises from the backend. If the old file still holds unsent mutations, it stays open for them instead; `syncState().schema.pending` tells you, and once they are sent you call `rebuild()`:
 
 === "TypeScript"
 
     ```ts
-    const raw = await Client.open({ path: 'local.sqlite', schema });
-    const { schema: state } = await raw.status();
+    const { schema: state } = await client.syncState();
     if (state.pending) {
       console.log(`sending ${state.pending.pending} changes before upgrading`);
       // … connect, wait for pending to reach 0, then:
-      const report = await raw.rebuild();
+      const report = await client.rebuild();
       console.log(report.newFile, report.leftPending);
     }
     ```
@@ -41,46 +38,36 @@ When the descriptor you pass differs from the one the database was built for, th
 === "Flutter"
 
     ```dart
-    final raw = await Client.open(
-      path: 'local.sqlite', schema: schema,
-      libraryPath: '/absolute/path/to/libahead_dart.dylib',
-    );
-    final state = (await raw.status())['schema'] as Map<String, dynamic>;
+    final state = (await client.syncState())['schema'] as Map<String, dynamic>;
     if (state['pending'] != null) {
       // … connect, wait for pending to reach 0, then:
-      final report = await raw.rebuild();
+      final report = await client.rebuild();
       print(report['newFile']);
     }
     ```
 
 `rebuild()` switches the same client to the new file and rejects while unsent mutations remain. `rebuild({ discardPending: true })`, or `discardPending: true` at open, rebuilds at once; the report names `leftPending` mutations and `leftDirect` local-only records that stay in `oldFile`. Nothing is moved between schemas and the old file is never deleted by the runtime. `migration` is still accepted for compatibility and ignored.
 
-## Reads
+## Escape-hatch reads
 
-All these methods read local SQLite through Rust. `RecordValue` in TypeScript is `Record<string, unknown>`; Dart uses `Map<String, dynamic>`.
+Typed reads (`models.<name>.get`, `query`, relation accessors, `watch`) are in the [client API](client-api.md). Two untyped reads remain for cases the generated API does not cover. Both read local SQLite through Rust; results are `RecordValue` rows (`Record<string, unknown>` in TypeScript, `Map<String, dynamic>` in Dart).
 
 | Method | Input | Result |
 | --- | --- | --- |
-| `read(model, identity)` | Model name and all identity fields | Complete record or null |
-| `query(model, where)` | Equality fields; default empty | Matching records |
-| `querySpec(model, query)` | `filter`, `orderBy`, `limit` | Matching records with requested order/limit |
+| `querySpec(model, query)` | Model name and `filter`, `orderBy`, `limit` | Matching records with requested order/limit |
 | `readSql(sql, parameters)` | Read-only SQL and bound parameters | Result rows |
-| `related(model, identity, relation)` | Source identity and declared relation name | Related record or null |
-| `referencing(model, identity, source, relation)` | Target identity, referencing model and its relation | Referencing records |
-| `watch(model, where, listener, onError?)` (TypeScript) | Equality filter and callbacks | Unsubscribe function |
-| `watch(model, where: ...)` (Dart) | Equality filter | Stream of record lists |
 
-TypeScript's `query` and `readSql` take optional positional second arguments. Dart uses named `where:` and `parameters:`. `querySpec` takes the same positional descriptor in both languages:
+TypeScript's `readSql` takes an optional positional second argument; Dart uses named `parameters:`.
 
 === "TypeScript"
 
     ```ts
-    const rows = await raw.querySpec('Entry', {
+    const rows = await client.querySpec('Entry', {
       filter: { note: null },
       orderBy: [{ field: 'text', direction: 'ascending' }],
       limit: 20,
     });
-    const matches = await raw.readSql(
+    const matches = await client.readSql(
       'SELECT id, text FROM "Entry" WHERE text = ?', ['Draft'],
     );
     ```
@@ -88,46 +75,33 @@ TypeScript's `query` and `readSql` take optional positional second arguments. Da
 === "Flutter"
 
     ```dart
-    final rows = await raw.querySpec('Entry', {
+    final rows = await client.querySpec('Entry', {
       'filter': {'note': null},
       'orderBy': [{'field': 'text', 'direction': 'ascending'}],
       'limit': 20,
     });
-    final matches = await raw.readSql(
+    final matches = await client.readSql(
       'SELECT id, text FROM "Entry" WHERE text = ?',
       parameters: ['Draft'],
     );
     ```
 
-`querySpec` calls its equality filter `filter`; the generated API calls it `where`. SQL rejects writes. Bind values instead of interpolating them into SQL. Watch results are distinct committed snapshots, with an initial query; they are not an event log. Cancel watchers when their owner is disposed.
+`querySpec` calls its equality filter `filter`; the generated API calls it `where`. SQL rejects writes. Bind values instead of interpolating them into SQL.
 
 ## Transactions and savepoints
 
-`transaction<T>(callback)` commits the callback's result or rolls back on failure. Its `Transaction` exposes all the reads above except `watch`, plus:
-
-| Method | Behavior |
-| --- | --- |
-| `mutate(descriptor)` | Apply declared optimistic operations and enqueue one mutation; returns its local ordinal |
-| `direct(operation)` | Apply one local-only operation; returns void |
-| `savepoint(callback)` | Run a nested scope; roll back that scope on failure; return its callback result |
-
-`raw.mutate(descriptor)` is a convenience wrapper around its own transaction. Prefer generated mutation builders to constructing descriptors yourself.
+`client.transaction(callback)` commits the callback's result or rolls back on failure; see [transactions](client-api.md#transactions). A single `client.mutate.<name>(args)` outside a transaction is its own transaction. Inside a transaction, `tx.transaction` is the runtime transaction; on Node and Dart it also offers `savepoint(callback)`, a nested scope that rolls back on failure and returns its callback's result (React Native's does not).
 
 === "TypeScript"
 
     ```ts
-    import { Edit } from './generated/client.ts';
-
-    await raw.transaction(async tx => {
-      await tx.mutate(Edit({
+    await client.transaction(async tx => {
+      await tx.mutate.edit({
         entry: { identity: { id: 'entry-1' }, values: { text: 'Draft' } },
-      }));
+      });
       try {
-        await tx.savepoint(async () => {
-          await tx.direct({
-            model: 'Entry', op: 'update',
-            identity: { id: 'entry-1' }, values: { note: 'Temporary' },
-          });
+        await (tx.transaction as Transaction).savepoint(async () => {
+          await tx.models.entry.update({ id: 'entry-1' }, { note: 'Temporary' });
           throw new Error('Discard this note');
         });
       } catch {
@@ -139,20 +113,18 @@ TypeScript's `query` and `readSql` take optional positional second arguments. Da
 === "Flutter"
 
     ```dart
-    import 'generated/generated.dart';
-
-    await raw.transaction((tx) async {
-      await tx.mutate(edit(
+    await client.transaction((tx) async {
+      await tx.mutate.edit(
         entry: const EditEntryUpdate(
           identity: EntryIdentity(id: 'entry-1'), text: Present('Draft'),
         ),
-      ));
+      );
       try {
-        await tx.savepoint(() async {
-          await tx.direct({
-            'model': 'Entry', 'op': 'update',
-            'identity': {'id': 'entry-1'}, 'values': {'note': 'Temporary'},
-          });
+        await tx.transaction.savepoint(() async {
+          await tx.models.entry.update(
+            const EntryIdentity(id: 'entry-1'),
+            const EntryPatch(note: Present('Temporary')),
+          );
           throw StateError('Discard this note');
         });
       } catch (_) {
@@ -161,16 +133,16 @@ TypeScript's `query` and `readSql` take optional positional second arguments. Da
     });
     ```
 
-Dart's savepoint also takes a zero-argument async callback and operates through the same `tx`. Await every call and nested callback. Savepoints must be properly nested, not run concurrently. An escaped transaction, unfinished operation or overlapping savepoint fails. Inside the transaction use `tx` reads; an outer `raw` read can wait behind the current transaction. TypeScript's `Transaction.finish()` is runtime-owned bookkeeping; applications should not call it.
+Await every call and nested callback. Savepoints must be properly nested, not run concurrently. An escaped transaction, unfinished operation or overlapping savepoint fails. Inside the transaction use `tx` reads; an outer `client` read can wait behind the current transaction.
 
 ## Server connection
 
-Pass `server` when opening the generated client, or call `connect` on the raw client after opening local storage. TypeScript accepts `ServerOptions`; Dart uses `SyncServer`. Only one connection may be active per client. Network I/O happens outside the local transaction queue.
+Pass `server` when opening the generated client, or call `client.connect` after opening local storage. TypeScript accepts `ServerOptions`; Dart uses `SyncServer`. Only one connection may be active per client. Network I/O happens outside the local transaction queue.
 
 === "TypeScript"
 
     ```ts
-    const connection = await raw.connect(
+    const connection = await client.connect(
       { url: backendUrl, token: () => accessToken },
       {
         onError: error => console.error(error),
@@ -182,7 +154,7 @@ Pass `server` when opening the generated client, or call `connect` on the raw cl
 === "Flutter"
 
     ```dart
-    final connection = await raw.connect(
+    final connection = await client.connect(
       SyncServer(url: backendUrl, token: () => accessToken),
       onError: (error) => print(error),
       refreshAuth: () async { accessToken = await renewAccessToken(); },
@@ -224,41 +196,44 @@ TypeScript calls the returned object `Connection`; Dart calls it `RuntimeConnect
 | `close()` | Permanently stop this connection; the client database stays open |
 | `closed` (Dart) | Future that completes when the connection closes |
 
-All controls return promise/future void. Pause/close cancel network activity and discard responses from the canceled session. Persisted frozen requests remain available for retry. After close, create a new connection through the raw client to resume sync. `await raw.close()` closes its connection and native database resources and is idempotent; subsequent client operations fail.
+All controls return promise/future void. Pause/close cancel network activity and discard responses from the canceled session. Persisted frozen requests remain available for retry. After close, call `client.connect` again to resume sync. `await client.close()` closes its connection and native database resources and is idempotent; subsequent client operations fail.
 
 ## Pending work and recovery
 
-`status()` returns `{ clientId, pending, beforeImages, cursors, channels, rejections, schema }`. `pending` counts queued mutations; `schema` is `{ rebuilt, pending, lastRebuild }` from the open-time schema check ([opening and schema changes](#opening-and-schema-changes)); `beforeImages` is a diagnostic count; `cursors` maps channels to received positions; `channels` lists desired subscriptions; `rejections` contains `{ ordinal, code }` entries. It is a local snapshot, not a network status probe.
+`client.syncState()` returns `{ clientId, pending, beforeImages, cursors, channels, rejections, schema }`. `pending` counts queued mutations; `schema` is `{ rebuilt, pending, lastRebuild }` from the open-time schema check ([opening and schema changes](#opening-and-schema-changes)); `beforeImages` is a diagnostic count; `cursors` maps channels to received positions; `channels` lists desired subscriptions; `rejections` contains `{ ordinal, code }` entries. `client.models.<name>.syncState(identity)` returns one record's `{ pending, rejections }`, typed by the model: pending entries carry the ordinal, the mutation name (one of the schema's), the phase, prerequisite states and `diverged` when its replay failed over newer server state. Both are local snapshots, not network probes.
 
 === "TypeScript"
 
     ```ts
-    const status = await raw.recordStatus('Entry', { id: 'entry-1' });
-    for (const item of status.pending) console.log(item.ordinal, item.phase);
-    for (const rejection of (await raw.status()).rejections) {
+    const state = await client.models.entry.syncState({ id: 'entry-1' });
+    for (const item of state.pending) console.log(item.ordinal, item.name, item.phase);
+    for (const rejection of (await client.syncState()).rejections) {
       console.log(rejection.code);
       // After your UI has handled it:
-      await raw.dismissRejection(rejection.ordinal);
+      await client.dismissRejection(rejection.ordinal);
     }
     ```
 
 === "Flutter"
 
     ```dart
-    final status = await raw.recordStatus('Entry', {'id': 'entry-1'});
-    for (final item in status['pending'] as List) {
-      print('${item['ordinal']}: ${item['phase']}');
+    final state = await client.models.entry.syncState(
+      const EntryIdentity(id: 'entry-1'),
+    );
+    for (final item in state.pending) {
+      print('${item.ordinal} ${item.name}: ${item.phase}');
     }
-    for (final rejection in (await raw.status())['rejections'] as List) {
+    for (final rejection in (await client.syncState())['rejections'] as List) {
       print(rejection['code']);
       // After your UI has handled it:
-      await raw.dismissRejection(rejection['ordinal'] as int);
+      await client.dismissRejection(rejection['ordinal'] as int);
     }
     ```
 
 | Method | Result / effect |
 | --- | --- |
-| `recordStatus(model, identity)` | `{ pending, rejections }` for that record; pending entries include ordinal, mutation name, phase, prerequisite states and `diverged` |
+| `syncState()` | The client's snapshot above |
+| `models.<name>.syncState(identity)` | `{ pending, rejections }` for that record; pending entries carry `diverged` |
 | `dismissRejection(ordinal)` | Remove a handled rejection from the durable local inbox; does not retry it |
 | `drop(ordinal)` | Remove eligible unsent work and recompute local state; frozen/sent work cannot be cancelled this way |
 
@@ -271,7 +246,7 @@ A schema can require host I/O, such as an upload, before a mutation can be sent.
 === "TypeScript"
 
     ```ts
-    await raw.runPrerequisites({
+    await client.runPrerequisites({
       Uploaded: async args => { await uploadFile(args.key); },
     });
     ```
@@ -279,7 +254,7 @@ A schema can require host I/O, such as an upload, before a mutation can be sent.
 === "Flutter"
 
     ```dart
-    await raw.runPrerequisites({
+    await client.runPrerequisites({
       'Uploaded': (args) async { await uploadFile(args['key']); },
     });
     ```
@@ -292,16 +267,8 @@ A schema can require host I/O, such as an upload, before a mutation can be sent.
 | `runPrerequisites(handlers)` | Run pending tasks; success marks ready, a callback failure marks failed with the error's text, a task with no handler is marked failed with `missing prerequisite handler` |
 | `setReadiness(key, state)` | Set `ready`, `pending` or `failed`; use the task's opaque key, not a reconstructed key |
 
-Callback failures are recorded as failed tasks with their reason rather than rethrown by the runner; a task no handler covers is recorded the same way and the run goes on. Inspect `pendingTasks` or `recordStatus` to display them. To retry, set the failed key to `pending`, then run callbacks again. Mark ready only when the prerequisite actually completed.
+Callback failures are recorded as failed tasks with their reason rather than rethrown by the runner; a task no handler covers is recorded the same way and the run goes on. Inspect `pendingTasks` or a record's `syncState` to display them. To retry, set the failed key to `pending`, then run callbacks again. Mark ready only when the prerequisite actually completed.
 
 ## Protocol primitives
 
-These low-level engine methods support protocol tests and tooling. Application synchronization is managed by `connect`; calling these methods alongside an active connection can interfere with its sequencing.
-
-| Method | Input and return |
-| --- | --- |
-| `freeze()` | Return frozen request JSON or null when no batch can be sent; retry preserves the same bytes |
-| `acknowledge(sequence, receipt)` | Apply a decoded push receipt to the matching batch; returns what it applied and any reports |
-| `applyPull(page)` | Apply a decoded pull page as one transaction and return its application result, including reports for records it could not apply |
-
-Wire fields are defined in the [protocol source](https://github.com/zanminwang/ahead/blob/main/crates/core/src/protocol.rs) and exercised by [shared wire fixtures](https://github.com/zanminwang/ahead/blob/main/fixtures). Do not manufacture receipts, advance cursors yourself or rewrite frozen requests to recover from a network failure.
+The engine's protocol methods (`freeze`, `acknowledge`, `applyPull`, the last two returning reports for records they could not apply) are not part of the application surface; they exist on the runtime handle the framework's own tests use. Application synchronization is managed by `connect`. Wire fields are defined in the [protocol source](https://github.com/zanminwang/ahead/blob/main/crates/core/src/protocol.rs) and exercised by [shared wire fixtures](https://github.com/zanminwang/ahead/blob/main/fixtures). Do not manufacture receipts, advance cursors yourself or rewrite frozen requests to recover from a network failure.

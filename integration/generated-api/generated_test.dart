@@ -43,6 +43,14 @@ void main(){
     await tx.models.book.update(const BookIdentity(id:'local'),const BookPatch(title:Present('Local edited')));
    });
    expect((await client.models.book.get(const BookIdentity(id:'local')))?.title,'Local edited');
+   // A mutation outside a transaction is its own transaction; its record's sync state is typed.
+   final ordinal=await client.mutate.editEntry(entry:const EditEntryEntryUpdate(identity:EntryIdentity(id:id),note:Present('outside')));
+   final state=await client.models.entry.syncState(const EntryIdentity(id:id));
+   expect(state.pending.map((p)=>p.ordinal),contains(ordinal));
+   expect(state.pending.every((p)=>p.phase=='queued' && !p.diverged),isTrue);
+   expect(state.rejections,isEmpty);
+   expect((await client.syncState())['pending'],greaterThan(0));
+   expect(client.clientId,isNotEmpty);
    expect(await client.client.freeze(),isNotNull);
   }finally{await client.close();await temp.delete(recursive:true);}
  });

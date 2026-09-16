@@ -11,7 +11,7 @@ export async function syncProtocol(client, transport, models) {
    continue;
   }
   if(caughtUp)return;
-  const status=await client.status();
+  const status=await client.syncState();
   if(status.channels.length===0)return;
   // One pull covers every subscribed channel; it repeats while any channel continues.
   const cursors=Object.fromEntries(status.channels.map(channel=>[channel,status.cursors[channel]??0]));

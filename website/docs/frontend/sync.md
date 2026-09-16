@@ -60,9 +60,9 @@ You can send mutations without subscribing to any channel. The receipt still cor
     await client.connection!.resume();
     ```
 
-This assumes `GeneratedClient.open` was given `server` and the record has already arrived locally. Without it the client is local-only until you connect its raw runtime. Dart uses the same `pause`/`resume` methods with its typed mutation arguments.
+This assumes `GeneratedClient.open` was given `server` and the record has already arrived locally. Without it the client is local-only until you call `client.connect`. Dart uses the same `pause`/`resume` methods with its typed mutation arguments.
 
-A local transaction's completion confirms local commit. It does not mean the server has accepted the operation. Display pending and rejected state using [recordStatus](runtime.md#pending-work-and-recovery) when that distinction matters to the UI.
+A local transaction's completion confirms local commit. It does not mean the server has accepted the operation. Display pending and rejected state using the record's [syncState](runtime.md#pending-work-and-recovery) when that distinction matters to the UI.
 
 You can close and reopen the same local database without losing queued changes. Keep the same backend database as well: replacing a backend's receipt/cursor history with an empty database is a reset, not a temporary network interruption. The tutorial's `offline` / `online` commands preserve both databases.
 
@@ -75,28 +75,30 @@ If a handler rejects the mutation, Ahead removes that mutation's optimistic cont
 === "TypeScript"
 
     ```ts
-    const { rejections } = await client.client.recordStatus('Entry', { id: 'entry-1' });
+    const { rejections } = await client.models.entry.syncState({ id: 'entry-1' });
     console.log(rejections);
     // After handling the rejection in your UI:
-    await client.client.dismissRejection(rejectionOrdinal);
+    await client.dismissRejection(rejectionOrdinal);
     ```
 
 === "Flutter"
 
     ```dart
-    final status = await client.client.recordStatus('Entry', {'id': 'entry-1'});
-    print(status['rejections']);
+    final state = await client.models.entry.syncState(
+      const EntryIdentity(id: 'entry-1'),
+    );
+    print(state.rejections);
     // After handling the rejection in your UI:
-    await client.client.dismissRejection(rejectionOrdinal);
+    await client.dismissRejection(rejectionOrdinal);
     ```
 
 `rejectionOrdinal` is taken from the rejection you handled. Dismissing only clears the inbox entry. Retrying the business action means creating a new mutation after resolving its cause. `drop(ordinal)` is for eligible unsent mutations; it cannot cancel a request whose server outcome is unknown.
 
 ## Recover from connection failures
 
-Provide `onError` to record background failures, and `refreshAuth` if your credentials can expire. Records that could not be applied also reach `onError`, as an `AheadReport` with a `kind`: `readFailed` when the server could not read the record, `skipped` when the local schema refused it, `conflict`, or `diverged` when a pending edit no longer applies to newer server state. A diverged edit is still sent, and `recordStatus` marks it `diverged` until the server answers it. Let the runtime retry frozen work; do not generate a new mutation merely because the original request timed out. The backend may already have committed it and retained its receipt.
+Provide `onError` to record background failures, and `refreshAuth` if your credentials can expire. Records that could not be applied also reach `onError`, as an `AheadReport` with a `kind`: `readFailed` when the server could not read the record, `skipped` when the local schema refused it, `conflict`, or `diverged` when a pending edit no longer applies to newer server state. A diverged edit is still sent, and `models.<name>.syncState(identity)` marks it `diverged` until the server answers it. Let the runtime retry frozen work; do not generate a new mutation merely because the original request timed out. The backend may already have committed it and retained its receipt.
 
-Use `wake()` after an application event that should prompt another scheduling check. Use `resume()` after explicitly pausing. A closed connection cannot resume; create a new one through `client.client.connect` or reopen the owning client.
+Use `wake()` after an application event that should prompt another scheduling check. Use `resume()` after explicitly pausing. A closed connection cannot resume; create a new one with `client.connect` or reopen the client.
 
 On connection or reconnection, Ahead establishes the WebSocket subscription and receives the current position of each channel. If every saved cursor is already there, it streams at once. Otherwise it sends one HTTP pull for all channels, holding changes that arrive meanwhile, then continues with WebSocket updates. Both sources use the same Rust page processing: each page applies as one transaction, covered pages are discarded, overlapping pages apply their unseen changes, and gaps trigger HTTP recovery from saved progress. Subscription changes replace the session; pages from replaced or canceled sessions cannot update local data.
 
@@ -118,6 +120,6 @@ When permissions change, publish the affected records to the channels that deliv
 | `frozen` long after the network recovered | Either the server refused the batch on identity or order grounds (401/403/409 `client.owner_mismatch`/`gap`/`overlap`) — the code reaches `onError` and the batch is resent as is because the server never ran it — or a received receipt was refused locally (it named another client or batch, or omitted an accepted record): check `onError` and the backend's loaders |
 | Server values do not update | Whether every affected channel was published to, and whether the handler reported every record it changed with `changes.add` |
 | Local client fails after another process wrote | One active client per SQLite file; close/reopen the stale instance |
-| Empty local data after an app update | `status().schema.rebuilt`: the schema was incompatible and a fresh database is synchronising from the beginning; `status().schema.pending` means the old file is still sending its last changes, call `rebuild()` when it reaches 0 ([local storage](storage.md#change-the-schema)) |
+| Empty local data after an app update | `syncState().schema.rebuilt`: the schema was incompatible and a fresh database is synchronising from the beginning; `syncState().schema.pending` means the old file is still sending its last changes, call `rebuild()` when it reaches 0 ([local storage](storage.md#change-the-schema)) |
 
 See [runtime APIs](runtime.md) for controls and [compatibility and recovery](storage.md) for storage constraints.
