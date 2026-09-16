@@ -56,7 +56,7 @@ fn response_completes_without_a_subscription() {
     )
     .unwrap();
     let report = c.acknowledge(1, receipt).unwrap();
-    assert_eq!((report.applied, report.conflicts), (1, 0));
+    assert_eq!((report.applied, report.conflicts()), (1, 0));
     assert_eq!(c.pending_count().unwrap(), 0);
     assert_eq!(c.read(&key()).unwrap().unwrap()["text"], "Hello");
     assert_eq!(c.before_image_count().unwrap(), 0);
@@ -152,7 +152,7 @@ fn channel_first_then_receipt_dedups_and_still_completes() {
     );
     let r = receipt(&mut c, 1, vec![authority(Some("B"), 7)]);
     let report = c.acknowledge(1, r).unwrap();
-    assert_eq!((report.applied, report.conflicts), (0, 0));
+    assert_eq!((report.applied, report.conflicts()), (0, 0));
     assert_eq!(c.read(&key()).unwrap().unwrap()["text"], "B");
     assert_eq!(c.cursor("book").unwrap(), 2);
     assert_quiet(&mut c);
@@ -175,7 +175,11 @@ fn receipt_first_then_channel_is_a_no_op_that_advances_the_cursor() {
     let mut delivered = page("book", 1, 2, Some("B"));
     delivered.changes[0].stamp = 7;
     let report = c.apply_page(delivered).unwrap();
-    assert_eq!((report.applied, report.conflicts), (1, 0));
+    assert_eq!(
+        (report.applied, report.conflicts()),
+        (0, 0),
+        "the same stamp and content changes nothing"
+    );
     assert_eq!(c.cursor("book").unwrap(), 2);
     assert_eq!(c.read(&key()).unwrap().unwrap()["text"], "B");
 }
@@ -429,9 +433,10 @@ fn deletion_authority_removes_the_row_and_retains_the_stamp() {
     );
 }
 
-/// A receipt that omits an accepted record, carries an unusable state, names
-/// another client or batch, or rejects an ordinal outside the batch is refused
-/// whole: the frozen batch stays for retry and nothing is applied.
+/// A receipt that omits an accepted record, names another client or batch, or
+/// rejects an ordinal outside the batch is refused whole: the frozen batch
+/// stays for retry and nothing is applied. (A record whose state does not fit
+/// fails alone; see the test below.)
 #[test]
 fn a_receipt_that_cannot_be_applied_is_refused_and_the_batch_stays_frozen() {
     let dir = tempfile::tempdir().unwrap();
@@ -440,8 +445,6 @@ fn a_receipt_that_cannot_be_applied_is_refused_and_the_batch_stays_frozen() {
     c.transaction(|tx| tx.enqueue(mutation("B")).map(|_| ()))
         .unwrap();
     let frozen = c.freeze().unwrap().unwrap();
-    let mut bad_state = authority(Some("B"), 2);
-    bad_state.state = json!({"text":22});
     let mut other_client = receipt(&mut c, 1, vec![authority(Some("B"), 2)]);
     other_client.client_id = "someone-else".into();
     let cases = vec![
@@ -451,7 +454,6 @@ fn a_receipt_that_cannot_be_applied_is_refused_and_the_batch_stays_frozen() {
             receipt(&mut c, 1, vec![authority_of("x", Some("x"), 1)]),
             1,
         ),
-        ("unusable state", receipt(&mut c, 1, vec![bad_state]), 1),
         ("another client", other_client, 1),
         (
             "future batch",
@@ -572,5 +574,180 @@ fn repeated_record_in_one_batch_completes_from_one_final_result() {
     let r = receipt(&mut c, 1, vec![authority(Some("C!"), 3)]);
     c.acknowledge(1, r).unwrap();
     assert_eq!(c.read(&key()).unwrap().unwrap()["text"], "C!");
+    assert_quiet(&mut c);
+}
+
+/// Divergence ([#122](https://github.com/zanminwang/ahead/issues/122)): new
+/// authority under which a queued operation no longer replays. The server's
+/// row stays visible, the mutation stays queued and is still sent, the
+/// application is told, and `record_status` marks the mutation until it
+/// completes.
+#[test]
+fn a_pending_update_over_a_deleted_base_diverges_and_is_still_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = open(&dir.path().join("db"));
+    subscribe(&mut c, "book");
+    c.apply_page(page("book", 0, 1, Some("A"))).unwrap();
+    let ordinal = c.transaction(|tx| tx.enqueue(mutation("B"))).unwrap();
+    // Another record with its own pending edit is unaffected throughout.
+    c.transaction(|tx| {
+        tx.direct(create("Entry", "other", json!({"text":"o","note":null})))?;
+        tx.enqueue(Mutation::new(
+            "Edit",
+            vec![Operation {
+                model: "Entry".into(),
+                op: OperationKind::Update,
+                identity: json!({"id":"other"}),
+                values: Some(json!({"text":"o2"})),
+            }],
+        ))
+    })
+    .unwrap();
+    let other = schema()
+        .record_key("Entry", &json!({"id":"other"}))
+        .unwrap();
+    // The server deleted the record: the update cannot replay over nothing.
+    let report = c.apply_page(page("book", 1, 2, None)).unwrap();
+    assert_eq!(report.applied, 1);
+    assert_eq!(report.diverged(), 1);
+    let diverged = &report.reports[0];
+    assert_eq!(diverged.kind, ReportKind::Diverged);
+    assert_eq!(diverged.ordinal, Some(ordinal));
+    assert_eq!((diverged.model.as_str(), diverged.stamp), ("Entry", 2));
+    assert!(
+        c.read(&key()).unwrap().is_none(),
+        "the base (a deletion) is visible"
+    );
+    assert_eq!(
+        c.pending_count().unwrap(),
+        2,
+        "the mutation is still queued"
+    );
+    let status = c.record_status(&key()).unwrap();
+    assert_eq!(status["pending"][0]["ordinal"], ordinal);
+    assert_eq!(status["pending"][0]["diverged"], true);
+    assert_eq!(c.read(&other).unwrap().unwrap()["text"], "o2");
+    assert_eq!(
+        c.record_status(&other).unwrap()["pending"][0]["diverged"],
+        false
+    );
+    // It is still sent, and its completion clears the mark.
+    let batch = PushRequest::decode(&c.freeze().unwrap().unwrap()).unwrap();
+    assert_eq!(batch.mutations.len(), 2);
+    assert_eq!(
+        c.record_status(&key()).unwrap()["pending"][0]["diverged"],
+        true
+    );
+    let r = receipt(
+        &mut c,
+        1,
+        vec![
+            authority(Some("B"), 3),
+            authority_of("other", Some("o2"), 1),
+        ],
+    );
+    let completed = c.acknowledge(1, r).unwrap();
+    assert!(completed.reports.is_empty());
+    assert_eq!(c.read(&key()).unwrap().unwrap()["text"], "B");
+    assert!(
+        c.record_status(&key()).unwrap()["pending"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_quiet(&mut c);
+}
+
+/// A pending create over a record the server now has: the server's row is
+/// visible, the create stays queued and diverged; the server decides.
+#[test]
+fn a_pending_create_over_an_existing_base_diverges() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = open(&dir.path().join("db"));
+    subscribe(&mut c, "book");
+    let ordinal = c.transaction(|tx| tx.enqueue(create_entry())).unwrap();
+    assert_eq!(c.read(&created()).unwrap().unwrap()["text"], "new");
+    let mut arrived = page("book", 0, 1, Some("theirs"));
+    arrived.changes[0].identity = json!({"id":"n"});
+    let report = c.apply_page(arrived).unwrap();
+    assert_eq!(report.diverged(), 1);
+    assert_eq!(report.reports[0].ordinal, Some(ordinal));
+    assert_eq!(report.reports[0].identity, json!({"id":"n"}));
+    assert_eq!(c.read(&created()).unwrap().unwrap()["text"], "theirs");
+    assert_eq!(
+        c.record_status(&created()).unwrap()["pending"][0]["diverged"],
+        true
+    );
+    // A rejection removes the mutation and its mark; the server's row stays.
+    c.freeze().unwrap().unwrap();
+    let r = rejecting(&mut c, 1, &[ordinal], "entry.exists", vec![]);
+    c.acknowledge(1, r).unwrap();
+    assert_eq!(c.read(&created()).unwrap().unwrap()["text"], "theirs");
+    assert!(
+        c.record_status(&created()).unwrap()["pending"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(c.rejections().unwrap().len(), 1);
+}
+
+/// The same divergence through a receipt: the authority a receipt carries for
+/// a record still edited afterwards is staged the same way and reported.
+#[test]
+fn divergence_is_reported_from_a_receipt_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = open(&dir.path().join("db"));
+    subscribe(&mut c, "book");
+    c.apply_page(page("book", 0, 1, Some("A"))).unwrap();
+    c.transaction(|tx| tx.enqueue(mutation("B"))).unwrap();
+    c.freeze().unwrap().unwrap();
+    let later = c.transaction(|tx| tx.enqueue(mutation("C"))).unwrap();
+    // The server answered the first edit with a deletion; the later edit
+    // cannot replay over it.
+    let r = receipt(&mut c, 1, vec![authority(None, 5)]);
+    let report = c.acknowledge(1, r).unwrap();
+    assert_eq!(report.diverged(), 1);
+    assert_eq!(report.reports[0].ordinal, Some(later));
+    assert!(c.read(&key()).unwrap().is_none());
+    assert_eq!(
+        c.record_status(&key()).unwrap()["pending"][0]["diverged"],
+        true
+    );
+}
+
+/// A receipt record this client cannot apply fails alone, as on a page: it
+/// is reported with its batch, the rest of the receipt lands and the batch
+/// still completes, so the queue never stalls behind it.
+#[test]
+fn a_receipt_record_that_does_not_fit_is_skipped_and_the_batch_completes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = open(&dir.path().join("db"));
+    seed(&mut c, "A");
+    c.transaction(|tx| {
+        tx.enqueue(mutation("hello"))?;
+        tx.enqueue(create_entry())
+    })
+    .unwrap();
+    c.freeze().unwrap().unwrap();
+    let mut bad = authority(Some("Hello"), 3);
+    bad.state = json!({"text":22,"note":null});
+    let mut good = authority_of("n", Some("new"), 4);
+    good.state = json!({"text":"new","note":null});
+    let r = receipt(&mut c, 1, vec![bad, good]);
+    let report = c.acknowledge(1, r).unwrap();
+    assert_eq!(report.applied, 1);
+    assert_eq!(report.skipped(), 1);
+    let skipped = &report.reports[0];
+    assert_eq!(skipped.identity, json!({"id":"e"}));
+    assert_eq!(skipped.detail["batch"], 1);
+    assert_eq!(
+        c.read(&key()).unwrap().unwrap()["text"],
+        "A",
+        "the record keeps the authority it had"
+    );
+    assert_eq!(c.record_stamp(&key()).unwrap(), 0, "and its stamp");
+    assert_eq!(c.read(&created()).unwrap().unwrap()["text"], "new");
+    assert_eq!(c.record_stamp(&created()).unwrap(), 4);
     assert_quiet(&mut c);
 }

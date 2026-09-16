@@ -202,11 +202,11 @@ Here `backendUrl`, `accessToken` and `renewAccessToken` belong to your applicati
 
 Ahead manages these phases automatically:
 
-1. Connect to `/sync/live` and subscribe to the current channel set. The server installs listeners before acknowledging the subscription.
-2. Fetch missing records through `POST /sync/pull`, starting from each channel's saved cursor. Queue WebSocket pages arriving while catch-up runs.
+1. Connect to `/sync/live` and subscribe to the current channel set. The server installs listeners, then acknowledges the subscription with each channel's current position.
+2. If a saved cursor is behind, fetch missing records through one `POST /sync/pull` for all channels, repeated while a channel has more. Queue WebSocket pages arriving while catch-up runs. If every cursor is current, skip this step.
 3. Continue receiving WebSocket updates. HTTP and WebSocket pages enter the same serialized Rust processing path, using each channel's saved cursor.
 
-For either source, a page already covered by the cursor is discarded. A page spanning the current cursor applies only its unseen changes; for example, at cursor `100`, a page covering `90 → 120` applies changes after `100` and advances to `120`. Only a page starting beyond the current cursor has a gap and requires HTTP recovery. Pages update SQLite and watches through the same engine logic.
+For either source, a page applies as one transaction and names a range for each channel it covers. A channel already covered by its cursor is left alone. A range spanning the current cursor applies: for example, at cursor `100`, a range `90 → 120` advances the channel to `120`, and each record's stamp decides whether its content is newer. A range starting beyond the current cursor is a gap. Then nothing from the page applies, and HTTP recovery fetches the missing range. Pages update SQLite and watches through the same engine logic.
 
 Mutation submission runs independently through `POST /sync/mutations`. A connection with no subscribed channels can still submit mutations without opening a socket.
 
@@ -258,7 +258,7 @@ All controls return promise/future void. Pause/close cancel network activity and
 
 | Method | Result / effect |
 | --- | --- |
-| `recordStatus(model, identity)` | `{ pending, rejections }` for that record; pending entries include ordinal, mutation name, phase and prerequisite states |
+| `recordStatus(model, identity)` | `{ pending, rejections }` for that record; pending entries include ordinal, mutation name, phase, prerequisite states and `diverged` |
 | `dismissRejection(ordinal)` | Remove a handled rejection from the durable local inbox; does not retry it |
 | `drop(ordinal)` | Remove eligible unsent work and recompute local state; frozen/sent work cannot be cancelled this way |
 
@@ -301,7 +301,7 @@ These low-level engine methods support protocol tests and tooling. Application s
 | Method | Input and return |
 | --- | --- |
 | `freeze()` | Return frozen request JSON or null when no batch can be sent; retry preserves the same bytes |
-| `acknowledge(sequence, receipt)` | Apply a decoded push receipt to the matching batch; returns void |
-| `applyPull(page)` | Apply a decoded pull page and return its application result |
+| `acknowledge(sequence, receipt)` | Apply a decoded push receipt to the matching batch; returns what it applied and any reports |
+| `applyPull(page)` | Apply a decoded pull page as one transaction and return its application result, including reports for records it could not apply |
 
-Wire fields are defined in the [protocol source](https://github.com/zanminwang/ahead/blob/main/crates/core/src/protocol.rs) and exercised by [shared wire fixtures](https://github.com/zanminwang/ahead/blob/main/fixtures). They retain names such as `scope` and `syncId`. Do not manufacture receipts, advance cursors yourself or rewrite frozen requests to recover from a network failure.
+Wire fields are defined in the [protocol source](https://github.com/zanminwang/ahead/blob/main/crates/core/src/protocol.rs) and exercised by [shared wire fixtures](https://github.com/zanminwang/ahead/blob/main/fixtures). Do not manufacture receipts, advance cursors yourself or rewrite frozen requests to recover from a network failure.

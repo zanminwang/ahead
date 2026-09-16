@@ -41,7 +41,11 @@ fn offline_queue_and_frozen_bytes_survive_restart_and_receipt_completes_at_once(
     let report = c
         .apply_page(page("book", 1, 2, Some("NORMALIZED")))
         .unwrap();
-    assert_eq!(report.conflicts, 0, "the same stamp and content is a no-op");
+    assert_eq!(
+        report.conflicts(),
+        0,
+        "the same stamp and content is a no-op"
+    );
     assert_eq!(c.read(&key()).unwrap().unwrap()["text"], "NORMALIZED");
     assert_eq!(c.cursor("book").unwrap(), 2);
 }
@@ -385,6 +389,7 @@ fn accepted_companion_cascade_does_not_resurrect_descendants() {
         identity: json!({"id":"other"}),
         stamp: 1,
         state: json!({"title":"New"}),
+        error: None,
     };
     let r = receipt(&mut c, 1, vec![other]);
     c.acknowledge(1, r).unwrap();

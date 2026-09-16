@@ -27,6 +27,25 @@ pub const LEGACY_TABLES: &[&str] = &["ahead_claim", "ahead_push_checkpoint"];
 /// database created before they existed holds pending work under the old
 /// contract; it is rebuilt beside, never converted or wiped.
 const CLIENT_COLUMNS: &[&str] = &["last_completed_push", "push_models"];
+/// Framework columns added after a layout shipped, with their definitions.
+/// A database without one gets it in place: its queue stays sendable.
+/// `diverged` marks a queued mutation whose replay failed over new authority
+/// ([#122](https://github.com/zanminwang/ahead/issues/122)).
+const ADDED_COLUMNS: &[(&str, &str, &str)] =
+    &[("ahead_mutation", "diverged", "INTEGER NOT NULL DEFAULT 0")];
+
+/// Add every framework column in [`ADDED_COLUMNS`] a table still lacks.
+pub fn add_framework_columns<S: ClientStore>(store: &mut S) -> Result<()> {
+    for (table, column, definition) in ADDED_COLUMNS {
+        let columns = store.query_committed(&format!("PRAGMA table_info({table})"), &[])?;
+        if !columns.rows.iter().any(|r| r[1].as_str() == Some(column)) {
+            store.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+            ))?;
+        }
+    }
+    Ok(())
+}
 
 pub const FRAMEWORK_DDL: &str = "
 CREATE TABLE IF NOT EXISTS ahead_schema (
@@ -48,7 +67,8 @@ CREATE TABLE IF NOT EXISTS ahead_subscription (
   channel TEXT PRIMARY KEY, cursor INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS ahead_mutation (
-  ordinal INTEGER PRIMARY KEY, name TEXT NOT NULL, version INTEGER NOT NULL, push INTEGER
+  ordinal INTEGER PRIMARY KEY, name TEXT NOT NULL, version INTEGER NOT NULL, push INTEGER,
+  diverged INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS ahead_mutation_operation (
   ordinal INTEGER NOT NULL REFERENCES ahead_mutation(ordinal) ON DELETE CASCADE,

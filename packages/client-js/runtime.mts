@@ -1,9 +1,11 @@
 import {
+  AheadReport,
   startConnection,
   startLiveLane,
   type Connection,
   type ConnectionOptions,
   type LiveLane,
+  type ReportDetails,
   type Transport,
 } from "./connection.mts";
 export type { Connection, ConnectionOptions } from "./connection.mts";
@@ -200,7 +202,7 @@ export function createClient<
           );
         const connection = await startConnection(
           (event) => control(event),
-          (t) => this.#runSync(t),
+          (t) => this.#runSync(t, options.onError),
           live.push,
           driverOptions,
         );
@@ -255,7 +257,10 @@ export function createClient<
         finished();
       }
     }
-    #runSync(transport: Transport): Promise<void> {
+    #runSync(
+      transport: Transport,
+      onError?: (error: unknown) => void,
+    ): Promise<void> {
       if (this.#syncing) return this.#syncing;
       const run = async () => {
         await this.#exclusive(() =>
@@ -267,9 +272,12 @@ export function createClient<
           );
           if (action === null) return;
           const response = await transport(action.kind, action.body);
-          await this.#exclusive(() =>
+          const reports = (await this.#exclusive(() =>
             this.#send({ op: "complete", response: JSON.parse(response) }),
-          );
+          )) as ReportDetails[];
+          // What the receipt or page could not apply; the client stays
+          // consistent and the application hears about each one.
+          for (const report of reports) onError?.(new AheadReport(report));
         }
       };
       this.#syncing = run().finally(() => {

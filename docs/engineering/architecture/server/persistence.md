@@ -2,11 +2,18 @@
 
 ## 1. Introduction and Goals
 
-Persistence stores the framework's four tables in the application's own database, through the application's own transaction. That is what makes a push atomic: business writes, stamps, publications and the receipt are one commit.
+Persistence stores the framework's four tables in the application's own database, through the application's own transaction. That is what makes a push atomic: business writes, stamps, publications and the receipt are one commit. PostgreSQL is the database; the application chooses the tool it talks to PostgreSQL with.
 
 ## 3. Context and Scope
 
-The application supplies a `Database<T>`: a `transaction(body)` runner that must give a coherent snapshot and roll back on failure, and a `persistence(tx)` factory returning an object with one method, `call(request)`. The requests it must answer:
+`@ahead/postgres` ([packages/postgres](../../../../packages/postgres)) owns every SQL statement Ahead runs, the migration, and the driver interface a PostgreSQL access tool binds. `packages/server` knows no SQL: `createBackend({database})` takes a `Database<T>`, a `transaction(body)` runner plus a `persistence(tx)` factory whose `call(request)` answers the host operations below, and `@ahead/postgres` builds that object from a driver.
+
+```ts
+interface PostgresDriver<Tx> {
+  transaction<R>(body: (tx: Tx) => Promise<R>): Promise<R>; // REPEATABLE READ, retry 40001/40P01
+  query(tx: Tx, sql: string, params: readonly unknown[]): Promise<Record<string, unknown>[]>;
+}
+```
 
 | Request | Meaning |
 | --- | --- |
@@ -19,25 +26,39 @@ The application supplies a `Database<T>`: a `transaction(body)` runner that must
 | `publish {channel, model, identity, identityKey, stamp}` | allocate the channel's next cursor and upsert the invalidation row at the given stamp, which must be the record's current one; return both |
 | `savepoint`, `rollback`, `release {ordinal}` | per-mutation savepoints |
 
-Tables: `ahead_client`, `ahead_channel`, `ahead_record`, `ahead_invalidation` ([migration.sql](../../../../packages/persistence-prisma/migration.sql)).
+Tables: `ahead_client`, `ahead_channel`, `ahead_record`, `ahead_invalidation` ([migration.sql](../../../../packages/postgres/migration.sql)).
 
 ## 5. Building Block View
 
-The shipped adapter targets PostgreSQL through a Prisma interactive transaction. Its important properties: `claim` uses `SELECT … FOR UPDATE`, so retries of one client serialize on the row; `advanceStamp` and `ensureStamp` allocate stamps with atomic upserts that return the new value, so concurrent first publications agree on 1 and an established stamp is never overwritten; `publish` allocates the cursor the same way and refuses a stamp that is not the record's current one; `scan` is a `LEFT JOIN` from the invalidation row to the stamp row, so a page carries the stamp of the content the loader reads, not the stamp the record had when it was last published; the transaction runner uses repeatable read and retries serialization failures a bounded number of times. Counters are `bigint` with safe-range checks and are narrowed to safe integers on the way out.
+| Module | Owns |
+| --- | --- |
+| [src/driver.mts](../../../../packages/postgres/src/driver.mts) | `PostgresDriver<Tx>`, `DriverOptions {retries, timeout}`, `withRetries`, `RETRYABLE_SQLSTATES` |
+| [src/sql.mts](../../../../packages/postgres/src/sql.mts) | every statement, as named constants; the only place SQL text lives |
+| [src/persistence.mts](../../../../packages/postgres/src/persistence.mts) | `answer(driver, tx, request)`, the switch over the operations above, and `persistence(driver)`, the `Database<Tx>` it becomes |
+| [src/pg.mts](../../../../packages/postgres/src/pg.mts), [src/prisma.mts](../../../../packages/postgres/src/prisma.mts), [src/drizzle.mts](../../../../packages/postgres/src/drizzle.mts) | the shims: `pg(pool)`, `prisma(client)`, `drizzle(db)`, each binding the two methods to its tool's transaction |
 
-Code: [persistence-prisma/index.mts](../../../../packages/persistence-prisma/index.mts); the contract in [server/index.mts](../../../../packages/server/index.mts).
+Properties the SQL holds: `claim` uses `SELECT … FOR UPDATE`, so retries of one client serialize on the row; `advanceStamp` and `ensureStamp` allocate stamps with atomic upserts that return the new value, so concurrent first publications agree on 1 and an established stamp is never overwritten; `publish` allocates the cursor the same way and refuses a stamp that is not the record's current one; `scan` is a `LEFT JOIN` from the invalidation row to the stamp row, so a page carries the stamp of the content the loader reads, not the stamp the record had when it was last published. Counters are `bigint` with safe-range checks and are narrowed to safe integers on the way out; a driver whose tool cannot send a bigint parameter sends it as text.
+
+Each shim's `transaction` runs at Repeatable Read and retries serialization failures (`40001`, `40P01`; Prisma `P2034`, or `P2010` with one of those codes) a bounded number of times, re-running the whole body. `pg` opens `BEGIN ISOLATION LEVEL REPEATABLE READ` on a pooled client; `prisma` uses `$transaction(body, {isolationLevel: 'RepeatableRead', timeout})` and `$queryRawUnsafe`; `drizzle` uses `db.transaction(body, {isolationLevel: 'repeatable read'})` and rewrites `$n` placeholders into a `sql` template (`bindDrizzle`) so the tool binds the parameters itself.
+
+Code: [packages/postgres/index.mts](../../../../packages/postgres/index.mts); the `Database<T>` contract in [server/index.mts](../../../../packages/server/index.mts).
+
+## 9. Architecture Decisions
+
+**One package for PostgreSQL, a two-method driver per tool ([#103](https://github.com/zanminwang/ahead/issues/103), decided 2026-09-16).** Modelled on River: the database is fixed, the driver is small, the transaction is the application's. Every statement lives once, in `sql.mts`, and a tool shim only binds `transaction` and `query`, so supporting another PostgreSQL tool is thirty lines and the same conformance suite; handlers and loaders keep receiving their tool's own transaction. A different database would be a different package, not a driver, and is not planned. The former `persistence-prisma` package became the `prisma` shim.
 
 ## 10. Quality Requirements
 
+- **Every shim answers the persistence operations the same way against a real database** (claim creates and locks the row and replays the stored receipt; owner mismatch refuses; `head` is 0 for an unknown channel; `advanceStamp` 1, 2 and `ensureStamp` agree on 1 under three concurrent transactions; `publish` validates the stamp; a rolled-back transaction removes a first initialisation; `scan` joins the current stamp and reports missing metadata; savepoints roll back and release; a serialization conflict retries the whole body). Evidence: [driver-conformance.test.mjs](../../../../integration/persistence/server/driver-conformance.test.mjs), run once each for `pg`, `prisma` and `drizzle`, and the `pgDriver` retry unit test in the same file.
 - **Concurrent retries of one client execute once; head, scan and loader see one snapshot.** Evidence: [runtime.test.mjs](../../../../integration/persistence/server/runtime.test.mjs) `concurrent same-client retry executes once under PostgreSQL lock`, `repeatable-read runner keeps head, scan, and loader coherent across concurrent publication`.
-- **A stamp advances without a channel; one push publishing to two channels carries one stamp to both and advances each head once; an external notify advances the stamp on every call while a push publishing an unchanged record does not; concurrent first publications initialize one stamp of 1; a rolled-back transaction removes a first initialization with its publication; `publish` refuses a missing or stale stamp; `scan` pairs the cursor with the current stamp** (guarantee D3). Evidence: `advanceStamp increments without a channel: no invalidation, no channel head`, `one push publishing to two channels carries the same stamp to both and advances each head once`, `an external notify advances the stamp on every call; a push publishing an unchanged record does not`, `concurrent first publications initialise one stamp of 1 and never overwrite an established one`, `a rolled-back transaction removes a first initialisation together with its publication`, `publish refuses a record without metadata or with a stamp that is not its current one`, `scan pairs the invalidation cursor with the current record stamp; a missing record row is a storage defect`, `concurrent notifies of one record receive distinct stamps`.
+- **A stamp advances without a channel; one push publishing to two channels carries one stamp to both and advances each head once; an external write advances the stamp on every call while a push publishing an unchanged record does not; concurrent first publications initialize one stamp of 1; a rolled-back transaction removes a first initialization with its publication; `publish` refuses a missing or stale stamp; `scan` pairs the cursor with the current stamp** (guarantee D3). Evidence: `advanceStamp increments without a channel: no invalidation, no channel head`, `one push publishing to two channels carries the same stamp to both and advances each head once`, `an external write advances the stamp on every call; a push publishing an unchanged record does not`, `concurrent first publications initialise one stamp of 1 and never overwrite an established one`, `a rolled-back transaction removes a first initialisation together with its publication`, `publish refuses a record without metadata or with a stamp that is not its current one`, `scan pairs the invalidation cursor with the current record stamp; a missing record row is a storage defect`, `concurrent notifies of one record receive distinct stamps`.
 - **Fresh framework tables define no `request_hash`; a table installed from an earlier `migration.sql` that still carries the column serves claim, replay and gap checks unchanged, before and after the column is dropped.** Evidence: `fresh framework tables omit request_hash; a table that still carries the column keeps replaying receipts`.
 - **Per-mutation savepoints behave as savepoints against a real database.** Evidence: [transaction-bridge.test.mjs](../../../../integration/bindings/node/transaction-bridge.test.mjs) `business rejection rolls back its savepoint while preceding mutation commits`.
 
-Executed 2026-09-15: `bash integration/persistence/server/run.sh` (61 passed) with the stamp separation; the savepoint bridge test read, not executed.
+Executed 2026-09-16: `bash integration/persistence/server/run.sh` (conformance 28 passed, runtime and host contract 68 passed).
 
 ## 11. Risks and Technical Debt
 
-**Accepted limitation (legacy column).** `ahead_client` once defined a `request_hash text` column that nothing wrote or read; receipt replay is keyed by client and sequence ([Server Push §9](engine/push.md#9-architecture-decisions)). Databases installed before its removal keep the column: `CREATE TABLE IF NOT EXISTS` never alters an existing table, and the adapter names its columns, so the extra one is ignored. Removing it is optional and safe, `ALTER TABLE ahead_client DROP COLUMN request_hash`, and touches no receipts or business data.
+**Accepted limitation (legacy column).** `ahead_client` once defined a `request_hash text` column that nothing wrote or read; receipt replay is keyed by client and sequence ([Server Push §9](engine/push.md#9-architecture-decisions)). Databases installed before its removal keep the column: `CREATE TABLE IF NOT EXISTS` never alters an existing table, and the statements name their columns, so the extra one is ignored. Removing it is optional and safe, `ALTER TABLE ahead_client DROP COLUMN request_hash`, and touches no receipts or business data.
 
-**Accepted limitations.** PostgreSQL via Prisma is the only adapter; the SQL is PostgreSQL-specific. The framework tables are installed from a raw SQL file with no migration tooling. Rows are never pruned: client rows live forever and invalidation rows grow with records × channels ([#61](https://github.com/zanminwang/ahead/issues/61)). The isolation requirement on an application-supplied runner is stated in prose only.
+**Accepted limitations.** PostgreSQL is the only database. The framework tables are installed from a raw SQL file with no migration tooling. Rows are never pruned: client rows live forever and invalidation rows grow with records × channels ([#61](https://github.com/zanminwang/ahead/issues/61)). The isolation requirement on a driver's runner is stated in the interface's doc comment and checked by the conformance retry test, not enforced at runtime.

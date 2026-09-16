@@ -31,7 +31,7 @@ export const loaders: Loaders<Tx> = {
 
 // main.ts
 import { createBackend, devAuth } from './generated/backend.ts';
-import { prisma } from '../../packages/persistence-prisma/index.mts';
+import { prisma } from '../../packages/postgres/index.mts';
 import { handlers } from './handlers.ts';
 import { loaders } from './loaders.ts';
 
@@ -68,20 +68,21 @@ Publish to every channel that provides a record whenever that record changes, in
 
 ## Background jobs
 
-Outside a Handler there is no readback and no receipt, so a change must be published to reach clients. Use `backend.transaction`; it advances the stamp of every record named, publishes it to the channel inside the same transaction as your writes, and wakes live subscribers after commit:
+Outside a Handler there is no readback and no receipt, so a change must be published to reach clients. Use `backend.transaction`; its body gets the same `changes` and `publish` as a Handler, the framework stamps and publishes what it collected inside the same transaction as your writes, and wakes live subscribers after commit:
 
 ```ts
-await backend.transaction(async ({ tx, notify }) => {
+await backend.transaction(async ({ tx, changes, publish }) => {
   await tx.entry.update({ where: { id: 'entry-1' }, data: { text: 'From a job' } });
-  await notify({ channel: 'book:demo', records: [Entry({ id: 'entry-1' })] });
+  changes.add(Entry({ id: 'entry-1' }));
+  publish({ channel: 'book:demo' });
 });
 ```
 
-If your framework already owns the transaction, see [externally owned transactions](api.md#externally-owned-transactions).
+See [background writes](api.md#background-writes).
 
 ## Transaction ownership
 
-The outer transaction belongs to the application. Persistence, Handler, and Loader callbacks all receive that same transaction. The runner must provide a coherent snapshot (Repeatable Read or stronger), roll back on rejected promises, and retry serialization conflicts. `prismaTransactions` supplies this contract.
+The outer transaction belongs to the application. Persistence, Handler, and Loader callbacks all receive that same transaction. The runner must provide a coherent snapshot (Repeatable Read or stronger), roll back on rejected promises, and retry serialization conflicts. Every shim of [`@ahead/postgres`](database.md) supplies this contract.
 
 ## Mutation results
 
@@ -89,7 +90,9 @@ A successful Handler returns nothing; its return value is ignored. The receipt c
 
 ## Loaders and Pull
 
-Wire vocabulary remains `scope` and `syncId`. Loaders return one state object or null for every identity, in precisely the supplied order. A missing or unauthorized row is null. Loader defects and refusals fail the request; they never skip rows or move the cursor past an error. Pull scans at most 50 compacted invalidations and materializes their current state with each record's current stamp.
+Loaders return one state object or null for every identity, in precisely the supplied order. A missing or unauthorized row is null. One pull covers every channel the client follows and delivers a record published to several of them once. Each channel scans at most 50 compacted invalidations, and the pull materializes their current state with each record's current stamp.
+
+A record that cannot be read fails alone ([#95](https://github.com/zanminwang/ahead/issues/95)). When a Loader throws or refuses a batch, Ahead retries each identity on its own. The record that still fails is delivered as an error change carrying `loader.failed` or the refusal code, and the rest of the page is served. The failure is reported to `onError`, which defaults to `console.error`. The client keeps its copy of that record and reports it. The record is corrected the next time you publish it. A Loader that returns the wrong number of entries is retried the same way, and a row that does not match the model type fails only its record with `loader.invalid`.
 
 Run `integration/persistence/server/run.sh` for the disposable PostgreSQL/Prisma integration suite. Its database is created, used, and destroyed by the runner.
 

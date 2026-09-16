@@ -282,7 +282,7 @@ class Client implements ReadPort {
             'entropy': entropy,
           }),
         ),
-        sync: (transport) => _startSync(transport, true),
+        sync: (transport) => _startSync(transport, true, onError),
         transport: transport,
         onError: onError,
         refreshAuth: refreshAuth == null ? null : refresh,
@@ -341,13 +341,17 @@ class Client implements ReadPort {
     }
   }
 
-  Future<void> _startSync(Transport transport, bool pushOnly) =>
-      _syncing ??= _runSync(transport, pushOnly).whenComplete(() {
-        _syncing = null;
-      });
+  Future<void> _startSync(
+    Transport transport,
+    bool pushOnly,
+    void Function(Object)? onError,
+  ) => _syncing ??= _runSync(transport, pushOnly, onError).whenComplete(() {
+    _syncing = null;
+  });
   Future<void> _runSync(
     Future<String> Function(String kind, String body) transport,
     bool pushOnly,
+    void Function(Object)? onError,
   ) async {
     await _exclusive(() => _send({'op': 'startSync', 'pushOnly': pushOnly}));
     while (true) {
@@ -357,9 +361,14 @@ class Client implements ReadPort {
         action['kind'] as String,
         action['body'] as String,
       );
-      await _exclusive(
+      final reports = await _exclusive(
         () => _send({'op': 'complete', 'response': jsonDecode(response)}),
       );
+      // What the receipt or page could not apply; the client stays consistent
+      // and the application hears about each one.
+      for (final report in reports as List<dynamic>) {
+        onError?.call(AheadReport.fromJson(report as Map<String, dynamic>));
+      }
     }
   }
 

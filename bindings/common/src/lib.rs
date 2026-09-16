@@ -225,13 +225,10 @@ impl RuntimeHost {
                         Value::Null
                     }
                     "next" => serde_json::to_value(e.cycle.next(&mut e.client)?)?,
-                    "complete" => {
-                        e.cycle.complete(
-                            &mut e.client,
-                            serde_json::to_string(&request["response"])?.as_bytes(),
-                        )?;
-                        Value::Null
-                    }
+                    "complete" => serde_json::to_value(e.cycle.complete(
+                        &mut e.client,
+                        serde_json::to_string(&request["response"])?.as_bytes(),
+                    )?)?,
                     "freeze" => match e.client.freeze()? {
                         Some(bytes) => {
                             json!(String::from_utf8(bytes).map_err(|_| invalid("utf8"))?)

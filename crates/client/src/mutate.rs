@@ -133,25 +133,31 @@ impl<S: ClientStore> Engine<'_, S> {
         self.copy_aside(&model, &key.identity)
     }
     /// Replay every still-queued operation for one record over its held truth.
-    pub fn rebuild(&mut self, key: &RecordKey) -> Result<()> {
+    /// When a replay fails the truth stays visible and the failing mutation's
+    /// ordinal is returned and marked diverged; the queue is untouched
+    /// ([#122](https://github.com/zanminwang/ahead/issues/122)).
+    pub fn rebuild(&mut self, key: &RecordKey) -> Result<Option<u64>> {
         let truth = self.before_get(key)?;
         let ops = self.ops_for(key)?;
         let mut row = truth.clone();
-        let mut failed = false;
+        let mut failed = None;
         for queued in &ops {
             if apply_to_row(&mut row, &queued.op).is_err() {
-                failed = true;
+                failed = Some(queued.ordinal);
                 break;
             }
         }
-        let result = if failed { truth.clone() } else { row };
+        let result = if failed.is_some() { truth.clone() } else { row };
         if self.main_set(key, result.as_ref()).is_err() {
             self.main_set(key, truth.as_ref())?;
         }
         if ops.is_empty() {
             self.before_set(key, None)?;
         }
-        Ok(())
+        if let Some(ordinal) = failed {
+            self.set_diverged(ordinal)?;
+        }
+        Ok(failed)
     }
     /// Every record reachable from `parent` through declared cascading deletes.
     pub fn descendants(&mut self, parent: &RecordKey) -> Result<Vec<RecordKey>> {
@@ -221,6 +227,8 @@ impl<S: ClientStore> Engine<'_, S> {
                             values: None,
                         },
                     )?;
+                    // A child whose own replay fails was already reported when
+                    // it was held; here only the delete effect is extended.
                     self.rebuild(&child)?;
                 }
             }

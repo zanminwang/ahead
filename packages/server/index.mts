@@ -20,10 +20,10 @@ export type Native = {
     request: string,
     callback: (request: string) => Promise<string>,
   ): Promise<string>;
-  publish(
+  /** Settles a business change made outside a handler: the same `{changes, publications}` a handler answers with. */
+  settleExternal(
     config: string,
-    changes: string,
-    channels: string,
+    settlement: string,
     callback: (request: string) => Promise<string>,
   ): Promise<string>;
   /** Negotiates and opens the socket's `Subscriptions`; answers `{handle, actions}` JSON. */
@@ -36,8 +36,7 @@ export type Native = {
   pullLive(
     config: string,
     owner: string,
-    scope: string,
-    fromCursor: number,
+    cursors: string,
     models: string,
     callback: (request: string) => Promise<string>,
   ): Promise<string>;
@@ -46,10 +45,12 @@ export type Native = {
   /** Forgets the session; idempotent. */
   liveClose(handle: number): void;
 };
+/** One channel's progress in a page: after `from`, up to `to`, of a channel at `head`. */
+export type CursorRange = { from: number; to: number; head: number };
 /** What the executor reports to the Rust `Subscriptions` controller. */
 export type LiveEvent =
   | { type: "committed"; scope: string }
-  | { type: "pulled"; scope: string; page: string }
+  | { type: "pulled"; page: string }
   | { type: "closed" };
 /** What the controller asks the executor to do, in order. */
 export type LiveAction =
@@ -57,8 +58,8 @@ export type LiveAction =
   | { type: "send"; frame: string }
   | {
       type: "pull";
-      scope: string;
-      fromCursor: number;
+      /** The cursor to pull after, per channel: one pull covers them all. */
+      cursors: Record<string, number>;
       /** The read contracts the session declared: model name to version. */
       models: Record<string, number>;
     };
@@ -135,7 +136,11 @@ function engineError(error: unknown): unknown {
 /** Wrap every native function so its failures surface as `EngineError`. */
 function typedNative(native: Native): Native {
   type Async =
-    "processPush" | "processPull" | "publish" | "negotiateLive" | "pullLive";
+    | "processPush"
+    | "processPull"
+    | "settleExternal"
+    | "negotiateLive"
+    | "pullLive";
   type Sync = "validateConfig" | "liveEvent" | "liveClose";
   const wrap =
     <K extends Async>(key: K) =>
@@ -160,7 +165,7 @@ function typedNative(native: Native): Native {
     validateConfig: wrapSync("validateConfig"),
     processPush: wrap("processPush"),
     processPull: wrap("processPull"),
-    publish: wrap("publish"),
+    settleExternal: wrap("settleExternal"),
     negotiateLive: wrap("negotiateLive"),
     pullLive: wrap("pullLive"),
     liveEvent: wrapSync("liveEvent"),
@@ -192,16 +197,16 @@ export interface RecordRef {
   model: string;
   identity: object;
 }
-/** The external notification: a business change made outside a handler, reported to one channel. */
-export type NotifyArgs = {
-  channel: string;
-  records: readonly (RecordRef | object)[];
-};
-/** What `backend.transaction` hands its body: the application transaction and the external notify bound to it. */
+/**
+ * What `backend.transaction` hands its body: the application transaction and
+ * the same `changes` and `publish` a handler receives. The body registers the
+ * records it changed and the channels to publish to; the engine settles them
+ * after the body returns, inside the same transaction.
+ */
 export interface TransactionCall<Tx> {
   tx: Tx;
-  /** Reports a business change made outside a handler: every record gets a new stamp and the channel an invalidation, inside `tx`. Await it; a pending notify fails the transaction. */
-  notify(args: NotifyArgs): Promise<void>;
+  changes: Changes;
+  publish: Publish;
 }
 /**
  * One publication a handler asks for. `records` absent publishes the
@@ -440,6 +445,9 @@ export function createBackend<T>(options: BackendOptions<T>) {
     options.native ??
       (require("../../bindings/node/ahead-node.node") as Native),
   );
+  // Nothing is dropped silently: without a handler, failures go to the console.
+  const onError: (error: unknown) => void =
+    options.onError ?? ((error) => console.error(error));
   const descriptor = options.config as {
     schema?: { models?: { name: string; version?: number }[] };
     mutations?: MutationDescriptor[];
@@ -527,8 +535,47 @@ export function createBackend<T>(options: BackendOptions<T>) {
         ? error.code
         : options.translateRejection?.(error);
     if (code != null) return { rejection: new MutationRejected(code).code };
-    options.onError?.(error);
+    onError(error);
     return { error: error instanceof Error ? error.message : String(error) };
+  };
+  /**
+   * The change set and publication intents one handler or one external
+   * transaction body accumulates; `add` keeps one entry per (model, identity).
+   */
+  const collect = () => {
+    const records: RecordRef[] = [];
+    const seen = new Set<string>();
+    const add = (ref: RecordRef) => {
+      const key = `${ref.model}\u0000${canonical(ref.identity)}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      records.push(ref);
+    };
+    const changes: Changes = {
+      records,
+      add: (record) => add(toRef(record, "changes.add")),
+    };
+    const publications: { channel: string; records?: RecordRef[] }[] = [];
+    const publish: Publish = ({ channel, records }) => {
+      if (typeof channel !== "string" || channel === "")
+        throw new Error("publish: channel must be a non-empty string");
+      if (records === undefined) {
+        publications.push({ channel });
+        return;
+      }
+      if (!Array.isArray(records))
+        throw new Error("publish: records must be an array");
+      publications.push({
+        channel,
+        records: records.map((record) => toRef(record, "publish")),
+      });
+    };
+    return {
+      changes,
+      publish,
+      seed: add,
+      settlement: () => ({ changes: [...records], publications }),
+    };
   };
   const host = (
     tx: T,
@@ -569,40 +616,15 @@ export function createBackend<T>(options: BackendOptions<T>) {
                 : shape(slot, raw);
           }
           // The change set starts with every record the operations target,
-          // in slot order; `add` keeps one entry per (model, identity).
-          const records: RecordRef[] = [];
-          const seen = new Set<string>();
-          const add = (ref: RecordRef) => {
-            const key = `${ref.model}\u0000${canonical(ref.identity)}`;
-            if (seen.has(key)) return;
-            seen.add(key);
-            records.push(ref);
-          };
+          // in slot order.
+          const collected = collect();
           for (const slot of entry.slots) {
             const raw = req.arguments[slot.name] as any;
             for (const item of slot.cardinality === "list" ? raw : [raw])
               if (item !== null && item !== undefined)
-                add({ model: slot.model, identity: item.identity });
+                collected.seed({ model: slot.model, identity: item.identity });
           }
-          const changes: Changes = {
-            records,
-            add: (record) => add(toRef(record, "changes.add")),
-          };
-          const publications: { channel: string; records?: RecordRef[] }[] = [];
-          const publish: Publish = ({ channel, records }) => {
-            if (typeof channel !== "string" || channel === "")
-              throw new Error("publish: channel must be a non-empty string");
-            if (records === undefined) {
-              publications.push({ channel });
-              return;
-            }
-            if (!Array.isArray(records))
-              throw new Error("publish: records must be an array");
-            publications.push({
-              channel,
-              records: records.map((record) => toRef(record, "publish")),
-            });
-          };
+          const { changes, publish } = collected;
           try {
             await entry.handler({
               input,
@@ -611,7 +633,7 @@ export function createBackend<T>(options: BackendOptions<T>) {
               changes,
               publish,
             });
-            result = { changes: [...records], publications };
+            result = collected.settlement();
           } catch (error) {
             result = refusal(error);
           }
@@ -628,10 +650,10 @@ export function createBackend<T>(options: BackendOptions<T>) {
           };
           // A read refusal (`MutationRejected` or a translated error) is
           // answered as data: the engine records it as the mutation's
-          // rejection in a push and refuses the page in a pull. Any other
-          // thrown error is also answered as data - a failure - which the
-          // engine turns into `loader.failed` for the mutation it was
-          // reading back for.
+          // rejection in a push and as that record's `error` change in a
+          // pull. Any other thrown error is also answered as data - a
+          // failure - which becomes `loader.failed` for that one mutation or
+          // record.
           let refused: { rejection: string } | { error: string } | undefined;
           let rows: unknown;
           try {
@@ -642,13 +664,27 @@ export function createBackend<T>(options: BackendOptions<T>) {
           } catch (error) {
             refused = refusal(error);
           }
-          if (refused) result = refused;
-          else if (
-            !Array.isArray(rows) ||
-            rows.some((value) => value === undefined)
-          )
-            throw new Error("invalid loader: undefined or non-array result");
-          else result = rows;
+          if (refused) return callbackJson(refused);
+          // An answer JSON cannot carry faithfully is a failed read, never a
+          // null: the engine retries the records one by one, so only the
+          // record whose row is broken fails.
+          let reason: string | undefined;
+          let answer = "";
+          if (!Array.isArray(rows)) reason = "a non-array result";
+          else if (rows.some((value) => value === undefined))
+            reason = "an undefined entry";
+          else
+            try {
+              answer = callbackJson(rows);
+            } catch (error) {
+              reason = error instanceof Error ? error.message : String(error);
+            }
+          if (reason === undefined) return answer;
+          const invalid = new Error(
+            `invalid loader answer for ${req.model} v${req.version}: ${reason}`,
+          );
+          onError(invalid);
+          return callbackJson({ error: invalid.message });
         } else {
           // Everything the persistence owns, plus anything this build does not
           // know: an operation added to the contract without an arm here is a
@@ -678,46 +714,11 @@ export function createBackend<T>(options: BackendOptions<T>) {
         return callbackJson(result);
       });
   };
-  const publish = (
-    tx: T,
-    changes: readonly RecordRef[],
-    channels: readonly string[],
-  ): Promise<unknown> => {
-    const session = sessions.get(tx);
-    if (!session)
-      return Promise.reject(
-        new Error(
-          "transaction not bound: use backend.transaction or bindTransaction",
-        ),
-      );
-    return session.track(async () => {
-      const result = JSON.parse(
-        await native.publish(
-          config,
-          JSON.stringify(changes),
-          JSON.stringify(channels),
-          host(tx, session),
-        ),
-      );
-      for (const channel of channels) session.touched.add(channel);
-      return result;
-    });
-  };
-  const notifyIn =
-    (tx: T) =>
-    ({ channel, records }: NotifyArgs): Promise<void> =>
-      publish(
-        tx,
-        records.map((record) => toRef(record, "notify")),
-        [channel],
-      ).then(() => undefined);
   const bindTransaction = (tx: T) => {
     if (sessions.has(tx)) throw new Error("transaction already bound");
     const session = new Session();
     sessions.set(tx, session);
     return {
-      /** Reports a business change made outside a handler: every record gets a new stamp and the channel an invalidation. Unlike a handler's `publish`, this returns a promise the caller must await before the transaction commits. */
-      notify: notifyIn(tx),
       assertCommittable: () => session.assertCommittable(),
       afterCommit: () => {
         const scopes = [...session.touched];
@@ -754,28 +755,78 @@ export function createBackend<T>(options: BackendOptions<T>) {
     return result;
   };
   /**
-   * Runs `body` in one application transaction with the external notify bound
-   * to it. After the adapter commits, the live subscribers of every channel
-   * notified are woken; a failure rolls back and wakes nobody. Not for use
-   * inside a handler, which already has a transaction and `publish`.
+   * Runs `body` in one application transaction with a handler's `changes` and
+   * `publish`. After the body returns, the engine settles what it collected in
+   * the same transaction: one new stamp per changed record, publications at
+   * those stamps. After the driver commits, the live subscribers of every
+   * channel published to are woken; a failure rolls back and wakes nobody.
+   * Not for use inside a handler, which already has a transaction.
    */
   const transaction = <R,>(
     body: (call: TransactionCall<T>) => Promise<R>,
-  ): Promise<R> => run((tx) => body({ tx, notify: notifyIn(tx) }));
+  ): Promise<R> =>
+    run(async (tx, session) => {
+      const collected = collect();
+      const result = await body({
+        tx,
+        changes: collected.changes,
+        publish: collected.publish,
+      });
+      await session.track(() =>
+        native.settleExternal(
+          config,
+          JSON.stringify(collected.settlement()),
+          host(tx, session),
+        ),
+      );
+      return result;
+    });
   const text = (request: Uint8Array | string) =>
     typeof request === "string"
       ? request
       : new TextDecoder("utf-8", { fatal: true }).decode(request);
+  // A loader row the served contract does not accept is checked by the
+  // engine, which fails only that record (`loader.invalid`). The developer
+  // still hears about each one.
+  const INVALID = '"loader.invalid"';
+  const reportInvalidPage = (page: string): string => {
+    if (!page.includes(INVALID)) return page;
+    const { changes } = JSON.parse(page) as {
+      changes: { model: string; identity: unknown; error?: string }[];
+    };
+    for (const change of changes)
+      if (change.error === "loader.invalid")
+        onError(
+          new Error(
+            `loader returned a row the served ${change.model} contract does not accept: ${JSON.stringify(change.identity)}`,
+          ),
+        );
+    return page;
+  };
+  const reportInvalidReceipt = (receipt: string): string => {
+    if (!receipt.includes(INVALID)) return receipt;
+    const { rejections } = JSON.parse(receipt) as {
+      rejections: { ordinal: number; code: string }[];
+    };
+    for (const rejection of rejections)
+      if (rejection.code === "loader.invalid")
+        onError(
+          new Error(
+            `loader returned a row the declared contract does not accept while reading back mutation ${rejection.ordinal}`,
+          ),
+        );
+    return receipt;
+  };
   /** @internal Raw protocol seams used by the framework's own tests; not part of the supported surface. */
   const api = {
     push: (owner: string, request: Uint8Array | string) =>
       run((tx, session) =>
         native.processPush(config, owner, text(request), host(tx, session)),
-      ),
+      ).then(reportInvalidReceipt),
     pull: (owner: string, request: Uint8Array | string) =>
       run((tx, session) =>
         native.processPull(config, owner, text(request), host(tx, session)),
-      ),
+      ).then(reportInvalidPage),
     negotiateLive: (
       owner: string,
       request: Uint8Array | string,
@@ -785,20 +836,25 @@ export function createBackend<T>(options: BackendOptions<T>) {
       ).then(JSON.parse),
     pullLive: (
       owner: string,
-      scope: string,
-      fromCursor: number,
+      cursors: Record<string, number>,
       models: Record<string, number>,
-    ): Promise<{ page: string; toCursor: number; continues: boolean }> =>
+    ): Promise<{ page: string; cursors: Record<string, CursorRange> }> =>
       run((tx, session) =>
         native.pullLive(
           config,
           owner,
-          scope,
-          fromCursor,
+          JSON.stringify(cursors),
           JSON.stringify(models),
           host(tx, session),
         ),
-      ).then(JSON.parse),
+      ).then((result) => {
+        const parsed = JSON.parse(result) as {
+          page: string;
+          cursors: Record<string, CursorRange>;
+        };
+        reportInvalidPage(parsed.page);
+        return parsed;
+      }),
     liveEvent: (handle: number, event: LiveEvent): LiveAction[] =>
       JSON.parse(native.liveEvent(handle, JSON.stringify(event))),
     liveClose: (handle: number): void => native.liveClose(handle),
@@ -806,7 +862,6 @@ export function createBackend<T>(options: BackendOptions<T>) {
       wakes.subscribe(scope, wake),
     notifyCommitted: (scopes: readonly string[]) => wakes.notify(scopes),
     closeLive: () => wakes.clear(),
-    bindTransaction,
     transaction,
   };
   const authenticate = async (request: IncomingMessage) => {
@@ -826,13 +881,13 @@ export function createBackend<T>(options: BackendOptions<T>) {
       createHttpHandler({
         backend: api,
         authenticate,
-        ...(options.onError ? { onError: options.onError } : {}),
+        onError,
       }),
     );
     const live = attachLive(server, {
       backend: api,
       authenticate,
-      ...(options.onError ? { onError: options.onError } : {}),
+      onError,
     });
     await new Promise<void>((resolve, reject) => {
       const onError = (error: Error) => reject(error);
@@ -958,10 +1013,9 @@ interface LiveBackend {
   ): Promise<{ handle: number; actions: LiveAction[] }>;
   pullLive(
     owner: string,
-    scope: string,
-    fromCursor: number,
+    cursors: Record<string, number>,
     models: Record<string, number>,
-  ): Promise<{ page: string; toCursor: number; continues: boolean }>;
+  ): Promise<{ page: string; cursors: Record<string, CursorRange> }>;
   liveEvent(handle: number, event: LiveEvent): LiveAction[];
   liveClose(handle: number): void;
   onCommitted(scope: string, wake: () => void): () => void;
@@ -1029,8 +1083,8 @@ function attachLive(
 /**
  * Executes the Rust controller's actions for one socket. Every sync decision
  * (what to pull, when, what to send) is the controller's; this only carries
- * events in and performs actions out. Pulls for different scopes may run
- * concurrently; the controller keeps at most one outstanding per scope.
+ * events in and performs actions out. The controller keeps at most one pull
+ * outstanding per session; it covers every scope with a pending commit.
  */
 async function serveLive(
   connection: WebSocket,
@@ -1076,12 +1130,10 @@ async function serveLive(
       } else if (action.type === "send") {
         if (open()) connection.send(action.frame);
       } else {
-        const { scope } = action;
         backend
-          .pullLive(owner, scope, action.fromCursor, action.models)
+          .pullLive(owner, action.cursors, action.models)
           .then(
-            (progress) =>
-              dispatch({ type: "pulled", scope, page: progress.page }),
+            (progress) => dispatch({ type: "pulled", page: progress.page }),
             fail,
           );
       }

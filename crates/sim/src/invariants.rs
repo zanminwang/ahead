@@ -147,6 +147,13 @@ fn no_pending_means_converged(sim: &mut Sim) -> Result<(), String> {
                 if sim.direct_writes.contains(&(i, key.encoded().unwrap())) {
                     continue;
                 }
+                // The last delivery of this record to this client could not be
+                // applied (a read failure or a skipped change): the client keeps
+                // its earlier content on purpose until the record is delivered
+                // again. Exempt exactly this pair; `Sim::settle` republishes it.
+                if sim.stale_reads.contains(&(i, key.encoded().unwrap())) {
+                    continue;
+                }
                 // A record's invalidation history on this channel can outlive its
                 // membership (a record can move to other channels entirely, and a
                 // change can be published outside membership). Once `channel` is no

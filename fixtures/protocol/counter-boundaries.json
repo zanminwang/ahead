@@ -2,42 +2,42 @@
   "pull": [
     {
       "name": "safe maximum",
-      "wire": "{\"scope\":\"book\",\"fromCursor\":9007199254740991,\"toCursor\":9007199254740991,\"changes\":[]}",
+      "wire": "{\"cursors\":{\"book\":{\"from\":9007199254740991,\"to\":9007199254740991,\"head\":9007199254740991}},\"changes\":[]}",
       "valid": true
     },
     {
       "name": "overflow",
-      "wire": "{\"scope\":\"book\",\"fromCursor\":0,\"toCursor\":9007199254740992,\"changes\":[]}",
+      "wire": "{\"cursors\":{\"book\":{\"from\":0,\"to\":9007199254740992,\"head\":9007199254740992}},\"changes\":[]}",
       "valid": false
     },
     {
       "name": "negative",
-      "wire": "{\"scope\":\"book\",\"fromCursor\":-1,\"toCursor\":0,\"changes\":[]}",
+      "wire": "{\"cursors\":{\"book\":{\"from\":-1,\"to\":0,\"head\":0}},\"changes\":[]}",
       "valid": false
     },
     {
       "name": "null withdrawal",
-      "wire": "{\"scope\":\"book\",\"fromCursor\":0,\"toCursor\":1,\"changes\":[{\"syncId\":1,\"model\":\"Entry\",\"identity\":{\"id\":\"one\"},\"stamp\":1,\"state\":null}]}",
+      "wire": "{\"cursors\":{\"book\":{\"from\":0,\"to\":1,\"head\":1}},\"changes\":[{\"model\":\"Entry\",\"identity\":{\"id\":\"one\"},\"stamp\":1,\"state\":null}]}",
       "valid": true
     },
     {
       "name": "stamp missing",
-      "wire": "{\"scope\":\"book\",\"fromCursor\":0,\"toCursor\":1,\"changes\":[{\"syncId\":1,\"model\":\"Entry\",\"identity\":{\"id\":\"one\"},\"state\":null}]}",
+      "wire": "{\"cursors\":{\"book\":{\"from\":0,\"to\":1,\"head\":1}},\"changes\":[{\"model\":\"Entry\",\"identity\":{\"id\":\"one\"},\"state\":null}]}",
       "valid": false
     },
     {
       "name": "stamp zero",
-      "wire": "{\"scope\":\"book\",\"fromCursor\":0,\"toCursor\":1,\"changes\":[{\"syncId\":1,\"model\":\"Entry\",\"identity\":{\"id\":\"one\"},\"stamp\":0,\"state\":null}]}",
+      "wire": "{\"cursors\":{\"book\":{\"from\":0,\"to\":1,\"head\":1}},\"changes\":[{\"model\":\"Entry\",\"identity\":{\"id\":\"one\"},\"stamp\":0,\"state\":null}]}",
       "valid": false
     },
     {
       "name": "stamp negative",
-      "wire": "{\"scope\":\"book\",\"fromCursor\":0,\"toCursor\":1,\"changes\":[{\"syncId\":1,\"model\":\"Entry\",\"identity\":{\"id\":\"one\"},\"stamp\":-1,\"state\":null}]}",
+      "wire": "{\"cursors\":{\"book\":{\"from\":0,\"to\":1,\"head\":1}},\"changes\":[{\"model\":\"Entry\",\"identity\":{\"id\":\"one\"},\"stamp\":-1,\"state\":null}]}",
       "valid": false
     },
     {
       "name": "stamp overflow",
-      "wire": "{\"scope\":\"book\",\"fromCursor\":0,\"toCursor\":1,\"changes\":[{\"syncId\":1,\"model\":\"Entry\",\"identity\":{\"id\":\"one\"},\"stamp\":9007199254740992,\"state\":null}]}",
+      "wire": "{\"cursors\":{\"book\":{\"from\":0,\"to\":1,\"head\":1}},\"changes\":[{\"model\":\"Entry\",\"identity\":{\"id\":\"one\"},\"stamp\":9007199254740992,\"state\":null}]}",
       "valid": false
     }
   ]

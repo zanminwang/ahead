@@ -35,7 +35,7 @@ Both examples open local storage. To start background sync, supply `server` as s
 | --- | --- | --- |
 | `path` | Yes | SQLite file to create or reopen. The application selects a writable directory. Use a separate file per signed-in user. |
 | `server` | No | Backend URL and credentials: `ServerOptions` in TypeScript, `SyncServer` in Dart. Ahead manages HTTP mutation submission, HTTP catch-up and WebSocket updates. |
-| `connection` (TypeScript) | No | `onError` and `refreshAuth` callbacks for the background connection. |
+| `connection` (TypeScript) | No | `onError` and `refreshAuth` callbacks for the background connection. `onError` also receives an `AheadReport` for each record Ahead could not apply ([Sync](sync.md#recover-from-connection-failures)). |
 | `onError`, `refreshAuth` (Dart) | No | The same callbacks, passed directly to `open`. |
 | `libraryPath` (Dart) | Outside iOS | Absolute native library path; iOS can use symbols linked into the process. |
 | `migration` | No | Defaults and optional cursor rewind for an explicitly changed schema. See [runtime migration](runtime.md#opening-and-schema-changes). |

@@ -34,7 +34,7 @@ Define your records and mutations once. Ahead generates typed client calls and b
 | --- | --- |
 | Client | TypeScript · Flutter |
 | Backend | TypeScript |
-| Backend database adapter | Prisma / PostgreSQL; custom [transactional adapters](backend/database.md) |
+| Backend database | [PostgreSQL](backend/database.md) through `pg`, Prisma or Drizzle; a two-method driver for other tools |
 
 The TypeScript client and backend currently run on Node.js. Clients use native Rust bindings; browser support is not implemented. See [platform validation](frontend/platforms.md) for tested environments and mobile setup.
 

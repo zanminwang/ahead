@@ -1,4 +1,4 @@
-//! The server's persistence, in memory. Mirrors packages/persistence-prisma/index.mts
+//! The server's persistence, in memory. Mirrors packages/postgres/src/persistence.mts
 //! closely enough that ahead_server cannot tell the difference: per-client receipts,
 //! per-channel heads, one invalidation row per (channel, record) carrying the latest
 //! cursor, and one stamp counter per record that only a business change advances.
@@ -63,6 +63,11 @@ struct State {
     fail_next: bool,
     break_next: bool,
     uppercase_next: bool,
+    /// Records whose next single-identity `load` throws (a batched load naming
+    /// one of them throws too, which is what makes the engine retry per identity).
+    fail_load: BTreeSet<String>,
+    /// Records whose next single-identity `load` is refused with `sim.refused`.
+    refuse_load: BTreeSet<String>,
     handler_calls: usize,
     accepted: usize,
     rejected: usize,
@@ -181,6 +186,16 @@ impl MemHost {
     /// "normalizing" a value, so the receipt's authority differs from the optimism.
     pub fn uppercase_next(&self) {
         self.0.lock().unwrap().uppercase_next = true;
+    }
+    /// The loader throws for `key` until it is asked for `key` alone: the
+    /// batched load fails, the engine retries per identity, and only this
+    /// record comes back as an error change.
+    pub fn fail_load_next(&self, key: &RecordKey) {
+        self.0.lock().unwrap().fail_load.insert(encoded(key));
+    }
+    /// Like [`fail_load_next`](Self::fail_load_next) with a refusal (`sim.refused`).
+    pub fn refuse_load_next(&self, key: &RecordKey) {
+        self.0.lock().unwrap().refuse_load.insert(encoded(key));
     }
     pub fn state(&self, key: &RecordKey) -> Option<Value> {
         self.0
@@ -711,6 +726,30 @@ impl Host for MemHost {
                 HostRequest::Load {
                     model, identities, ..
                 } => {
+                    // A record marked to fail makes every load naming it fail; the
+                    // mark is consumed by the single-identity retry, so exactly
+                    // that record ends as an error change.
+                    let keys: Vec<String> = identities
+                        .iter()
+                        .map(|identity| encoded(&key_of(&model, identity)))
+                        .collect();
+                    let single = keys.len() == 1;
+                    if let Some(k) = keys.iter().find(|k| s.fail_load.contains(*k)).cloned() {
+                        if single {
+                            s.fail_load.remove(&k);
+                        }
+                        return Ok(response!(Loaded::Failed {
+                            error: "sim load failure".into()
+                        }));
+                    }
+                    if let Some(k) = keys.iter().find(|k| s.refuse_load.contains(*k)).cloned() {
+                        if single {
+                            s.refuse_load.remove(&k);
+                        }
+                        return Ok(response!(Loaded::Refused {
+                            rejection: "sim.refused".into()
+                        }));
+                    }
                     // Loads name no channel: the record exists or it does not, for
                     // every delivery path alike.
                     let rows: Vec<Option<Value>> = identities
@@ -751,9 +790,7 @@ mod tests {
 
     fn pull(host: &MemHost, channel: &str, from: u64) -> PullPage {
         let req = PullRequest {
-            channel: channel.into(),
-            client_id: "c1".into(),
-            from_cursor: from,
+            cursors: BTreeMap::from([(channel.to_string(), from)]),
             models: schema::declared_models(),
         }
         .encode()
@@ -802,7 +839,7 @@ mod tests {
         assert_eq!(page.changes.len(), 1);
         assert_eq!(page.changes[0].stamp, 1);
         assert_eq!(page.changes[0].state["text"], "hi");
-        assert_eq!(page.to_cursor, 1);
+        assert_eq!(page.cursors["b"].to, 1);
     }
 
     #[test]
@@ -842,7 +879,7 @@ mod tests {
             "the row's stamp is the record's now"
         );
         assert_eq!(page.changes[0].state["text"], "v2");
-        assert_eq!(page.changes[0].cursor, 1, "the cursor is the row's own");
+        assert_eq!(page.cursors["a"].to, 1, "the cursor is the row's own");
         host.ensure_publish(&entry_key("e1"), "c");
         assert_eq!(
             host.stamp(&entry_key("e1")),

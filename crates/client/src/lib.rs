@@ -97,13 +97,76 @@ pub enum Readiness {
     Ready,
     Failed,
 }
+/// Why one record or one queued mutation could not be applied as delivered.
+/// Every kind leaves the client consistent; the report is for the application
+/// ([#51](https://github.com/zanminwang/ahead/issues/51),
+/// [#122](https://github.com/zanminwang/ahead/issues/122)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReportKind {
+    /// The server could not read the record: the change carried `error`
+    /// instead of a state. Local content and stamp are kept.
+    ReadFailed,
+    /// The delivered state does not fit this client's schema. Nothing written.
+    Skipped,
+    /// The same stamp with different content. Nothing written.
+    Conflict,
+    /// A queued operation no longer replays over the new base: the base is
+    /// visible and the mutation is still sent (`ordinal`).
+    Diverged,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Report {
+    pub kind: ReportKind,
+    pub model: String,
+    pub identity: Value,
+    pub stamp: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinal: Option<u64>,
+    #[serde(default)]
+    pub detail: Value,
+}
+impl Report {
+    pub(crate) fn new(kind: ReportKind, model: &str, identity: &Value, stamp: u64) -> Self {
+        Self {
+            kind,
+            model: model.to_string(),
+            identity: identity.clone(),
+            stamp,
+            code: None,
+            ordinal: None,
+            detail: Value::Null,
+        }
+    }
+}
+/// What applying a receipt or a page came to. `cursors` are the channel
+/// cursors the page moved, at their new values.
 #[derive(Debug, Default, Serialize)]
 pub struct ApplyReport {
     pub applied: usize,
-    pub skipped: usize,
     pub stale: bool,
-    pub conflicts: usize,
-    pub diagnostics: Vec<Value>,
+    pub cursors: BTreeMap<String, u64>,
+    pub reports: Vec<Report>,
+}
+impl ApplyReport {
+    pub fn count(&self, kind: ReportKind) -> usize {
+        self.reports.iter().filter(|r| r.kind == kind).count()
+    }
+    pub fn skipped(&self) -> usize {
+        self.count(ReportKind::Skipped)
+    }
+    pub fn conflicts(&self) -> usize {
+        self.count(ReportKind::Conflict)
+    }
+    pub fn diverged(&self) -> usize {
+        self.count(ReportKind::Diverged)
+    }
+    pub fn read_failed(&self) -> usize {
+        self.count(ReportKind::ReadFailed)
+    }
 }
 
 /// A transaction the host holds open across calls, with its own savepoint stack.
@@ -170,9 +233,10 @@ const SUBSCRIPTION_MARK: &str = "ahead_subscription:";
 
 /// In-memory memory of the pulls this client issued and of how many times each
 /// channel's subscription changed since open. A page whose request predates the
-/// channel's current subscription is stale, not a gap: the resubscribe reset the
-/// cursor, and the next pull from that cursor delivers everything. Nothing here
-/// is durable; a process restart cannot have a request in flight.
+/// current subscription of any channel it names is stale, not a gap: the
+/// resubscribe reset the cursor, and the next pull from that cursor delivers
+/// everything. Nothing here is durable; a process restart cannot have a
+/// request in flight.
 #[derive(Default)]
 struct PullLedger {
     epochs: BTreeMap<String, u64>,
@@ -181,10 +245,11 @@ struct PullLedger {
     /// session compares it with the value it started under.
     generation: u64,
 }
+/// One request: the cursor it asked from on every channel, and the epoch each
+/// channel's subscription was at.
 struct IssuedPull {
-    channel: String,
-    from_cursor: u64,
-    epoch: u64,
+    cursors: BTreeMap<String, u64>,
+    epochs: BTreeMap<String, u64>,
 }
 impl PullLedger {
     const CAPACITY: usize = 1024;
@@ -207,36 +272,39 @@ impl PullLedger {
             self.generation += 1;
         }
     }
-    fn issue(&mut self, channel: &str, from_cursor: u64) {
+    fn issue(&mut self, cursors: &BTreeMap<String, u64>) {
         if self.issued.len() == Self::CAPACITY {
             self.issued.pop_front();
         }
+        let epochs = cursors.keys().map(|c| (c.clone(), self.epoch(c))).collect();
         self.issued.push_back(IssuedPull {
-            channel: channel.to_string(),
-            from_cursor,
-            epoch: self.epoch(channel),
+            cursors: cursors.clone(),
+            epochs,
         });
     }
-    /// Whether the page answering `(channel, from_cursor)` was requested under an
-    /// earlier subscription of the channel. Consumes the matching request. A page
-    /// this client never requested is not judged here.
-    fn stale(&mut self, channel: &str, from_cursor: u64) -> bool {
-        let current = self.epoch(channel);
-        let matches = |p: &IssuedPull| p.channel == channel && p.from_cursor == from_cursor;
+    fn current_epochs(&self, cursors: &BTreeMap<String, u64>) -> BTreeMap<String, u64> {
+        cursors.keys().map(|c| (c.clone(), self.epoch(c))).collect()
+    }
+    /// Whether the page answering a request from `cursors` was requested under
+    /// an earlier subscription of one of its channels. Consumes the matching
+    /// request. A page this client never requested is not judged here.
+    fn stale(&mut self, cursors: &BTreeMap<String, u64>) -> bool {
+        let current = self.current_epochs(cursors);
+        let matches = |p: &IssuedPull| p.cursors == *cursors;
         if let Some(i) = self
             .issued
             .iter()
-            .position(|p| matches(p) && p.epoch == current)
+            .position(|p| matches(p) && p.epochs == current)
         {
             self.issued.remove(i);
-            // The wire identifies requests only by channel and cursor. If old and
-            // current subscriptions issued the same request, this response could
-            // belong to either one. Let every indistinguishable answer use the
-            // cursor gate; otherwise the fresh answer can be dropped as stale
+            // The wire identifies requests only by channels and cursors. If old
+            // and current subscriptions issued the same request, this response
+            // could belong to either one. Let every indistinguishable answer use
+            // the cursor gate; otherwise the fresh answer can be dropped as stale
             // when the old answer arrives first. Retain the entries so another
             // subscription change can still make the outstanding answers stale.
             for pull in self.issued.iter_mut().filter(|p| matches(p)) {
-                pull.epoch = current;
+                pull.epochs = current.clone();
             }
             return false;
         }
@@ -260,6 +328,7 @@ impl<S: ClientStore> Client<S> {
             )));
         }
         store.execute_batch(ddl::FRAMEWORK_DDL)?;
+        ddl::add_framework_columns(&mut store)?;
         store.begin()?;
         let opened = (|| {
             ddl::reconcile(&mut store, &schema)?;
@@ -879,7 +948,7 @@ impl<S: ClientStore> Client<S> {
                         }
                     })
                     .collect();
-                pending.push(json!({"ordinal":q.ordinal,"name":q.mutation.name,"phase":phase,"prerequisites":prerequisites}));
+                pending.push(json!({"ordinal":q.ordinal,"name":q.mutation.name,"phase":phase,"diverged":q.diverged,"prerequisites":prerequisites}));
             }
             let rejections: Vec<Value> = e
                 .rejection_details()?

@@ -201,3 +201,44 @@ fn a_database_from_the_checkpoint_era_is_refused_untouched() {
     drop(ahead_client::Client::open(SqliteStore::open(&fresh).unwrap(), entry.clone()).unwrap());
     ahead_client::Client::open(SqliteStore::open(&fresh).unwrap(), entry).unwrap();
 }
+
+/// A database from before the divergence column ([#122](https://github.com/zanminwang/ahead/issues/122))
+/// gets the column in place: its queued work stays and is still sendable.
+#[test]
+fn a_queue_without_the_divergence_column_gains_it_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let entry: Schema = Schema::from_value(
+        serde_json::from_str(include_str!("../../../fixtures/schemas/entry.json")).unwrap(),
+    )
+    .unwrap();
+    {
+        let mut c =
+            ahead_client::Client::open(SqliteStore::open(&path).unwrap(), entry.clone()).unwrap();
+        c.transaction(|tx| {
+            tx.enqueue(ahead_client::Mutation::new(
+                "Create",
+                vec![ahead_client::Operation {
+                    model: "Entry".into(),
+                    op: ahead_client::OperationKind::Create,
+                    identity: json!({"id":"e"}),
+                    values: Some(json!({"text":"queued","note":null})),
+                }],
+            ))
+        })
+        .unwrap();
+    }
+    SqliteStore::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE ahead_mutation DROP COLUMN diverged")
+        .unwrap();
+    let mut c = ahead_client::Client::open(SqliteStore::open(&path).unwrap(), entry).unwrap();
+    assert_eq!(c.pending_count().unwrap(), 1, "the queued mutation is kept");
+    assert!(c.freeze().unwrap().is_some(), "and it is still sent");
+    let mut s = SqliteStore::open(&path).unwrap();
+    assert!(
+        columns(&mut s, "ahead_mutation")
+            .iter()
+            .any(|(name, _, _)| name == "diverged")
+    );
+}

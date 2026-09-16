@@ -1,7 +1,7 @@
 import { PrismaClient, type Prisma } from "@prisma/client";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { prisma } from "../../../../packages/persistence-prisma/index.mts";
+import { prisma } from "../../../../packages/postgres/index.mts";
 import {
   createBackend,
   devAuth,
@@ -51,7 +51,7 @@ export async function createExample() {
     },
     async initialize() {
       const migration = await readFile(
-        new URL("../../../../packages/persistence-prisma/migration.sql", import.meta.url),
+        new URL("../../../../packages/postgres/migration.sql", import.meta.url),
         "utf8",
       );
       for (const sql of migration.split(";").map((s) => s.trim()).filter(Boolean))
@@ -59,16 +59,14 @@ export async function createExample() {
       await db.$executeRawUnsafe(
         'CREATE TABLE IF NOT EXISTS "Entry" (id TEXT PRIMARY KEY,text TEXT NOT NULL,note TEXT)',
       );
-      await backend.transaction(async ({ tx, notify }) => {
+      await backend.transaction(async ({ tx, changes, publish }) => {
         await tx.entry.upsert({
           where: { id: "entry-1" },
           create: { id: "entry-1", text: "Hello from the server" },
           update: {},
         });
-        await notify({
-          channel: "book:demo",
-          records: [{ model: "Entry", identity: { id: "entry-1" } }],
-        });
+        changes.add({ model: "Entry", identity: { id: "entry-1" } });
+        publish({ channel: "book:demo" });
       });
     },
     listen(port: number) {
