@@ -7,6 +7,34 @@ import {
   type Transport,
 } from "./connection.mts";
 export type { Connection, ConnectionOptions } from "./connection.mts";
+/** A rejection retained in the local inbox until dismissed. */
+export type Rejection = {
+  ordinal: number;
+  code: string;
+  [key: string]: unknown;
+};
+/** One queued mutation touching a record. `diverged` is set when its edit could not be replayed over newer authority. */
+export type PendingMutation<Name extends string = string> = {
+  ordinal: number;
+  name: Name;
+  phase: "queued" | "frozen";
+  prerequisites: { key: string; state: "ready" | "pending" | "failed" }[];
+  diverged?: boolean;
+};
+/** One record's sync state: what is still pending for it and what was rejected. */
+export type ModelSyncState<Name extends string = string> = {
+  pending: PendingMutation<Name>[];
+  rejections: Rejection[];
+};
+/** The whole client's sync state: a local snapshot, not a network probe. */
+export type ClientSyncState = {
+  clientId: string;
+  pending: number;
+  beforeImages: number;
+  cursors: Record<string, number>;
+  channels: string[];
+  rejections: Rejection[];
+};
 import { strictJson, type QuerySpec, type RecordValue } from "./values.mts";
 import type { ServerOptions, ServerConnection } from "./live.mts";
 import { Events } from "./events.mts";
@@ -315,13 +343,15 @@ export function createClient<
     applyPull(page: object) {
       return this.#exclusive(() => this.#send({ op: "pull", page }));
     }
-    recordStatus(model: string, identity: object) {
+    /** The client's sync state, or one record's when `model` and `identity` are given. */
+    syncState(): Promise<ClientSyncState>;
+    syncState(model: string, identity: object): Promise<ModelSyncState>;
+    syncState(model?: string, identity?: object) {
       return this.#exclusive(() =>
-        this.#send({ op: "recordStatus", key: { model, identity } }),
+        model === undefined
+          ? this.#send({ op: "status" })
+          : this.#send({ op: "recordStatus", key: { model, identity } }),
       );
-    }
-    status() {
-      return this.#exclusive(() => this.#send({ op: "status" }));
     }
     pendingTasks(): Promise<RecordValue[]> {
       return this.#exclusive(() => this.#send({ op: "tasks" }));

@@ -212,7 +212,7 @@ test('pause cancels held catch-up and a late HTTP token cannot start a request',
  try{
   await fixture.client.subscribe('scope');const connection=await fixture.client.connect({...network.config,token:()=>++calls===1?'secret':(called.resolve(),token.promise)});
   await timeout(called.promise);await timeout(connection.pause());token.resolve('late');await new Promise(r=>setTimeout(r,30));
-  assert.equal(network.requests.length,0);assert.equal((await fixture.client.status()).cursors.scope??0,0);
+  assert.equal(network.requests.length,0);assert.equal((await fixture.client.syncState()).cursors.scope??0,0);
   await connection.resume();await until(()=>network.requests.length===1);
  }finally{token.resolve('late');await fixture.close();await network.close();}
 });
@@ -222,12 +222,12 @@ test('one incoming page path covers duplicates, applies overlap directly and rec
  const network=await syncFixture((b,res)=>res.end(JSON.stringify({...page(`HTTP ${head}`,b.fromCursor),toCursor:head,changes:[{...page(`HTTP ${head}`,head-1).changes[0]}]})));
  try{
   await fixture.client.subscribe('scope');await fixture.client.connect(network.config);
-  await until(async()=>(await fixture.client.status()).cursors.scope===1);
+  await until(async()=>(await fixture.client.syncState()).cursors.scope===1);
   network.sockets[0].send(JSON.stringify(page('duplicate')));await new Promise(r=>setTimeout(r,20));assert.equal(network.requests.length,1);
   head=2;network.sockets[0].send(JSON.stringify({...page('overlap'),toCursor:2,changes:[page('overlap',1).changes[0]]}));
-  await until(async()=>(await fixture.client.status()).cursors.scope===2);assert.equal(network.requests.length,1,'overlap must not issue another HTTP pull');assert.equal((await fixture.client.read('Entry',{id:'live'})).text,'overlap');
+  await until(async()=>(await fixture.client.syncState()).cursors.scope===2);assert.equal(network.requests.length,1,'overlap must not issue another HTTP pull');assert.equal((await fixture.client.read('Entry',{id:'live'})).text,'overlap');
   head=4;network.sockets[0].send(JSON.stringify(page('gap',3)));
-  await until(async()=>(await fixture.client.status()).cursors.scope===4);assert.equal(network.requests.at(-1).body.fromCursor,2);assert.equal((await fixture.client.read('Entry',{id:'live'})).text,'HTTP 4');
+  await until(async()=>(await fixture.client.syncState()).cursors.scope===4);assert.equal(network.requests.at(-1).body.fromCursor,2);assert.equal((await fixture.client.read('Entry',{id:'live'})).text,'HTTP 4');
  }finally{await fixture.close();await network.close();}
 });
 
@@ -247,7 +247,7 @@ test('a reusable server config isolates cancellation and no-channel clients only
   const ca=await a.client.connect(network.config);await b.client.subscribe('scope');const cb=await b.client.connect(network.config);
   await until(async()=>(await b.client.read('Entry',{id:'live'}))?.text==='shared');assert.equal(network.sockets.length,1);
   await a.client.mutate({name:'Create',operations:[{model:'Entry',op:'create',identity:{id:'local'},values:{text:'  push without channels  ',note:null}}]});
-  await until(async()=>(await a.client.status()).pending===0);assert.equal(network.requests.filter(r=>r.url==='/sync/mutations').length,1);assert.equal(network.sockets.length,1);
+  await until(async()=>(await a.client.syncState()).pending===0);assert.equal(network.requests.filter(r=>r.url==='/sync/mutations').length,1);assert.equal(network.sockets.length,1);
   assert.equal((await a.client.read('Entry',{id:'local'})).text,'push without channels','the receipt alone completes the batch and the row shows the server-returned state; no channel is involved');
   assert.deepEqual(network.requests.find(r=>r.url==='/sync/mutations').body.models,{Entry:1},'the push declares the read contracts its receipt is served at');
   await ca.close();network.sockets[0].send(JSON.stringify(page('still connected',1)));
@@ -279,7 +279,7 @@ test('bounded receive overflow preserves in-flight HTTP progress and recovers th
  try{
   await fixture.client.subscribe('scope');await fixture.client.connect(network.config);await timeout(entered.promise);
   const socket=network.sockets[0];socket._socket.cork();for(let cursor=1;cursor<=200;cursor++)socket.send(JSON.stringify(page(`live ${cursor}`,cursor)));socket._socket.uncork();
-  head=201;gate.resolve();await until(async()=>(await fixture.client.status()).cursors.scope===201);
+  head=201;gate.resolve();await until(async()=>(await fixture.client.syncState()).cursors.scope===201);
   assert.equal(network.sockets.length,1,'overflow must not restart and starve HTTP catch-up');
   assert.ok(network.requests.length<=4,'bounded queue coalesces recovery work');
  }finally{gate.resolve();await fixture.close();await network.close();}
@@ -303,7 +303,7 @@ test('push completes from its receipt while the WebSocket upgrade is refused; HT
   await client.connect({url:`http://127.0.0.1:${server.address().port}`,token:'secret'},{onError:e=>errors.push(e)});
   await until(()=>pushes===1&&upgradeAttempts>=2);
   assert.equal(pulls,0,'no HTTP catch-up runs without an acknowledged WebSocket: there is no polling fallback');
-  await until(async()=>(await client.status()).pending===0);
+  await until(async()=>(await client.syncState()).pending===0);
   assert.equal(pulls,0,'the batch completed from its receipt alone: no page was delivered');
   assert.equal((await client.read('Entry',{id:'live'})).text,'edited offline','the row shows the server-returned state as soon as the response is applied');
   assert.ok(errors.some(e=>/live failed: 503/.test(String(e.message))),`upgrade refusals reach onError: ${errors.map(e=>e.message)}`);
@@ -311,7 +311,7 @@ test('push completes from its receipt while the WebSocket upgrade is refused; HT
   await until(async()=>(await client.read('Entry',{id:'live'})).text==='from catch-up');
   assert.equal(pushes,1,'the receipt was not re-requested');
   assert.ok(pulls>=1,'catch-up ran over HTTP once the upgrade was acknowledged');
-  assert.equal((await client.status()).pending,0);
+  assert.equal((await client.syncState()).pending,0);
  }finally{await fixture.close();for(const s of ws.clients)s.terminate();await new Promise(r=>ws.close(r));await new Promise(r=>server.close(r));}
 });
 test('a 401 on both lanes at once shares one refreshAuth; both lanes recover with the new token',async()=>{
@@ -336,7 +336,7 @@ test('a 401 on both lanes at once shares one refreshAuth; both lanes recover wit
   assert.equal(refreshes,1,'the second lane joined the pending refresh instead of starting another');
   release();
   await until(()=>accepted>=1&&pushes>=1);
-  await until(async()=>(await client.status()).pending===0);
+  await until(async()=>(await client.syncState()).pending===0);
   assert.equal((await client.read('Entry',{id:'live'})).text,'edited offline','the receipt completed the batch without any page');
   assert.equal(refreshes,1,'no further refresh once the token is valid');
   assert.equal(unauthorized,2);
@@ -373,11 +373,11 @@ test('an owner-mismatch refusal reaches onError and leaves the batch frozen for 
  await new Promise(r=>server.listen(0,'127.0.0.1',r));
  try{
   await client.mutate({name:'Create',operations:[{model:'Entry',op:'create',identity:{id:'live'},values:{text:'local',note:null}}]});
-  assert.equal((await client.status()).pending,1);
+  assert.equal((await client.syncState()).pending,1);
   await client.connect({url:`http://127.0.0.1:${server.address().port}`,token:'secret'},{onError:e=>errors.push(e)});
   await until(()=>bodies.length>=2,'the frozen batch is resent after the refusal');
   assert.ok(errors.some(e=>/client\.owner_mismatch/.test(String(e.message))),`the refusal's code reaches onError: ${errors.map(e=>e.message)}`);
-  assert.equal((await client.status()).pending,1,'the refused batch stays pending, not dropped or completed');
+  assert.equal((await client.syncState()).pending,1,'the refused batch stays pending, not dropped or completed');
   assert.deepEqual(bodies[1],bodies[0],'the same request body is resent on the next cycle');
  }finally{await fixture.close();await new Promise(r=>server.close(r));}
 });

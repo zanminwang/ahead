@@ -57,7 +57,7 @@ test('mobile transport authenticates real HTTP/WS and streams without polling',a
     peer.send(JSON.stringify(change));
     await new Promise(r=>setTimeout(r,100));
     assert.equal(requests.length,1,'ordinary/duplicate live pages must not issue pull requests');
-    assert.equal((await client.status()).cursors.scope,1);
+    assert.equal((await client.syncState()).cursors.scope,1);
     await client.close();
     const before=requests.length;
     await new Promise(r=>setTimeout(r,50));

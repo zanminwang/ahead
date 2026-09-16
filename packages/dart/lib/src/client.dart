@@ -54,7 +54,7 @@ void _nativeWorker(List<Object?> args) {
 }
 
 /// Typed generated model APIs delegate to this generic native client.
-class Client implements ReadPort {
+class Client implements ReadPort, MutatePort {
   final SendPort _worker;
   final Isolate _isolate;
   final int _handle;
@@ -405,7 +405,9 @@ class Client implements ReadPort {
         () async =>
             (await _send({'op': 'pull', 'page': page})) as Map<String, dynamic>,
       );
-  Future<Map<String, dynamic>> recordStatus(
+
+  /// One record's sync state: its pending mutations and retained rejections.
+  Future<Map<String, dynamic>> recordSyncState(
     String model,
     Map<String, dynamic> identity,
   ) => _exclusive(
@@ -416,7 +418,9 @@ class Client implements ReadPort {
             })
             as Map<String, dynamic>,
   );
-  Future<Map<String, dynamic>> status() => _exclusive(
+
+  /// The client's sync state: a local snapshot, not a network probe.
+  Future<Map<String, dynamic>> syncState() => _exclusive(
     () async => (await _send({'op': 'status'})) as Map<String, dynamic>,
   );
   Future<List<Map<String, dynamic>>> pendingTasks() => _exclusive(
