@@ -22,9 +22,9 @@ import {Client} from '../../packages/client-js/index.mts';
 // cannot pass by agreeing with the other one.
 const INITIAL='Hello from the server';
 async function reseed(app){
- await app.backend.transaction(async({tx,notify})=>{
+ await app.backend.transaction(async({tx,changes,publish})=>{
   await tx.entry.update({where:{id:'entry-1'},data:{text:INITIAL}});
-  await notify({channel:'book:demo',records:[{model:'Entry',identity:{id:'entry-1'}}]});
+  changes.add({model:'Entry',identity:{id:'entry-1'}});publish({channel:'book:demo'});
  });
  assert.equal((await app.db.entry.findUnique({where:{id:'entry-1'}})).text,INITIAL);
 }

@@ -12,6 +12,7 @@ mod push;
 pub mod query;
 pub mod queue;
 pub mod rows;
+pub mod schema_store;
 pub mod store;
 pub mod transport;
 
@@ -96,13 +97,76 @@ pub enum Readiness {
     Ready,
     Failed,
 }
+/// Why one record or one queued mutation could not be applied as delivered.
+/// Every kind leaves the client consistent; the report is for the application
+/// ([#51](https://github.com/zanminwang/ahead/issues/51),
+/// [#122](https://github.com/zanminwang/ahead/issues/122)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReportKind {
+    /// The server could not read the record: the change carried `error`
+    /// instead of a state. Local content and stamp are kept.
+    ReadFailed,
+    /// The delivered state does not fit this client's schema. Nothing written.
+    Skipped,
+    /// The same stamp with different content. Nothing written.
+    Conflict,
+    /// A queued operation no longer replays over the new base: the base is
+    /// visible and the mutation is still sent (`ordinal`).
+    Diverged,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Report {
+    pub kind: ReportKind,
+    pub model: String,
+    pub identity: Value,
+    pub stamp: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinal: Option<u64>,
+    #[serde(default)]
+    pub detail: Value,
+}
+impl Report {
+    pub(crate) fn new(kind: ReportKind, model: &str, identity: &Value, stamp: u64) -> Self {
+        Self {
+            kind,
+            model: model.to_string(),
+            identity: identity.clone(),
+            stamp,
+            code: None,
+            ordinal: None,
+            detail: Value::Null,
+        }
+    }
+}
+/// What applying a receipt or a page came to. `cursors` are the channel
+/// cursors the page moved, at their new values.
 #[derive(Debug, Default, Serialize)]
 pub struct ApplyReport {
     pub applied: usize,
-    pub skipped: usize,
     pub stale: bool,
-    pub conflicts: usize,
-    pub diagnostics: Vec<Value>,
+    pub cursors: BTreeMap<String, u64>,
+    pub reports: Vec<Report>,
+}
+impl ApplyReport {
+    pub fn count(&self, kind: ReportKind) -> usize {
+        self.reports.iter().filter(|r| r.kind == kind).count()
+    }
+    pub fn skipped(&self) -> usize {
+        self.count(ReportKind::Skipped)
+    }
+    pub fn conflicts(&self) -> usize {
+        self.count(ReportKind::Conflict)
+    }
+    pub fn diverged(&self) -> usize {
+        self.count(ReportKind::Diverged)
+    }
+    pub fn read_failed(&self) -> usize {
+        self.count(ReportKind::ReadFailed)
+    }
 }
 
 /// A transaction the host holds open across calls, with its own savepoint stack.
@@ -121,6 +185,46 @@ pub struct Client<S: ClientStore> {
     session: Option<Session>,
     last_changed: BTreeSet<String>,
     pulls: PullLedger,
+    schema_state: SchemaState,
+    origin: Option<Origin<S>>,
+}
+
+/// Where a client opened through [`Client::open_at`] came from: the path the
+/// application named, how to open a store at a file, and the schema it asked
+/// for (which may differ from the one in use while an old file is pending).
+struct Origin<S> {
+    path: std::path::PathBuf,
+    factory: StoreFactory<S>,
+    target: Schema,
+}
+
+/// Opens a store at a file; how [`Client::open_at`] reaches storage.
+pub type StoreFactory<S> = Box<dyn Fn(&std::path::Path) -> Result<S> + Send + Sync>;
+
+/// What the schema check found at open ([Reconciliation](../../docs/engineering/architecture/client/storage/reconciliation.md)).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SchemaState {
+    /// This open created a fresh file beside an incompatible one.
+    pub rebuilt: bool,
+    /// The incompatible file is still in use because it holds unsent work.
+    pub pending: Option<PendingRebuild>,
+    /// What the last rebuild left behind.
+    pub last_rebuild: Option<RebuildReport>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingRebuild {
+    pub old_file: String,
+    pub reason: String,
+    pub pending: usize,
+    pub direct: usize,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RebuildReport {
+    pub old_file: String,
+    pub new_file: String,
+    pub reason: String,
+    pub left_pending: usize,
+    pub left_direct: usize,
 }
 
 /// Marker a transaction leaves in its changed set when it subscribes or
@@ -129,9 +233,10 @@ const SUBSCRIPTION_MARK: &str = "ahead_subscription:";
 
 /// In-memory memory of the pulls this client issued and of how many times each
 /// channel's subscription changed since open. A page whose request predates the
-/// channel's current subscription is stale, not a gap: the resubscribe reset the
-/// cursor, and the next pull from that cursor delivers everything. Nothing here
-/// is durable; a process restart cannot have a request in flight.
+/// current subscription of any channel it names is stale, not a gap: the
+/// resubscribe reset the cursor, and the next pull from that cursor delivers
+/// everything. Nothing here is durable; a process restart cannot have a
+/// request in flight.
 #[derive(Default)]
 struct PullLedger {
     epochs: BTreeMap<String, u64>,
@@ -140,10 +245,11 @@ struct PullLedger {
     /// session compares it with the value it started under.
     generation: u64,
 }
+/// One request: the cursor it asked from on every channel, and the epoch each
+/// channel's subscription was at.
 struct IssuedPull {
-    channel: String,
-    from_cursor: u64,
-    epoch: u64,
+    cursors: BTreeMap<String, u64>,
+    epochs: BTreeMap<String, u64>,
 }
 impl PullLedger {
     const CAPACITY: usize = 1024;
@@ -166,36 +272,39 @@ impl PullLedger {
             self.generation += 1;
         }
     }
-    fn issue(&mut self, channel: &str, from_cursor: u64) {
+    fn issue(&mut self, cursors: &BTreeMap<String, u64>) {
         if self.issued.len() == Self::CAPACITY {
             self.issued.pop_front();
         }
+        let epochs = cursors.keys().map(|c| (c.clone(), self.epoch(c))).collect();
         self.issued.push_back(IssuedPull {
-            channel: channel.to_string(),
-            from_cursor,
-            epoch: self.epoch(channel),
+            cursors: cursors.clone(),
+            epochs,
         });
     }
-    /// Whether the page answering `(channel, from_cursor)` was requested under an
-    /// earlier subscription of the channel. Consumes the matching request. A page
-    /// this client never requested is not judged here.
-    fn stale(&mut self, channel: &str, from_cursor: u64) -> bool {
-        let current = self.epoch(channel);
-        let matches = |p: &IssuedPull| p.channel == channel && p.from_cursor == from_cursor;
+    fn current_epochs(&self, cursors: &BTreeMap<String, u64>) -> BTreeMap<String, u64> {
+        cursors.keys().map(|c| (c.clone(), self.epoch(c))).collect()
+    }
+    /// Whether the page answering a request from `cursors` was requested under
+    /// an earlier subscription of one of its channels. Consumes the matching
+    /// request. A page this client never requested is not judged here.
+    fn stale(&mut self, cursors: &BTreeMap<String, u64>) -> bool {
+        let current = self.current_epochs(cursors);
+        let matches = |p: &IssuedPull| p.cursors == *cursors;
         if let Some(i) = self
             .issued
             .iter()
-            .position(|p| matches(p) && p.epoch == current)
+            .position(|p| matches(p) && p.epochs == current)
         {
             self.issued.remove(i);
-            // The wire identifies requests only by channel and cursor. If old and
-            // current subscriptions issued the same request, this response could
-            // belong to either one. Let every indistinguishable answer use the
-            // cursor gate; otherwise the fresh answer can be dropped as stale
+            // The wire identifies requests only by channels and cursors. If old
+            // and current subscriptions issued the same request, this response
+            // could belong to either one. Let every indistinguishable answer use
+            // the cursor gate; otherwise the fresh answer can be dropped as stale
             // when the old answer arrives first. Retain the entries so another
             // subscription change can still make the outstanding answers stale.
             for pull in self.issued.iter_mut().filter(|p| matches(p)) {
-                pull.epoch = current;
+                pull.epochs = current.clone();
             }
             return false;
         }
@@ -208,14 +317,22 @@ impl PullLedger {
 }
 
 impl<S: ClientStore> Client<S> {
+    /// Open `store` for `schema`. An earlier framework layout is refused: file
+    /// selection and rebuilding belong to [`Client::open_at`]. The schema the
+    /// store is built for is recorded (or replaced) once reconciliation succeeds.
     pub fn open(mut store: S, schema: Schema) -> Result<Self> {
         schema.validate()?;
-        // An earlier layout is refused before any statement runs against it.
-        ddl::check_layout(&mut store)?;
+        if let ddl::Layout::Legacy(what) = ddl::check_layout(&mut store)? {
+            return Err(invalid(format!(
+                "this database was created by an earlier Ahead runtime ({what}); open it through a path so it can be rebuilt beside"
+            )));
+        }
         store.execute_batch(ddl::FRAMEWORK_DDL)?;
+        ddl::add_framework_columns(&mut store)?;
         store.begin()?;
         let opened = (|| {
             ddl::reconcile(&mut store, &schema)?;
+            schema_store::write_descriptor(&mut store, &schema)?;
             let row = store.query("SELECT client_id, generation FROM ahead_client", &[])?;
             let (client_id, generation) = match row.rows.first() {
                 Some(r) => (
@@ -238,6 +355,15 @@ impl<S: ClientStore> Client<S> {
             }
         };
         store.commit()?;
+        // Reconciliation may have altered tables on the writing connection;
+        // a committed read makes every connection load the new schema before
+        // the first statement is prepared against it.
+        for model in &schema.models {
+            store.query_committed(
+                &format!("SELECT 1 FROM {} LIMIT 0", ddl::quote(&model.name)),
+                &[],
+            )?;
+        }
         Ok(Self {
             store,
             schema,
@@ -247,7 +373,181 @@ impl<S: ClientStore> Client<S> {
             session: None,
             last_changed: BTreeSet::new(),
             pulls: PullLedger::default(),
+            schema_state: SchemaState::default(),
+            origin: None,
         })
+    }
+    /// Open the database the application names by `path`, choosing the file
+    /// through the sidecar and the schema check: identical or compatible →
+    /// the current file; incompatible or an earlier layout → a fresh file
+    /// beside it, unless the old file holds unsent work and `discard_pending`
+    /// is false, in which case the old file opens with its own schema so the
+    /// work can be sent first ([`SchemaState::pending`]).
+    pub fn open_at(
+        path: impl AsRef<std::path::Path>,
+        schema: Schema,
+        factory: StoreFactory<S>,
+        discard_pending: bool,
+    ) -> Result<Self>
+    where
+        S: 'static,
+    {
+        schema.validate()?;
+        let path = path.as_ref().to_path_buf();
+        let file = schema_store::current_file(&path);
+        let mut store = factory(&file)?;
+        let mut client = match ddl::check_layout(&mut store)? {
+            ddl::Layout::Fresh => Self::open(store, schema.clone())?,
+            ddl::Layout::Legacy(what) => {
+                let pending = count_rows(&mut store, "ahead_mutation").unwrap_or(0);
+                drop(store);
+                Self::rebuild_beside(&path, &factory, &file, &schema, &what, pending, 0)?
+            }
+            ddl::Layout::Current => {
+                store.execute_batch(ddl::FRAMEWORK_DDL)?;
+                match schema_store::read_descriptor(&mut store)? {
+                    // A database from before descriptors were stored: only its
+                    // tables can say whether it fits. Any other open failure is
+                    // an error, never a reason to switch files.
+                    None => match ddl::incompatibility(&mut store, &schema)? {
+                        None => Self::open(store, schema.clone())?,
+                        Some(reason) => {
+                            let pending = count_rows(&mut store, "ahead_mutation")?;
+                            drop(store);
+                            Self::rebuild_beside(
+                                &path, &factory, &file, &schema, &reason, pending, 0,
+                            )?
+                        }
+                    },
+                    Some(stored) => match Schema::compatibility(&stored, &schema) {
+                        Compatibility::Identical | Compatibility::Additive(_) => {
+                            Self::open(store, schema.clone())?
+                        }
+                        Compatibility::Incompatible(reason) => {
+                            let pending = count_rows(&mut store, "ahead_mutation")?;
+                            let direct = count_direct(&mut store, &stored)?;
+                            if pending > 0 && !discard_pending {
+                                let mut client = Self::open(store, stored)?;
+                                client.schema_state.pending = Some(PendingRebuild {
+                                    old_file: file.to_string_lossy().into_owned(),
+                                    reason,
+                                    pending,
+                                    direct,
+                                });
+                                client
+                            } else {
+                                drop(store);
+                                Self::rebuild_beside(
+                                    &path, &factory, &file, &schema, &reason, pending, direct,
+                                )?
+                            }
+                        }
+                    },
+                }
+            }
+        };
+        client.origin = Some(Origin {
+            path,
+            factory,
+            target: schema,
+        });
+        Ok(client)
+    }
+    /// Create `<path>.<n>`, initialise it for `schema`, carry the old file's
+    /// subscriptions over at cursor 0, and point the sidecar at it. Files are
+    /// numbered upward: a numbered file above the one in use was never pointed
+    /// at (an interrupted rebuild) and is removed; the file in use and every
+    /// earlier generation are kept.
+    fn rebuild_beside(
+        path: &std::path::Path,
+        factory: &dyn Fn(&std::path::Path) -> Result<S>,
+        old_file: &std::path::Path,
+        schema: &Schema,
+        reason: &str,
+        left_pending: usize,
+        left_direct: usize,
+    ) -> Result<Self> {
+        let in_use = schema_store::file_number(path, old_file);
+        for stray in schema_store::numbered_files(path) {
+            if schema_store::file_number(path, &stray) > in_use {
+                schema_store::remove_database_files(&stray);
+            }
+        }
+        let new_file = schema_store::next_free_file(path);
+        let channels: Vec<String> = match factory(old_file) {
+            Ok(mut old) => old
+                .query_committed(
+                    "SELECT channel FROM ahead_subscription ORDER BY channel",
+                    &[],
+                )
+                .map(|rows| {
+                    rows.rows
+                        .iter()
+                        .filter_map(|r| r[0].as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Err(_) => vec![],
+        };
+        let mut client = Self::open(factory(&new_file)?, schema.clone())?;
+        if !channels.is_empty() {
+            client.write(|e| {
+                for channel in &channels {
+                    e.set_cursor(channel, 0)?;
+                }
+                Ok(())
+            })?;
+        }
+        schema_store::set_current_file(path, &new_file)?;
+        client.schema_state.rebuilt = true;
+        client.schema_state.last_rebuild = Some(RebuildReport {
+            old_file: old_file.to_string_lossy().into_owned(),
+            new_file: new_file.to_string_lossy().into_owned(),
+            reason: reason.to_string(),
+            left_pending,
+            left_direct,
+        });
+        Ok(client)
+    }
+    /// The schema check's outcome for this client.
+    pub fn schema_state(&self) -> &SchemaState {
+        &self.schema_state
+    }
+    /// Rebuild now: leave the incompatible file behind and open a fresh one
+    /// for the schema the application asked for. Refused while unsent work
+    /// remains unless `discard_pending`; the report says what was left.
+    pub fn rebuild(&mut self, discard_pending: bool) -> Result<RebuildReport>
+    where
+        S: 'static,
+    {
+        let Some(pending) = self.schema_state.pending.clone() else {
+            return Err(invalid("no rebuild is pending"));
+        };
+        if self.session.is_some() {
+            return Err(invalid("client transaction active"));
+        }
+        let remaining = self.pending_count()?;
+        if remaining > 0 && !discard_pending {
+            return Err(invalid(format!(
+                "{remaining} unsent mutations remain in {}; send them or rebuild with discardPending",
+                pending.old_file
+            )));
+        }
+        let origin = self
+            .origin
+            .take()
+            .ok_or_else(|| invalid("client was not opened through a path"))?;
+        let mut fresh = Self::open_at(&origin.path, origin.target.clone(), origin.factory, true)?;
+        let report = fresh
+            .schema_state
+            .last_rebuild
+            .clone()
+            .ok_or_else(|| invalid("rebuild produced no report"))?;
+        fresh.watchers = std::mem::take(&mut self.watchers);
+        *self = fresh;
+        let tables: BTreeSet<String> = self.schema.models.iter().map(|m| m.name.clone()).collect();
+        self.notify(tables);
+        Ok(report)
     }
     pub fn client_id(&self) -> &str {
         &self.client_id
@@ -648,7 +948,7 @@ impl<S: ClientStore> Client<S> {
                         }
                     })
                     .collect();
-                pending.push(json!({"ordinal":q.ordinal,"name":q.mutation.name,"phase":phase,"prerequisites":prerequisites}));
+                pending.push(json!({"ordinal":q.ordinal,"name":q.mutation.name,"phase":phase,"diverged":q.diverged,"prerequisites":prerequisites}));
             }
             let rejections: Vec<Value> = e
                 .rejection_details()?
@@ -663,6 +963,39 @@ impl<S: ClientStore> Client<S> {
             Ok(json!({"pending":pending,"rejections":rejections}))
         })
     }
+}
+
+fn count_rows<S: ClientStore>(store: &mut S, table: &str) -> Result<usize> {
+    let rows = store.query_committed(&format!("SELECT COUNT(*) FROM {table}"), &[])?;
+    rows.rows
+        .first()
+        .and_then(|r| r[0].as_u64())
+        .map(|n| n as usize)
+        .ok_or_else(|| invalid("count failed"))
+}
+
+/// Rows the server never confirmed: visible rows without stamp evidence.
+/// They exist only in this file and are not carried into a rebuilt one.
+fn count_direct<S: ClientStore>(store: &mut S, schema: &Schema) -> Result<usize> {
+    let mut total = 0;
+    for model in &schema.models {
+        let mut keys = model.identity.clone();
+        keys.sort();
+        let pairs: Vec<String> = keys
+            .iter()
+            .map(|k| format!("'{}', m.{}", k.replace('\'', "''"), ddl::quote(k)))
+            .collect();
+        // A row with no stamp and no pending operation reached this file only
+        // through a direct write: nothing will ever send it.
+        let identity = format!("json_object({})", pairs.join(", "));
+        let sql = format!(
+            "SELECT COUNT(*) FROM {} m WHERE NOT EXISTS (SELECT 1 FROM ahead_record r WHERE r.model = ? AND r.identity = {identity}) AND NOT EXISTS (SELECT 1 FROM ahead_mutation_operation o WHERE o.model = ? AND o.identity = {identity})",
+            ddl::quote(&model.name),
+        );
+        let rows = store.query_committed(&sql, &[json!(model.name), json!(model.name)])?;
+        total += rows.rows.first().and_then(|r| r[0].as_u64()).unwrap_or(0) as usize;
+    }
+    Ok(total)
 }
 
 pub struct ClientTransaction<'a, S: ClientStore> {

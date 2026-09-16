@@ -24,17 +24,23 @@ export const SEED_TODOS = [
  * resets edits made through the app.
  */
 export async function seed(backend: Backend): Promise<void> {
-  await backend.transaction(async ({ tx, notify }) => {
-    for (const user of SEED_USERS)
-      await tx.user.upsert({ where: { id: user.id }, create: user, update: {} });
-    for (const todo of SEED_TODOS)
-      await tx.todo.upsert({ where: { id: todo.id }, create: todo, update: {} });
-    await notify({
-      channel: CHANNEL,
-      records: [
-        ...SEED_USERS.map((user) => ({ model: "User", identity: { id: user.id } })),
-        ...SEED_TODOS.map((todo) => ({ model: "Todo", identity: { id: todo.id } })),
-      ],
-    });
+  await backend.transaction(async ({ tx, changes, publish }) => {
+    for (const user of SEED_USERS) {
+      await tx.user.upsert({
+        where: { id: user.id },
+        create: user,
+        update: {},
+      });
+      changes.add({ model: "User", identity: { id: user.id } });
+    }
+    for (const todo of SEED_TODOS) {
+      await tx.todo.upsert({
+        where: { id: todo.id },
+        create: todo,
+        update: {},
+      });
+      changes.add({ model: "Todo", identity: { id: todo.id } });
+    }
+    publish({ channel: CHANNEL });
   });
 }

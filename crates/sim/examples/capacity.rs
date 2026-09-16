@@ -1,8 +1,9 @@
 //! Reproducible diagnostic, not a throughput guarantee. Each enqueue is a real SQLite commit.
 use ahead_client::{Client, Mutation, Operation, OperationKind};
-use ahead_core::{PullPage, RecordChange, Schema};
+use ahead_core::{AuthorityRecord, CursorRange, PullPage, Schema};
 use ahead_sqlite::SqliteStore;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::time::Instant;
 fn main() {
     let schema = Schema::from_value(
@@ -14,15 +15,13 @@ fn main() {
         let path = dir.path().join("capacity.sqlite");
         let mut client = Client::open(SqliteStore::open(&path).unwrap(), schema.clone()).unwrap();
         let page = |from, to| PullPage {
-            channel: "book".into(),
-            from_cursor: from,
-            to_cursor: to,
-            changes: vec![RecordChange {
-                cursor: to,
+            cursors: BTreeMap::from([("book".to_string(), CursorRange { from, to, head: to })]),
+            changes: vec![AuthorityRecord {
                 model: "Entry".into(),
                 identity: json!({"id":"one"}),
                 stamp: to,
                 state: json!({"text":"authority","note":null}),
+                error: None,
             }],
         };
         client

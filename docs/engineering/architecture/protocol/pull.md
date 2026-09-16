@@ -4,26 +4,43 @@ Engine behavior: [Client Pull](../client/engine/pull.md), [Server Pull](../serve
 
 ## 3. Context and Scope
 
-- Request, `POST /sync/pull`: `{clientId, scope, fromCursor, models}`, where `fromCursor` is the client's durable cursor for the channel (`0` on first contact) and `models` declares the read contracts the client expects, `{"Task": 2, "Note": 1}`: every model of its schema with the version its generated types read ([#91](https://github.com/zanminwang/ahead/issues/91)). The same declaration goes on the subscribe frame ([Subscriptions](subscriptions.md)), so catch-up and live pages are served alike.
-- Response: `{scope, fromCursor, toCursor, changes:[{syncId, model, identity, stamp, state}]}`. The same page shape is streamed over the WebSocket without an envelope ([Subscriptions](subscriptions.md)).
-- Errors: `400 request.invalid` when `fromCursor` is ahead of the channel head, `models` is missing or malformed, or the body is malformed; `409 model_version_unsupported` with `{model, version}` when a declared model is unknown or its version is not retained, and with `{model}` when a page holds a model the client did not declare (refused whole until per-read isolation, [#95](https://github.com/zanminwang/ahead/issues/95)); `500 server` for loader defects.
+- Request, `POST /sync/pull`: `{models, cursors}`. `cursors` maps every channel the client follows to its durable cursor (`0` on first contact): one request covers all of them. `models` declares the read contracts the client expects, `{"Entry": 2, "Comment": 1}`: every model of its schema with the version its generated types read ([#91](https://github.com/zanminwang/ahead/issues/91)); a client still on `Entry` v1 sends `{"Entry": 1}` and never sees fields v2 added. The SDK fills both; application code never writes them. There is no client id: the owner comes from authentication.
+- Response, a page: `{cursors: {channel: {from, to, head}}, changes: [...]}`. The same page shape is streamed over the WebSocket, naming only the channels that moved ([Subscriptions](subscriptions.md)).
+- A change is `{model, identity, stamp, state}`: the same authority record a push receipt carries ([Push](push.md)). `state` is the whole record or `null` for a deletion. A record the server could not read is `{model, identity, stamp, state: null, error}` where `error` is a code: `loader.failed` for a thrown loader, or the loader's own refusal code.
+- Errors: `400 request.invalid` when a cursor is ahead of its channel head, `models` or `cursors` is missing or malformed, or the body is malformed; `409 model_version_unsupported` with `{model, version}` when a declared model is unknown or its version is not retained; `500 server` for infrastructure failures. A loader failure is not a request error.
+
+```json
+{"models":{"Entry":2,"Comment":1},"cursors":{"book:demo":42,"inbox:alice":7}}
+```
+```json
+{"cursors":{"book:demo":{"from":42,"to":47,"head":47},"inbox:alice":{"from":7,"to":9,"head":9}},
+ "changes":[
+  {"model":"Entry","identity":{"id":"e"},"stamp":12,"state":{"text":"Hello","note":null}},
+  {"model":"Entry","identity":{"id":"f"},"stamp":3,"state":null},
+  {"model":"Entry","identity":{"id":"g"},"stamp":5,"state":null,"error":"loader.failed"}
+ ]}
+```
 
 ## 5. Building Block View
 
-- **Page rules.** `toCursor ≥ fromCursor`; change cursors strictly increase within `(fromCursor, toCursor]`; every change carries a `state` key (an object, or `null` for a delete) and a positive `stamp`.
-- **A change is a whole record.** `state` is the full authoritative state, never a diff, shaped by the declared version of its model; the same record and the same `stamp` reach a v1 client in the v1 shape and a v2 client in the v2 shape.
-- **Two counters, two jobs.** `syncId` orders pages within a channel (guarantee A2); `stamp` orders content per record across every delivery path (guarantee D2). A change is the same authority type a push receipt carries, `{model, identity, stamp, state}` plus its cursor ([Push](push.md)); converting one to receipt authority discards only the cursor.
-- **Page end.** The server returns at most `limits::PULL_CHANGES` (50) changes. With fewer, `toCursor` is the channel head; with exactly that many, it is the last change's cursor and `PullPage::continues` is true. Clients treat a page that does not continue as "channel drained". More than the limit is refused on decode.
+- **Page rules.** Every channel range has `from ≤ to ≤ head`; at least one channel is named; a record appears once (no two changes share `(model, identity)`); every change carries `state` and a positive `stamp`; `error`, when present, is a valid code and then `state` is `null`. A page holds at most `limits::PULL_CHANGES` (50) changes per named channel.
+- **Changes carry no channel and no cursor.** The server collects the invalidations of every channel into one set keyed by record, so a record published to two followed channels is delivered once, at its current stamp. Channels say which clients receive a change; they never appear on a record.
+- **Two counters, two jobs.** A channel's `from`/`to` orders delivery within that channel (guarantee A2); `stamp` orders content per record across every delivery path (guarantee D2).
+- **Per-channel continuation.** Each channel scans at most 50 invalidations. A channel whose `to` is below its `head` continues (`CursorRange::continues`) and the client pulls again from `to`; the other channels are not held back.
+- **A change is a whole record**, shaped by the declared version of its model; the same record and stamp reach a v1 client in the v1 shape and a v2 client in the v2 shape.
 
-Code: [core/protocol.rs](../../../../crates/core/src/protocol.rs) (`PullRequest`, `PullPage`, `RecordChange`, `limits`).
+Code: [core/protocol.rs](../../../../crates/core/src/protocol.rs) (`PullRequest`, `PullPage`, `CursorRange`, `AuthorityRecord`, `limits`).
 
 ## 10. Quality Requirements
 
-- A page continues only when it holds exactly the limit, and one change more is refused. Evidence: [core/tests/contracts.rs](../../../../crates/core/tests/contracts.rs) `shared_limits_are_defined_once_and_a_page_continues_only_when_full`.
-- A page without a stamp, with a backwards cursor or with an out-of-range counter is refused. Evidence: [core/tests/contracts.rs](../../../../crates/core/tests/contracts.rs) `field_default_and_record_stamp_round_trip_and_ahead_prefix_is_rejected`, `wire_names_remain_legacy_and_counters_are_safe`, `shared_wire_fixtures_preserve_counter_boundaries`.
-- A pull declares the read contracts on both paths and a missing or bad declaration is refused; a declared version selects the loader and the contract. Evidence: [core/tests/contracts.rs](../../../../crates/core/tests/contracts.rs) `pull_and_subscribe_declare_the_read_contracts_and_refuse_a_missing_or_bad_declaration`, [live-messages.json](../../../../fixtures/protocol/live-messages.json); [server/tests/stamp.rs](../../../../crates/server/tests/stamp.rs) `pull_normalizes_loader_rows_with_the_retained_contract_of_the_served_version`, `a_page_holding_a_model_the_client_did_not_declare_is_refused_whole`; [runtime.test.mjs](../../../../integration/persistence/server/runtime.test.mjs) `a pull reaches the loader of the declared model version and normalizes rows with that contract`, `HTTP maps engine codes to statuses`.
-- A full page ends at its last change and the remainder reaches the head. Evidence: [runtime.test.mjs](../../../../integration/persistence/server/runtime.test.mjs) `50-row pages retain original cursor progression and remainder reaches head`.
+- The canonical page and every case in [pull-page.json](../../../../fixtures/protocol/pull-page.json) decode as declared: a record shared by two channels, a deletion, an error change; refusals for a duplicate record, `to < from`, no channels, a change with both state and error, an error that is not a code, a legacy single-channel page, and a page over the per-channel limit. Evidence: [core/tests/contracts.rs](../../../../crates/core/tests/contracts.rs) `pull_page_fixture_cases_decode_as_declared`, `a_page_names_its_channels_and_keeps_unknown_fields_out_of_the_records`, `shared_limits_are_defined_once_and_apply_per_channel`, `shared_wire_fixtures_preserve_counter_boundaries`.
+- A pull carries no client id and declares the read contracts; a missing or bad declaration is refused. Evidence: `push_requests_refuse_a_blank_client_id_and_pulls_carry_none`, `pull_and_subscribe_declare_the_read_contracts_and_refuse_a_missing_or_bad_declaration`.
+- One pull covers every channel, a shared record arrives once, and a full channel continues on its own. Evidence: [server/tests/stamp.rs](../../../../crates/server/tests/stamp.rs) `one_pull_covers_every_channel_and_delivers_a_shared_record_once`, `a_full_channel_continues_independently_of_the_others`, `a_cursor_ahead_of_its_channel_head_is_refused`; [runtime.test.mjs](../../../../integration/persistence/server/runtime.test.mjs) `a pull covers every channel in one request and delivers a record shared by two channels once`.
+- A record that cannot be read is an `error` change and the page is served. Evidence: `a_loader_refusal_isolates_one_record_after_a_per_identity_retry`, `a_loader_failure_is_an_error_change_and_a_single_record_needs_no_retry`; `a loader that throws for one id fails only that record and reaches onError`, `a loader refusal for one id is an error change carrying the refusal code`.
+
+Executed 2026-09-16: `cargo test -p ahead-core -p ahead-server --locked`, `bash integration/persistence/server/run.sh`.
 
 ## 11. Risks and Technical Debt
 
-- **Accepted limitation (planned change):** completion is inferred from the 50-change constant and the page carries no head or client limit. [#11](https://github.com/zanminwang/ahead/issues/11) proposes `limit` and `head` fields; [#14](https://github.com/zanminwang/ahead/issues/14) proposes a separate snapshot request for bootstrap.
+- **Accepted limitation (planned change).** The per-channel limit is the fixed 50 ([#11](https://github.com/zanminwang/ahead/issues/11)); bootstrap is a cursor walk from zero ([#14](https://github.com/zanminwang/ahead/issues/14)).
+- **Accepted limitation.** An `error` change is not retried by the protocol; the record is corrected the next time it is published or explicitly fetched ([#116](https://github.com/zanminwang/ahead/issues/116)).

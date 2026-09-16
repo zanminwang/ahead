@@ -32,7 +32,7 @@ After a Handler returns, the framework allocates a stamp for every changed Recor
 
 Background jobs publish through `backend.transaction`, which runs the job's writes and its publication in one application transaction, advances the stamps of the records it names, and wakes live subscribers once the transaction commits.
 
-The [backend SDK guide](backend/setup.md) shows registration and background publication. The first adapter targets [Prisma/PostgreSQL](backend/prisma.md).
+The [backend SDK guide](backend/setup.md) shows registration and background publication. The backend stores its metadata in [PostgreSQL](backend/database.md), through `pg`, Prisma or Drizzle.
 
 ## Channel and Cursor
 
@@ -65,9 +65,9 @@ A newer deletion withdraws the record across channels, and the client keeps the 
 
 `get`, `query`, relation accessors, raw SQL and `watch` read local SQLite through the Rust engine. They do not call a loader. Read-only SQL uses the on-disk tables rather than copying the full record set into a separate projection.
 
-The backend's loader is the sync read path: it supplies the current authorized content of the records a mutation changed, for the receipt, and of the records a publication identified, for a page. It never sees which path is asking. This separation lets your local record schema differ from your backend database layout.
+The backend's loader is the sync read path: it supplies the current authorized content of the records a mutation changed, for the receipt, and of the records a publication identified, for a page. It never sees which path is asking. A record the loader cannot read fails alone: the rest of the page is delivered, and the client keeps its copy and reports the failure. This separation lets your local record schema differ from your backend database layout.
 
-Ahead uses one connection: HTTP submits mutations and catches up missing records; WebSocket delivers ongoing changes. Initial connection, reconnection and gap recovery use saved channel cursors. Received records pass through the Rust engine into SQLite.
+Ahead uses one connection: HTTP submits mutations and catches up missing records in one pull for all channels; WebSocket delivers ongoing changes. Initial connection, reconnection and gap recovery use saved channel cursors. Received records pass through the Rust engine into SQLite.
 
 ## Current limits
 

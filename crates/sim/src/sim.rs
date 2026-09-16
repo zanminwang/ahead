@@ -6,7 +6,7 @@ use crate::{
     rng::Rng,
     schema,
 };
-use ahead_client::{Client, Operation, OperationKind};
+use ahead_client::{Client, Operation, OperationKind, Report, ReportKind};
 use ahead_core::{PullPage, PushReceipt, PushRequest, RecordKey};
 use ahead_sqlite::SqliteStore;
 use serde_json::json;
@@ -89,9 +89,9 @@ pub enum Action {
     Freeze {
         client: usize,
     },
+    /// One pull for every channel the client subscribes to, from its cursors.
     Pull {
         client: usize,
-        channel: String,
     },
     Deliver,
     Drop,
@@ -131,10 +131,24 @@ pub enum Action {
     /// pairs with) is a host infrastructure error: the whole delivery fails
     /// and nothing in it is committed.
     BreakNext,
+    /// The loader throws for `key` (until asked for it alone): that record is
+    /// delivered as an error change, the rest of the page is unaffected.
+    FailLoadNext {
+        key: String,
+    },
+    /// The loader refuses `key` with `sim.refused`: the same, with that code.
+    RefuseLoadNext {
+        key: String,
+    },
+    /// The next page a client receives has its first change forged without a
+    /// required field: the client skips and reports that change alone.
+    CorruptNextPage,
 }
 
 pub struct Slot {
     pub path: PathBuf,
+    /// The schema this slot opens with; `Sim::upgrade` replaces it.
+    pub schema: ahead_core::Schema,
     pub client: Option<Client<SqliteStore>>,
     pub enqueued: Vec<u64>,
     pub receipts: BTreeMap<u64, PushReceipt>,
@@ -195,6 +209,16 @@ pub struct Sim {
     /// (`ApplyReport::conflicts`). The engine never applies such content; a test that
     /// injects none expects this to stay 0.
     pub conflicts: usize,
+    /// Every report a receipt or page produced, in order: what the application
+    /// would have been told.
+    pub reports: Vec<Report>,
+    /// (client, encoded key) pairs whose last delivery could not be applied (a read
+    /// failure or a skipped change): the client keeps its earlier content on
+    /// purpose until the record is delivered again, so `no_pending_means_converged`
+    /// exempts exactly these pairs. Cleared when newer authority lands.
+    pub stale_reads: BTreeSet<(usize, String)>,
+    /// Whether the next page delivered to a client is forged (`Action::CorruptNextPage`).
+    pub corrupt_next_page: bool,
     _dir: tempfile::TempDir,
 }
 
@@ -204,8 +228,16 @@ pub const OWNER: &str = "u";
 /// in `Sim::settle`.
 type SimSnapshot = (usize, u64, Vec<(String, u64)>);
 
-fn open(path: &PathBuf) -> Client<SqliteStore> {
-    Client::open(SqliteStore::open(path).unwrap(), schema::schema()).unwrap()
+/// Opens through the file-selection path (sidecar, descriptor, compatibility), the
+/// way an SDK does, so a restart after a rebuild lands on the rebuilt file.
+fn open(path: &PathBuf, schema: &ahead_core::Schema, discard_pending: bool) -> Client<SqliteStore> {
+    Client::open_at(
+        path,
+        schema.clone(),
+        Box::new(|p| SqliteStore::open(p)),
+        discard_pending,
+    )
+    .unwrap()
 }
 
 pub fn parse_key(s: &str) -> RecordKey {
@@ -223,9 +255,11 @@ impl Sim {
         let clients = (0..clients)
             .map(|i| {
                 let path = dir.path().join(format!("client-{i}.sqlite"));
+                let schema = schema::schema();
                 Slot {
-                    client: Some(open(&path)),
+                    client: Some(open(&path, &schema, false)),
                     path,
+                    schema,
                     enqueued: vec![],
                     receipts: BTreeMap::new(),
                     pushes: BTreeMap::new(),
@@ -250,11 +284,63 @@ impl Sim {
             generate_membership_faults: false,
             comparisons: 0,
             conflicts: 0,
+            reports: vec![],
+            stale_reads: BTreeSet::new(),
+            corrupt_next_page: false,
             _dir: dir,
         }
     }
     pub fn check(&mut self) -> Result<(), String> {
         crate::invariants::check(self)
+    }
+    /// Reopen a running client with `schema` the way an app upgrade does: an
+    /// identical or additive schema opens in place; an incompatible one is rebuilt
+    /// beside, unless unsent work keeps the old file open (`discard_pending` leaves
+    /// that work behind). A rebuilt file is a new client to the simulation: the
+    /// slot's push bookkeeping and the high-water marks start over, since nothing
+    /// in the old file belongs to it.
+    pub fn upgrade(
+        &mut self,
+        client: usize,
+        schema: ahead_core::Schema,
+        discard_pending: bool,
+    ) -> ahead_client::SchemaState {
+        self.clients[client].client = None;
+        self.clients[client].schema = schema;
+        let slot = &self.clients[client];
+        let reopened = open(&slot.path, &slot.schema, discard_pending);
+        let state = reopened.schema_state().clone();
+        self.clients[client].client = Some(reopened);
+        if state.rebuilt {
+            self.forget(client);
+        }
+        state
+    }
+    /// `Client::rebuild` on a client whose old file was kept open for unsent work.
+    pub fn rebuild(
+        &mut self,
+        client: usize,
+        discard_pending: bool,
+    ) -> Result<ahead_client::RebuildReport, String> {
+        let report = self
+            .client(client)
+            .rebuild(discard_pending)
+            .map_err(|e| e.to_string())?;
+        self.forget(client);
+        Ok(report)
+    }
+    fn forget(&mut self, client: usize) {
+        let slot = &mut self.clients[client];
+        slot.enqueued.clear();
+        slot.receipts.clear();
+        slot.pushes.clear();
+        slot.crash_state = None;
+        for generation in slot.generations.values_mut() {
+            *generation += 1;
+        }
+        self.seen_stamps.retain(|(i, _), _| *i != client);
+        self.seen_cursors.retain(|(i, _), _| *i != client);
+        self.direct_writes.retain(|(i, _)| *i != client);
     }
     pub fn client(&mut self, i: usize) -> &mut Client<SqliteStore> {
         self.clients[i].client.as_mut().expect("client is crashed")
@@ -357,25 +443,20 @@ impl Sim {
                     self.net.send(Message::Push { client, bytes });
                 }
             }
-            Action::Pull { client, channel } => {
-                let c = self.client(client);
-                if !c
-                    .desired_channels()
-                    .map_err(|e| e.to_string())?
-                    .contains(&channel)
-                {
-                    return Ok(());
-                }
+            Action::Pull { client } => {
                 // Issued through the client so it can tell a page from an earlier
-                // subscription of the channel apart from a gap (A2).
-                let bytes = c
-                    .downlink_request(&channel)
+                // subscription of a channel apart from a gap (A2). Nothing
+                // subscribed: nothing to pull.
+                let Some(body) = self
+                    .client(client)
+                    .downlink_request()
                     .map_err(|e| e.to_string())?
-                    .into_bytes();
+                else {
+                    return Ok(());
+                };
                 self.net.send(Message::Pull {
                     client,
-                    channel,
-                    bytes,
+                    bytes: body.into_bytes(),
                 });
             }
             Action::Deliver => self.deliver()?,
@@ -400,8 +481,9 @@ impl Sim {
             }
             Action::Restart { client } => {
                 if self.clients[client].client.is_none() {
-                    let path = self.clients[client].path.clone();
-                    self.clients[client].client = Some(open(&path));
+                    let slot = &self.clients[client];
+                    let reopened = open(&slot.path, &slot.schema, false);
+                    self.clients[client].client = Some(reopened);
                     if let Some(before) = self.clients[client].crash_state.take() {
                         crate::invariants::no_pending_operation_is_lost_on_reopen(
                             self, client, &before,
@@ -477,6 +559,9 @@ impl Sim {
             Action::RejectNext { code } => self.host.reject_next(&code),
             Action::FailNext => self.host.fail_next(),
             Action::BreakNext => self.host.break_next(),
+            Action::FailLoadNext { key } => self.host.fail_load_next(&parse_key(&key)),
+            Action::RefuseLoadNext { key } => self.host.refuse_load_next(&parse_key(&key)),
+            Action::CorruptNextPage => self.corrupt_next_page = true,
         }
         Ok(())
     }
@@ -520,7 +605,8 @@ impl Sim {
                 // duplicate changes nothing and reports itself as such.
                 match self.client(client).acknowledge(sequence, receipt.clone()) {
                     Ok(report) => {
-                        self.conflicts += report.conflicts;
+                        self.conflicts += report.conflicts();
+                        self.reports.extend(report.reports);
                         self.clients[client].receipts.insert(sequence, receipt);
                     }
                     Err(e) => return Err(e.to_string()),
@@ -538,14 +624,30 @@ impl Sim {
                     self.net.send(Message::Page { client, bytes });
                     return Ok(());
                 }
-                let page = PullPage::decode(&bytes).map_err(|e| e.to_string())?;
+                let mut page = PullPage::decode(&bytes).map_err(|e| e.to_string())?;
+                if self.corrupt_next_page
+                    && let Some(first) = page.changes.iter_mut().find(|c| c.error.is_none())
+                {
+                    // A change without its required `text`: the schema refuses it.
+                    self.corrupt_next_page = false;
+                    if let Some(state) = first.state.as_object_mut() {
+                        state.remove("text");
+                    } else {
+                        first.state = json!({});
+                    }
+                }
                 // A key this page carries a newer authoritative change for is no
                 // longer shadowed by an earlier direct write on this client. Newer
                 // is the client's own rule (D2): the change's stamp beats the
                 // record's local stamp. A stale copy of a page the client already
                 // applied (a duplicate, a late retry) leaves the direct write in
-                // place, so it must keep the exemption too.
+                // place, so it must keep the exemption too. The same snapshot shows
+                // that a change the client could not apply left nothing behind.
                 let mut touched = vec![];
+                // Keys the page delivers at the client's stamp or beyond: once
+                // applied without a report, the client holds the server's content.
+                let mut confirmed = vec![];
+                let mut before = BTreeMap::new();
                 for change in &page.changes {
                     let Ok(key) = schema::schema().record_key(&change.model, &change.identity)
                     else {
@@ -561,17 +663,88 @@ impl Sim {
                         .first()
                         .and_then(|r| r["stamp"].as_u64())
                         .unwrap_or(0);
-                    if change.stamp > local {
+                    let content = self.client(client).read(&key).map_err(|e| e.to_string())?;
+                    before.insert(key.encoded().unwrap(), (local, content));
+                    if change.stamp > local && change.error.is_none() {
                         touched.push(key.encoded().unwrap());
                     }
+                    if change.stamp >= local && change.error.is_none() {
+                        confirmed.push(key.encoded().unwrap());
+                    }
                 }
+                let ranges = page.cursors.clone();
+                // Entries this page deletes: their comments cascade locally, so a
+                // comment's row may go even when its own change was not applied.
+                let deleted_entries: BTreeSet<String> = page
+                    .changes
+                    .iter()
+                    .filter(|c| c.model == "Entry" && c.error.is_none() && c.state.is_null())
+                    .filter_map(|c| c.identity["id"].as_str().map(str::to_string))
+                    .collect();
                 let report = self
                     .client(client)
                     .apply_page(page)
                     .map_err(|e| e.to_string())?;
-                self.conflicts += report.conflicts;
+                self.conflicts += report.conflicts();
+                // A page moves a channel to its `to` or not at all.
+                for (channel, cursor) in &report.cursors {
+                    if ranges.get(channel).map(|r| r.to) != Some(*cursor) {
+                        return Err(format!(
+                            "client {client} channel {channel} cursor {cursor} landed inside the page"
+                        ));
+                    }
+                }
+                for entry in &report.reports {
+                    let key = schema::schema()
+                        .record_key(&entry.model, &entry.identity)
+                        .map_err(|e| e.to_string())?;
+                    let encoded = key.encoded().unwrap();
+                    if matches!(
+                        entry.kind,
+                        ReportKind::ReadFailed | ReportKind::Skipped | ReportKind::Conflict
+                    ) {
+                        let now_stamp = self
+                            .client(client)
+                            .record_stamp(&key)
+                            .map_err(|e| e.to_string())?;
+                        let now = self.client(client).read(&key).map_err(|e| e.to_string())?;
+                        let (then_stamp, then) = before.get(&encoded).cloned().unwrap_or((0, None));
+                        // The stamp never moves for a change that was not applied. The
+                        // content does not either, unless a parent deletion in the same
+                        // page cascaded the row away (and then it is gone, not rewritten).
+                        let cascaded = key.model == "Comment"
+                            && now.is_none()
+                            && then
+                                .as_ref()
+                                .and_then(|row| row["entryId"].as_str())
+                                .is_some_and(|parent| deleted_entries.contains(parent));
+                        if now_stamp != then_stamp || (now != then && !cascaded) {
+                            return Err(format!(
+                                "client {client} {encoded}: a {:?} change changed local content or stamp",
+                                entry.kind
+                            ));
+                        }
+                        touched.retain(|k| k != &encoded);
+                        confirmed.retain(|k| k != &encoded);
+                        // The client missed something only if the delivery was
+                        // newer than what it holds.
+                        let missed = before
+                            .get(&encoded)
+                            .is_some_and(|(stamp, _)| entry.stamp > *stamp);
+                        if entry.kind != ReportKind::Conflict && missed {
+                            self.stale_reads.insert((client, encoded));
+                        }
+                    }
+                }
+                self.reports.extend(report.reports);
                 for key in touched {
                     self.direct_writes.remove(&(client, key));
+                }
+                // A page the client dropped (stale, covered) confirmed nothing.
+                if !report.stale {
+                    for key in confirmed {
+                        self.stale_reads.remove(&(client, key));
+                    }
                 }
             }
             Message::PushFailed { .. } => {}
@@ -589,6 +762,7 @@ impl Sim {
     }
     /// Push and pull everything for every running client until nothing changes.
     pub fn settle(&mut self) {
+        let mut republished = BTreeSet::new();
         for _ in 0..16 {
             let before = self.snapshot();
             for i in 0..self.clients.len() {
@@ -596,14 +770,20 @@ impl Sim {
                     continue;
                 }
                 self.apply(Action::Freeze { client: i }).unwrap();
-                let channels: Vec<String> = self
-                    .client(i)
-                    .desired_channels()
-                    .unwrap()
-                    .into_iter()
-                    .collect();
-                for channel in channels {
-                    self.apply(Action::Pull { client: i, channel }).unwrap();
+                self.apply(Action::Pull { client: i }).unwrap();
+            }
+            // A record a client could not read is corrected the next time it is
+            // published: settle republishes it on its channels at its stamp, once.
+            // A client that does not follow those channels keeps its retained copy
+            // (still exempt from the convergence check).
+            let stale: BTreeSet<String> = self.stale_reads.iter().map(|(_, k)| k.clone()).collect();
+            for encoded in stale {
+                if !republished.insert(encoded.clone()) {
+                    continue;
+                }
+                let key = schema::key_from_encoded(&encoded);
+                for channel in self.host.membership(&key) {
+                    self.host.ensure_publish(&key, &channel);
                 }
             }
             self.drain();
@@ -665,11 +845,7 @@ mod tests {
         );
         assert_eq!(sim.client(0).last_completed_push().unwrap(), 1);
         assert_eq!(sim.client(0).record_stamp(&entry_key("e1")).unwrap(), 1);
-        sim.apply(Action::Pull {
-            client: 0,
-            channel: "a".into(),
-        })
-        .unwrap();
+        sim.apply(Action::Pull { client: 0 }).unwrap();
         sim.apply(Action::Deliver).unwrap(); // pull reaches server, page queued
         sim.apply(Action::Deliver).unwrap(); // page reaches client: same stamp, no rewrite
         assert_eq!(sim.client(0).pending_count().unwrap(), 0);

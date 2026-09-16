@@ -56,6 +56,13 @@ pub fn comment_key(id: &str) -> RecordKey {
         .record_key("Comment", &json!({ "id": id }))
         .unwrap()
 }
+/// The key behind its canonical encoding (`["Model",{"id":…}]`).
+pub fn key_from_encoded(encoded: &str) -> RecordKey {
+    let parts: Vec<Value> = serde_json::from_str(encoded).expect("encoded key");
+    schema()
+        .record_key(parts[0].as_str().expect("model"), &parts[1])
+        .expect("known key")
+}
 fn op(model: &str, kind: OperationKind, id: &str, values: Option<Value>) -> Operation {
     Operation {
         model: model.into(),

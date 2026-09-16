@@ -30,6 +30,6 @@ Batch `n+1` is accepted only after `n`. Resending `n` returns the stored receipt
 
 ## 11. Risks and Technical Debt
 
-**Resolved ([#63](https://github.com/zanminwang/ahead/issues/63), [#55](https://github.com/zanminwang/ahead/issues/55)).** The legacy `requiredScope`/`requiredSyncId` pair and `requiredCheckpoints` are gone with the checkpoint contract they carried. A receipt of the old shape is refused by the decoder, and a local database that still holds checkpoint rows is refused on open ([Reconciliation](../client/storage/reconciliation.md)).
+**Resolved ([#63](https://github.com/zanminwang/ahead/issues/63), [#55](https://github.com/zanminwang/ahead/issues/55)).** The legacy `requiredScope`/`requiredSyncId` pair and `requiredCheckpoints` are gone with the checkpoint contract they carried. A receipt of the old shape is refused by the decoder, and a local database that still holds checkpoint rows is rebuilt beside on open, its checkpoint-era queue reported as left behind ([Reconciliation](../client/storage/reconciliation.md)).
 
 **Accepted limitation.** A receipt grows with the records a batch changes, and a handler's extra changes (`changes.add`) count too. The only bounds are the 20-mutation cap and the HTTP body limit ([#11](https://github.com/zanminwang/ahead/issues/11)); a receipt the transport cannot deliver leaves the batch in flight for retry, never partially applied.

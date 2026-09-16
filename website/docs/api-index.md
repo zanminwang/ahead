@@ -23,14 +23,13 @@ Use this index to find the interface you call or implement. The examples use the
 | `backend.listen` | Serve sync requests and close the listener | [Listener](backend/api.md#listener), [Deploy the backend](backend/deployment.md) |
 | `Authenticate`, `devAuth` | Identify the caller | [Authentication](backend/api.md#authentication) |
 | `MutationRejected`, `translateRejection`, `onError`, `EngineError` | Reject business operations and diagnose failures | [Errors](backend/api.md#errors) |
-| `backend.transaction`, `TransactionCall`, `NotifyArgs` | Write and publish outside a handler; subscribers wake after commit | [Background writes](backend/api.md#background-writes) |
-| `Database`, `Persistence`, `prisma` | Run business and sync storage in the same database transaction | [Database adapters](backend/database.md) |
+| `backend.transaction`, `TransactionCall` | Write outside a handler with the same `changes` and `publish`; subscribers wake after commit | [Background writes](backend/api.md#background-writes) |
+| `pg`, `prisma`, `drizzle`, `PostgresDriver`, `persistence` | Run business and sync storage in one PostgreSQL transaction through your own access tool | [Database](backend/database.md) |
 
 ## Advanced interfaces
 
 | Interface | Use it to | Reference |
 | --- | --- | --- |
-| `backend.bindTransaction` | Publish inside a transaction your framework owns | [Externally owned transactions](backend/api.md#externally-owned-transactions) |
 | React Native `databasePath` | Resolve a persistent local database path | [React Native setup](frontend/platforms.md#react-native) |
 | `Client`, `Transaction`, `QuerySpec`, `RecordValue` | Access the generic runtime beneath generated APIs | [Client runtime](frontend/runtime.md) |
 | `ServerOptions`, `SyncServer`, `ConnectionOptions` | Configure the backend connection and refresh credentials | [Server connection](frontend/runtime.md#server-connection) |

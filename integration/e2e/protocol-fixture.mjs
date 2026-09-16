@@ -2,18 +2,20 @@
 /** The read contracts a client of `schema` declares: every model at its version. */
 export const declaredModels=schema=>Object.fromEntries(schema.models.map(model=>[model.name,model.version??1]));
 export async function syncProtocol(client, transport, models) {
- const completed=new Set();
+ let caughtUp=false;
  for (;;) {
   const frozen=await client.freeze();
   if(frozen!==null) {
    await client.acknowledge(JSON.parse(frozen).batchSequence,JSON.parse(await transport('push',frozen)));
-   completed.clear();
+   caughtUp=false;
    continue;
   }
-  const status=await client.syncState();const scope=status.channels.find(scope=>!completed.has(scope));
-  if(scope===undefined)return;
-  const body=JSON.stringify({clientId:client.clientId,scope,fromCursor:status.cursors[scope]??0,models});
-  const page=JSON.parse(await transport('pull',body));await client.applyPull(page);
-  if(page.changes.length<50)completed.add(scope);
+  if(caughtUp)return;
+  const status=await client.syncState();
+  if(status.channels.length===0)return;
+  // One pull covers every subscribed channel; it repeats while any channel continues.
+  const cursors=Object.fromEntries(status.channels.map(channel=>[channel,status.cursors[channel]??0]));
+  const page=JSON.parse(await transport('pull',JSON.stringify({cursors,models})));await client.applyPull(page);
+  caughtUp=Object.values(page.cursors).every(range=>range.to>=range.head);
  }
 }

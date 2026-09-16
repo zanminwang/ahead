@@ -66,18 +66,7 @@ pub(crate) async fn read_back(
         }
         versions.insert(&key.model, *version);
     }
-    // One stamp per changed record, taken in canonical key order so that two
-    // mutations touching the same records lock them the same way.
-    let mut stamps: BTreeMap<String, u64> = BTreeMap::new();
-    for (encoded, key) in changes {
-        let Stamped(stamp) = host
-            .call_typed(HostRequest::AdvanceStamp {
-                model: key.model.clone(),
-                identity_key: key.encoded_identity().map_err(internal)?,
-            })
-            .await?;
-        stamps.insert(encoded.clone(), stamp);
-    }
+    let stamps = allocate_stamps(changes, host).await?;
     // Loaders read the changed records grouped by model, at the declared version.
     let mut groups: BTreeMap<&str, Vec<&String>> = BTreeMap::new();
     for (encoded, key) in changes {
@@ -108,28 +97,62 @@ pub(crate) async fn read_back(
             // aborts the rest of the batch.
             Loaded::Failed { .. } => return Ok(Outcome::Refused(code::LOADER_FAILED.into())),
         };
+        // An answer the served contract cannot accept is this mutation's
+        // content problem: it rejects only this mutation.
         if rows.len() != encoded_keys.len() {
-            return Err(Error::new(code::LOADER_INVALID, "misaligned loader result"));
+            return Ok(Outcome::Refused(code::LOADER_INVALID.into()));
         }
         for (encoded, state) in encoded_keys.iter().zip(rows) {
             let key = &changes[*encoded];
             let state = match state {
                 None => Value::Null,
-                Some(state) => contract
-                    .normalize_state(model, &state)
-                    .map_err(|e| Error::new(code::LOADER_INVALID, e.to_string()))?,
+                Some(state) => match contract.normalize_state(model, &state) {
+                    Ok(state) => state,
+                    Err(_) => return Ok(Outcome::Refused(code::LOADER_INVALID.into())),
+                },
             };
             records.push(AuthorityRecord {
                 model: key.model.clone(),
                 identity: key.identity.clone(),
                 stamp: stamps[*encoded],
                 state,
+                error: None,
             });
         }
     }
-    // Publications go out at the stamps allocated above. A published record
-    // outside the change set keeps its current stamp, initialized only when it
-    // has none: distribution never advances a version.
+    publish_intents(config, changes, &stamps, publications, host).await?;
+    Ok(Outcome::Records(records))
+}
+
+/// One stamp per changed record, taken in canonical key order so that two
+/// transactions touching the same records lock them the same way.
+pub(crate) async fn allocate_stamps(
+    changes: &Changes,
+    host: &impl Host,
+) -> Result<BTreeMap<String, u64>> {
+    let mut stamps: BTreeMap<String, u64> = BTreeMap::new();
+    for (encoded, key) in changes {
+        let Stamped(stamp) = host
+            .call_typed(HostRequest::AdvanceStamp {
+                model: key.model.clone(),
+                identity_key: key.encoded_identity().map_err(internal)?,
+            })
+            .await?;
+        stamps.insert(encoded.clone(), stamp);
+    }
+    Ok(stamps)
+}
+
+/// Carry out publication intents at the stamps allocated for the change set.
+/// A published record outside the change set keeps its current stamp,
+/// initialized only when it has none: distribution never advances a version.
+pub(crate) async fn publish_intents(
+    config: &Config,
+    changes: &Changes,
+    stamps: &BTreeMap<String, u64>,
+    publications: &[PublicationIntent],
+    host: &impl Host,
+) -> Result<()> {
     for intent in publications {
         if intent.channel.is_empty() {
             return Err(Error::new(
@@ -163,7 +186,7 @@ pub(crate) async fn read_back(
             publish_one(host, &intent.channel, key, stamp).await?;
         }
     }
-    Ok(Outcome::Records(records))
+    Ok(())
 }
 
 /// Invalidate one record on one channel at its current stamp.

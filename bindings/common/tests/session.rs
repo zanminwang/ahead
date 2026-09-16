@@ -42,7 +42,7 @@ fn rust_selects_transport_actions_and_reuses_frozen_request_on_retry() {
     host.call(json!({"op":"startSync","handle":id})).unwrap();
     let action = host.call(json!({"op":"next","handle":id})).unwrap()["value"].clone();
     assert_eq!(action["kind"], "pull");
-    host.call(json!({"op":"complete","handle":id,"response":{"scope":"book","fromCursor":0,"toCursor":1,"changes":[{"syncId":1,"model":"Entry","identity":{"id":"e"},"stamp":1,"state":{"text":"A","note":null}}]}})).unwrap();
+    host.call(json!({"op":"complete","handle":id,"response":{"cursors":{"book":{"from":0,"to":1,"head":1}},"changes":[{"model":"Entry","identity":{"id":"e"},"stamp":1,"state":{"text":"A","note":null}}]}})).unwrap();
     assert!(host.call(json!({"op":"next","handle":id})).unwrap()["value"].is_null());
     host.call(json!({"op":"enqueue","handle":id,"mutation":{"name":"Edit","operations":[{"model":"Entry","op":"update","identity":{"id":"e"},"values":{"text":"B"}}]}})).unwrap();
     host.call(json!({"op":"startSync","handle":id})).unwrap();
@@ -105,7 +105,7 @@ fn live_push_cycle_keeps_receipts_but_leaves_reads_to_the_stream() {
         "normalized"
     );
     // The stream later carries the same authority: a no-op that advances the cursor.
-    host.call(json!({"op":"pull","handle":id,"page":{"scope":"book","fromCursor":0,"toCursor":1,"changes":[{"syncId":1,"model":"Entry","identity":{"id":"e"},"stamp":1,"state":{"text":"normalized","note":null}}]}})).unwrap();
+    host.call(json!({"op":"pull","handle":id,"page":{"cursors":{"book":{"from":0,"to":1,"head":1}},"changes":[{"model":"Entry","identity":{"id":"e"},"stamp":1,"state":{"text":"normalized","note":null}}]}})).unwrap();
     assert_eq!(
         host.call(json!({"op":"status","handle":id})).unwrap()["value"]["cursors"]["book"],
         1
@@ -185,17 +185,23 @@ fn streaming(host: &mut RuntimeHost, id: &Value, first: &Value) -> Value {
     let epoch = opened[0]["epoch"].clone();
     assert_eq!(
         serde_json::from_str::<Value>(opened[0]["subscribe"].as_str().unwrap()).unwrap(),
-        json!({"type":"subscribe","scopes":["book"],"models":{"Entry":1}})
+        json!({"type":"subscribe","channels":["book"],"models":{"Entry":1}})
     );
-    let ack = json!({"type":"subscribed","scopes":["book"],"rejections":[]}).to_string();
+    // The acknowledged head is beyond the durable cursor: one pull from it.
+    let ack = json!({"type":"subscribed","cursors":{"book":first["cursors"]["book"]["head"]}})
+        .to_string();
     let requested = host
         .call(json!({"op":"live","handle":id,"event":"message","epoch":epoch,"body":ack,"now":0}))
         .unwrap()["value"]
         .clone();
+    if first["cursors"]["book"]["head"] == 0 {
+        assert_eq!(requested, json!([]), "at the head: no catch-up");
+        return epoch;
+    }
     assert_eq!(requested[0]["type"], "request");
     assert_eq!(
-        serde_json::from_str::<Value>(requested[0]["body"].as_str().unwrap()).unwrap()["fromCursor"],
-        0
+        serde_json::from_str::<Value>(requested[0]["body"].as_str().unwrap()).unwrap()["cursors"],
+        json!({"book":0})
     );
     host.call(json!({"op":"live","handle":id,"event":"catchUp","epoch":epoch,"body":first.to_string(),"now":0}))
         .unwrap();
@@ -212,7 +218,7 @@ fn incoming_pages_share_cursor_policy_and_do_not_overwrite_push_cycle() {
         .call(json!({"op":"open","path":dir.path().join("db"),"schema":schema}))
         .unwrap()["value"]["handle"]
         .clone();
-    let page = json!({"scope":"book","fromCursor":0,"toCursor":1,"changes":[{"syncId":1,"model":"Entry","identity":{"id":"e"},"stamp":1,"state":{"text":"A","note":null}}]});
+    let page = json!({"cursors":{"book":{"from":0,"to":1,"head":1}},"changes":[{"model":"Entry","identity":{"id":"e"},"stamp":1,"state":{"text":"A","note":null}}]});
     let epoch = streaming(&mut host, &id, &page);
     let deliver = |host: &mut RuntimeHost, event: &str, page: &Value| {
         host.call(json!({"op":"live","handle":id,"event":event,"epoch":epoch,"body":page.to_string(),"now":0}))
@@ -220,15 +226,19 @@ fn incoming_pages_share_cursor_policy_and_do_not_overwrite_push_cycle() {
             .clone()
     };
     assert_eq!(deliver(&mut host, "message", &page), json!([]), "covered");
-    let gap = json!({"scope":"book","fromCursor":2,"toCursor":3,"changes":[]});
+    let gap = json!({"cursors":{"book":{"from":2,"to":3,"head":3}},"changes":[]});
     let recovered = deliver(&mut host, "message", &gap);
     assert_eq!(recovered[0]["type"], "request", "a gap recovers over HTTP");
     host.call(json!({"op":"enqueue","handle":id,"mutation":{"name":"Edit","operations":[{"model":"Entry","op":"update","identity":{"id":"e"},"values":{"text":"B"}}]}})).unwrap();
     host.call(json!({"op":"startSync","handle":id,"pushOnly":true}))
         .unwrap();
     let push = host.call(json!({"op":"next","handle":id})).unwrap()["value"].clone();
-    let empty = json!({"scope":"book","fromCursor":1,"toCursor":1,"changes":[]});
-    assert_eq!(deliver(&mut host, "catchUp", &empty), json!([]));
+    // The pull covers the held gap frame, which is then discarded.
+    let covering = json!({"cursors":{"book":{"from":1,"to":3,"head":3}},"changes":[]});
+    assert_eq!(
+        deliver(&mut host, "catchUp", &covering),
+        json!([{"type":"wake","lane":"push"}])
+    );
     assert_eq!(
         host.call(json!({"op":"next","handle":id})).unwrap()["value"],
         push,
@@ -245,23 +255,23 @@ fn incoming_overlap_is_identical_with_or_without_http_request_metadata() {
         serde_json::from_str(include_str!("../../../fixtures/schemas/entry.json")).unwrap();
     for over_http in [false, true] {
         let id=host.call(json!({"op":"open","path":dir.path().join(if over_http {"http"} else {"ws"}),"schema":schema})).unwrap()["value"]["handle"].clone();
-        let empty = json!({"scope":"book","fromCursor":0,"toCursor":0,"changes":[]});
+        let empty = json!({"cursors":{"book":{"from":0,"to":0,"head":0}},"changes":[]});
         let epoch = streaming(&mut host, &id, &empty);
         let deliver = |host: &mut RuntimeHost, event: &str, page: &Value| {
             host.call(json!({"op":"live","handle":id,"event":event,"epoch":epoch,"body":page.to_string(),"now":0}))
                 .unwrap()["value"]
                 .clone()
         };
-        let first = json!({"scope":"book","fromCursor":0,"toCursor":1,"changes":[{"syncId":1,"model":"Entry","identity":{"id":"e"},"stamp":1,"state":{"text":"first","note":null}}]});
-        let overlap = json!({"scope":"book","fromCursor":0,"toCursor":2,"changes":[{"syncId":1,"model":"Entry","identity":{"id":"e"},"stamp":1,"state":{"text":"covered conflicting content","note":null}},{"syncId":2,"model":"Entry","identity":{"id":"e"},"stamp":2,"state":{"text":"incoming overlap","note":null}}]});
+        let first = json!({"cursors":{"book":{"from":0,"to":1,"head":1}},"changes":[{"model":"Entry","identity":{"id":"e"},"stamp":1,"state":{"text":"first","note":null}}]});
+        let overlap = json!({"cursors":{"book":{"from":0,"to":2,"head":2}},"changes":[{"model":"Entry","identity":{"id":"e"},"stamp":2,"state":{"text":"incoming overlap","note":null}}]});
         if over_http {
             // A streamed gap makes the session request from cursor 0; the first
             // page then lands through the stream before the answer arrives.
-            let gap = json!({"scope":"book","fromCursor":5,"toCursor":6,"changes":[]});
+            let gap = json!({"cursors":{"book":{"from":5,"to":6,"head":6}},"changes":[]});
             assert_eq!(deliver(&mut host, "message", &gap)[0]["type"], "request");
         }
-        // While the channel catches up, a streamed page is held and is covered
-        // once the HTTP answer lands; in streaming it applies at once.
+        // While a pull is in flight, a streamed page waits in the queue and is
+        // covered once the HTTP answer lands; in streaming it applies at once.
         assert_eq!(
             deliver(&mut host, "message", &first),
             if over_http {
@@ -276,7 +286,13 @@ fn incoming_overlap_is_identical_with_or_without_http_request_metadata() {
                 if over_http { "catchUp" } else { "message" },
                 &overlap
             ),
-            json!([{"type":"wake","lane":"push"}]),
+            if over_http {
+                // The pull applied, then the queue: `first` is covered and the
+                // gap frame still does not connect, so one more pull runs.
+                json!([{"type":"wake","lane":"push"},{"type":"request","epoch":epoch,"body":"{\"cursors\":{\"book\":2},\"models\":{\"Entry\":1}}"}])
+            } else {
+                json!([{"type":"wake","lane":"push"}])
+            },
             "applied over {}",
             if over_http { "HTTP" } else { "the stream" }
         );
@@ -314,12 +330,12 @@ fn incoming_overlap_is_identical_with_or_without_http_request_metadata() {
         .call(json!({"op":"open","path":dir.path().join("mismatch"),"schema":schema}))
         .unwrap()["value"]["handle"]
         .clone();
-    let first = json!({"scope":"book","fromCursor":0,"toCursor":0,"changes":[]});
+    let first = json!({"cursors":{"book":{"from":0,"to":0,"head":0}},"changes":[]});
     let epoch = streaming(&mut host, &id, &first);
-    let gap = json!({"scope":"book","fromCursor":5,"toCursor":6,"changes":[]}).to_string();
+    let gap = json!({"cursors":{"book":{"from":5,"to":6,"head":6}},"changes":[]}).to_string();
     host.call(json!({"op":"live","handle":id,"event":"message","epoch":epoch,"body":gap,"now":0}))
         .unwrap();
-    let other = json!({"scope":"other","fromCursor":0,"toCursor":2,"changes":[]}).to_string();
+    let other = json!({"cursors":{"other":{"from":0,"to":2,"head":2}},"changes":[]}).to_string();
     let ended = host
         .call(json!({"op":"live","handle":id,"event":"catchUp","epoch":epoch,"body":other,"now":0}))
         .unwrap()["value"]
@@ -384,4 +400,76 @@ fn transaction_scoped_commands_and_sync_commands_are_refused_by_code() {
             .to_string(),
         "client_closed"
     );
+}
+
+/// An incompatible schema at open keeps the old file while it holds unsent
+/// work, sends it through the same handle, then `rebuild` switches to a fresh
+/// file; every step is visible in `status().schema`.
+#[test]
+fn incompatible_schema_reports_pending_work_and_rebuild_switches_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut host = RuntimeHost::default();
+    let schema: Value =
+        serde_json::from_str(include_str!("../../../fixtures/schemas/entry.json")).unwrap();
+    let mut breaking = schema.clone();
+    breaking["models"][0]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name":"due","nullable":false,"type":{"kind":"scalar","name":"string"}}));
+    let opened = host
+        .call(json!({"op":"open","path":path,"schema":schema}))
+        .unwrap()["value"]
+        .clone();
+    assert_eq!(opened["schema"]["rebuilt"], false);
+    let id = opened["handle"].clone();
+    host.call(json!({"op":"direct","handle":id,"operation":{"model":"Entry","op":"create","identity":{"id":"e"},"values":{"text":"A","note":null}}})).unwrap();
+    host.call(json!({"op":"enqueue","handle":id,"mutation":{"name":"Edit","operations":[{"model":"Entry","op":"update","identity":{"id":"e"},"values":{"text":"B"}}]}})).unwrap();
+    host.call(json!({"op":"freeze","handle":id})).unwrap();
+    host.call(json!({"op":"close","handle":id})).unwrap();
+
+    let opened = host
+        .call(json!({"op":"open","path":path,"schema":breaking}))
+        .unwrap()["value"]
+        .clone();
+    let id = opened["handle"].clone();
+    let client_id = opened["clientId"].clone();
+    assert_eq!(opened["schema"]["rebuilt"], false);
+    assert_eq!(opened["schema"]["pending"]["pending"], 1);
+    assert!(
+        opened["schema"]["pending"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("due")
+    );
+    let status = host.call(json!({"op":"status","handle":id})).unwrap()["value"].clone();
+    assert_eq!(status["pending"], 1);
+    assert_eq!(
+        status["schema"]["pending"]["oldFile"].as_str().unwrap(),
+        path.to_string_lossy()
+    );
+    assert!(
+        host.call(json!({"op":"rebuild","handle":id})).is_err(),
+        "unsent work blocks the rebuild"
+    );
+    host.call(json!({"op":"ack","handle":id,"sequence":1,"receipt":{"clientId":client_id,"batchSequence":1,"rejections":[],"records":[{"model":"Entry","identity":{"id":"e"},"stamp":2,"state":{"text":"B","note":null}}]}})).unwrap();
+    let report = host.call(json!({"op":"rebuild","handle":id})).unwrap();
+    assert_eq!(report["value"]["leftPending"], 0);
+    assert!(
+        report["value"]["newFile"]
+            .as_str()
+            .unwrap()
+            .ends_with("db.1")
+    );
+    assert_eq!(report["changed"], true, "watchers learn the tables changed");
+    let status = host.call(json!({"op":"status","handle":id})).unwrap()["value"].clone();
+    assert_eq!(status["schema"]["rebuilt"], true);
+    assert!(status["schema"]["pending"].is_null());
+    assert!(
+        host.call(json!({"op":"read","handle":id,"key":{"model":"Entry","identity":{"id":"e"}}}))
+            .unwrap()["value"]
+            .is_null(),
+        "the fresh file is empty"
+    );
+    assert!(path.exists(), "the old file is kept");
 }

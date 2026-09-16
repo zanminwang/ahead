@@ -5,7 +5,7 @@ import {
 import { readFile, writeFile } from "node:fs/promises";
 import { createServer, request as httpRequest } from "node:http";
 import { connect as netConnect, type Socket } from "node:net";
-import { prisma } from "../../../packages/persistence-prisma/index.mts";
+import { prisma } from "../../../packages/postgres/index.mts";
 import {
   createBackend,
   devAuth,
@@ -48,7 +48,7 @@ const backend = createBackend({
 });
 const migration = await readFile(
   new URL(
-    "../../../packages/persistence-prisma/migration.sql",
+    "../../../packages/postgres/migration.sql",
     import.meta.url,
   ),
   "utf8",
@@ -61,16 +61,14 @@ for (const sql of migration
 await db.$executeRawUnsafe(
   'CREATE TABLE IF NOT EXISTS "Entry" (id TEXT PRIMARY KEY,text TEXT NOT NULL,note TEXT)',
 );
-await backend.transaction(async ({ tx, notify }) => {
+await backend.transaction(async ({ tx, changes, publish }) => {
   await tx.entry.upsert({
     where: { id: "entry-1" },
     create: { id: "entry-1", text: "seed", note: null },
     update: {},
   });
-  await notify({
-    channel: "book:demo",
-    records: [{ model: "Entry", identity: { id: "entry-1" } }],
-  });
+  changes.add({ model: "Entry", identity: { id: "entry-1" } });
+  publish({ channel: "book:demo" });
 });
 const started = await backend.listen({ port: 0, host: "127.0.0.1" });
 const target = new URL(started.url);

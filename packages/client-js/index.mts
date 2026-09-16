@@ -5,12 +5,19 @@ import { createServerConnection } from "./live.mts";
 export { Transaction, type QuerySpec } from "./transaction.mts";
 export type { RecordValue } from "./values.mts";
 export type { Connection, ConnectionOptions } from "./connection.mts";
+export {
+  AheadReport,
+  type ReportDetails,
+  type ReportKind,
+} from "./connection.mts";
 export type { ServerOptions } from "./live.mts";
 export type {
   ClientSyncState,
   ModelSyncState,
   PendingMutation,
+  RebuildReport,
   Rejection,
+  SchemaState,
 } from "./runtime.mts";
 const native = createRequire(import.meta.url)(
   "../../bindings/node/ahead-node.node",

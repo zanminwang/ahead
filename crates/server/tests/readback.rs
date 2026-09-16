@@ -416,6 +416,7 @@ fn success_reads_back_each_changed_record_once_at_its_stamp() {
             identity: json!({"id":"a"}),
             stamp: 1,
             state: json!({"text":"typed"}),
+            error: None,
         }]
     );
     assert_eq!(
@@ -842,10 +843,10 @@ fn a_loader_host_error_fails_the_whole_push() {
     assert_eq!(host.count("handle"), 1, "the handler had already run");
 }
 
-/// Loader rows the contract cannot accept, or a misaligned row count, fail the
-/// push with `loader.invalid`.
+/// Loader rows the contract cannot accept, or a misaligned row count, reject
+/// only the mutation being read back, with `loader.invalid`.
 #[test]
-fn invalid_loader_rows_fail_the_push() {
+fn invalid_loader_rows_reject_only_their_mutation() {
     for rows in [
         json!([1]),
         json!([{"id":"a"}]),
@@ -856,9 +857,18 @@ fn invalid_loader_rows_fail_the_push() {
         let host = Scripted::new();
         host.seed("Entry", "a", json!({"id":"a","text":"old"}));
         host.answer_load(0, Ok(rows.clone()));
-        let err = process(&config(), &push(1, vec![edit(1, "a", "typed")]), &host).unwrap_err();
-        assert_eq!(err.code, code::LOADER_INVALID, "{rows}: {err}");
-        assert_eq!(host.count("saveReceipt"), 0, "{rows}");
+        let receipt =
+            decode(&process(&config(), &push(1, vec![edit(1, "a", "typed")]), &host).unwrap());
+        assert_eq!(
+            receipt.rejections,
+            vec![ahead_core::Rejection {
+                ordinal: 1,
+                code: code::LOADER_INVALID.into()
+            }],
+            "{rows}"
+        );
+        assert!(receipt.records.is_empty(), "{rows}");
+        assert_eq!(host.count("rollback"), 1, "{rows}");
     }
 }
 

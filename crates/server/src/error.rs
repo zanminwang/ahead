@@ -48,10 +48,6 @@ pub mod code {
     pub const LOADER_UNREGISTERED: &str = "loader.unregistered";
     /// A loader returned rows the schema cannot accept.
     pub const LOADER_INVALID: &str = "loader.invalid";
-    /// A loader refused a read while serving a page. In a push the same
-    /// refusal is the affected mutation's rejection instead; per-read
-    /// isolation for pages is [#95](https://github.com/zanminwang/ahead/issues/95).
-    pub const LOADER_REFUSED: &str = "loader.refused";
     /// A publish request is malformed.
     pub const PUBLISH_INVALID: &str = "publish.invalid";
     /// A live page does not continue the subscription it was produced for.

@@ -77,6 +77,9 @@ class Client implements ReadPort, MutatePort {
     required Map<String, dynamic> schema,
     String? libraryPath,
     Map<String, dynamic>? migration,
+
+    /// Rebuild at once when the schema is incompatible, leaving unsent work in the old file.
+    bool discardPending = false,
   }) async {
     final ready = ReceivePort();
     final isolate = await Isolate.spawn(_nativeWorker, [
@@ -95,6 +98,7 @@ class Client implements ReadPort, MutatePort {
         'path': path,
         'schema': schema,
         if (migration != null) 'migration': migration,
+        if (discardPending) 'discardPending': true,
       });
       final value = opened['value'] as Map;
       return Client._(
@@ -278,7 +282,7 @@ class Client implements ReadPort, MutatePort {
             'entropy': entropy,
           }),
         ),
-        sync: (transport) => _startSync(transport, true),
+        sync: (transport) => _startSync(transport, true, onError),
         transport: transport,
         onError: onError,
         refreshAuth: refreshAuth == null ? null : refresh,
@@ -337,13 +341,17 @@ class Client implements ReadPort, MutatePort {
     }
   }
 
-  Future<void> _startSync(Transport transport, bool pushOnly) =>
-      _syncing ??= _runSync(transport, pushOnly).whenComplete(() {
-        _syncing = null;
-      });
+  Future<void> _startSync(
+    Transport transport,
+    bool pushOnly,
+    void Function(Object)? onError,
+  ) => _syncing ??= _runSync(transport, pushOnly, onError).whenComplete(() {
+    _syncing = null;
+  });
   Future<void> _runSync(
     Future<String> Function(String kind, String body) transport,
     bool pushOnly,
+    void Function(Object)? onError,
   ) async {
     await _exclusive(() => _send({'op': 'startSync', 'pushOnly': pushOnly}));
     while (true) {
@@ -353,9 +361,14 @@ class Client implements ReadPort, MutatePort {
         action['kind'] as String,
         action['body'] as String,
       );
-      await _exclusive(
+      final reports = await _exclusive(
         () => _send({'op': 'complete', 'response': jsonDecode(response)}),
       );
+      // What the receipt or page could not apply; the client stays consistent
+      // and the application hears about each one.
+      for (final report in reports as List<dynamic>) {
+        onError?.call(AheadReport.fromJson(report as Map<String, dynamic>));
+      }
     }
   }
 
@@ -423,6 +436,16 @@ class Client implements ReadPort, MutatePort {
   Future<Map<String, dynamic>> syncState() => _exclusive(
     () async => (await _send({'op': 'status'})) as Map<String, dynamic>,
   );
+
+  /// Leave an incompatible database behind and open a fresh file for the
+  /// schema this client asked for. Refused while unsent mutations remain
+  /// unless [discardPending]; the report says what the old file keeps.
+  Future<Map<String, dynamic>> rebuild({bool discardPending = false}) =>
+      _exclusive(
+        () async =>
+            (await _send({'op': 'rebuild', 'discardPending': discardPending}))
+                as Map<String, dynamic>,
+      );
   Future<List<Map<String, dynamic>>> pendingTasks() => _exclusive(
     () async =>
         (await _send({'op': 'tasks'}) as List).cast<Map<String, dynamic>>(),

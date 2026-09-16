@@ -280,6 +280,7 @@ const GENERATED_NAMES: &[&str] = &[
     "PendingMutation",
     "Present",
     "ReadPort",
+    "RebuildReport",
     "Rejection",
     "RuntimeConnection",
     "SyncServer",

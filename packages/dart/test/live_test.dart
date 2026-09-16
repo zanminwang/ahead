@@ -7,8 +7,28 @@ import 'package:test/test.dart';
 
 final subscribeFrame = jsonEncode({
   'type': 'subscribe',
-  'scopes': ['scope'],
+  'channels': ['scope'],
 });
+
+/// The acknowledgement: every subscribed channel at `head`.
+String ack(Map sub, [int head = 0]) => jsonEncode({
+  'type': 'subscribed',
+  'cursors': {for (final channel in sub['channels'] as List) channel: head},
+});
+Map<String, dynamic> range(int from, int to, [int? head]) => {
+  'from': from,
+  'to': to,
+  'head': head ?? to,
+};
+
+/// An HTTP answer that moves nothing: every requested channel stays where it is.
+Map<String, dynamic> emptyPage(Map pull) => {
+  'cursors': {
+    for (final entry in (pull['cursors'] as Map).entries)
+      entry.key: range(entry.value as int, entry.value as int),
+  },
+  'changes': <Object>[],
+};
 SocketEvents events({
   Future<void> Function(String)? message,
   void Function(Object, StackTrace?)? closed,
@@ -88,18 +108,10 @@ void main() {
         final socket = await WebSocketTransformer.upgrade(request);
         socket.listen((message) {
           handshake.complete(jsonDecode(message as String) as Map);
+          socket.add(ack(jsonDecode(message) as Map));
           socket.add(
             jsonEncode({
-              'type': 'subscribed',
-              'scopes': ['scope'],
-              'rejections': [],
-            }),
-          );
-          socket.add(
-            jsonEncode({
-              'scope': 'scope',
-              'fromCursor': 7,
-              'toCursor': 8,
+              'cursors': {'scope': range(7, 8)},
               'changes': [],
             }),
           );
@@ -127,7 +139,7 @@ void main() {
       try {
         expect(await handshake.future.timeout(const Duration(seconds: 2)), {
           'type': 'subscribe',
-          'scopes': ['scope'],
+          'channels': ['scope'],
         });
         await second.future.timeout(const Duration(seconds: 2));
         expect(
@@ -135,7 +147,7 @@ void main() {
           'subscribed',
           reason: 'the transport does not interpret frames',
         );
-        expect(frames[1]['toCursor'], 8);
+        expect(frames[1]['cursors']['scope']['to'], 8);
         cancel.complete();
         await finished.future.timeout(const Duration(seconds: 2));
       } finally {
@@ -323,14 +335,7 @@ void main() {
         if (request.uri.path == '/sync/pull') {
           final pull =
               jsonDecode(await utf8.decoder.bind(request).join()) as Map;
-          request.response.write(
-            jsonEncode({
-              'scope': pull['scope'],
-              'fromCursor': pull['fromCursor'],
-              'toCursor': pull['fromCursor'],
-              'changes': [],
-            }),
-          );
+          request.response.write(jsonEncode(emptyPage(pull)));
           await request.response.close();
           return;
         }
@@ -338,13 +343,7 @@ void main() {
         sockets.add(socket);
         socket.listen((message) {
           final sub = jsonDecode(message as String) as Map;
-          socket.add(
-            jsonEncode({
-              'type': 'subscribed',
-              'scopes': sub['scopes'],
-              'rejections': [],
-            }),
-          );
+          socket.add(ack(sub));
           if (!accepted.isCompleted) accepted.complete();
         });
       });
@@ -418,12 +417,9 @@ void main() {
       // session carry newer stamps than the first session's did.
       var stampBase = 0;
       Map<String, dynamic> page(String text, int cursor) => {
-        'scope': 'scope',
-        'fromCursor': cursor,
-        'toCursor': cursor + 1,
+        'cursors': {'scope': range(cursor, cursor + 1)},
         'changes': [
           {
-            'syncId': cursor + 1,
             'model': 'Entry',
             'identity': {'id': 'live'},
             'stamp': stampBase + cursor + 1,
@@ -432,20 +428,15 @@ void main() {
         ],
       };
       var pulls = 0;
-      Map<String, dynamic>? recovery;
+      Map<String, dynamic> Function(int from)? recovery;
       server.listen((r) async {
         if (r.uri.path == '/sync/pull') {
           pulls++;
           final pull = jsonDecode(await utf8.decoder.bind(r).join()) as Map;
           r.response.write(
             jsonEncode(
-              recovery ??
-                  {
-                    'scope': pull['scope'],
-                    'fromCursor': pull['fromCursor'],
-                    'toCursor': pull['fromCursor'],
-                    'changes': [],
-                  },
+              recovery?.call((pull['cursors'] as Map)['scope'] as int) ??
+                  emptyPage(pull),
             ),
           );
           await r.response.close();
@@ -456,13 +447,7 @@ void main() {
         socket.listen((message) {
           final sub = jsonDecode(message as String) as Map;
           handshakes.add(sub);
-          socket.add(
-            jsonEncode({
-              'type': 'subscribed',
-              'scopes': sub['scopes'],
-              'rejections': [],
-            }),
-          );
+          socket.add(ack(sub));
         });
       });
       try {
@@ -511,8 +496,13 @@ void main() {
         );
         expect(errors, isEmpty);
         final beforeOverlap = pulls;
-        recovery = page('overlap recovered', 1);
-        sockets.last.add(jsonEncode({...page('overlap', 1), 'fromCursor': 0}));
+        recovery = (from) => page('overlap recovered', from);
+        sockets.last.add(
+          jsonEncode({
+            ...page('overlap', 1),
+            'cursors': {'scope': range(0, 2)},
+          }),
+        );
         await until(
           () async =>
               (await client.read('Entry', {'id': 'live'}))?['text'] ==
@@ -525,7 +515,10 @@ void main() {
         );
         expect((await client.syncState())['cursors']['scope'], 2);
         sockets.last.add(
-          jsonEncode({...page('duplicate', 1), 'fromCursor': 0}),
+          jsonEncode({
+            ...page('duplicate', 1),
+            'cursors': {'scope': range(0, 2)},
+          }),
         );
         await Future<void>.delayed(const Duration(milliseconds: 30));
         expect(pulls, beforeOverlap);
@@ -534,7 +527,11 @@ void main() {
           'overlap',
         );
         final before = pulls;
-        recovery = page('recovered', 2);
+        // The pull covers the gap frame: from the cursor up to the frame's end.
+        recovery = (from) => {
+          ...page('recovered', from),
+          'cursors': {'scope': range(from, 11)},
+        };
         sockets.last.add(jsonEncode(page('gap', 10)));
         await until(
           () async =>
@@ -577,18 +574,18 @@ void main() {
       var entered = Completer<void>();
       var held = true;
       var version = 'initial';
+      var serverHead = 55;
       // A resubscribed channel restarts at cursor 0 while the records it
       // delivered before are retained at their stamps, so the "fresh" catch-up
       // carries newer stamps than the "initial" one did.
       var stampBase = 0;
       Map<String, dynamic> page(int from, int to, String text) => {
-        'scope': 'scope',
-        'fromCursor': from,
-        'toCursor': to,
+        'cursors': {
+          'scope': range(from, to, to > serverHead ? to : serverHead),
+        },
         'changes': [
           for (var cursor = from + 1; cursor <= to; cursor++)
             {
-              'syncId': cursor,
               'model': 'Entry',
               'identity': {'id': 'e$cursor'},
               'stamp': stampBase + cursor,
@@ -610,9 +607,13 @@ void main() {
           expect(acknowledged, isTrue, reason: 'listeners must precede HTTP');
           final body =
               jsonDecode(await utf8.decoder.bind(request).join()) as Map;
-          final from = body['fromCursor'] as int;
+          final from = (body['cursors'] as Map)['scope'] as int;
           requests.add(from);
-          final result = page(from, from == 0 ? 50 : 55, version);
+          final result = page(
+            from,
+            from == 0 ? 50 : (from < 55 ? 55 : serverHead),
+            version,
+          );
           if (held) {
             held = false;
             entered.complete();
@@ -630,13 +631,7 @@ void main() {
           final sub = jsonDecode(message as String) as Map;
           expect(sub.containsKey('cursors'), isFalse);
           acknowledged = true;
-          socket.add(
-            jsonEncode({
-              'type': 'subscribed',
-              'scopes': sub['scopes'],
-              'rejections': [],
-            }),
-          );
+          socket.add(ack(sub, serverHead));
         });
       });
       try {
@@ -666,6 +661,9 @@ void main() {
         held = true;
         hold = Completer<void>();
         entered = Completer<void>();
+        // The server moved on: the acknowledgement's head is beyond the
+        // durable cursor, so the reconnect pulls from it.
+        serverHead = 57;
         await connection.resume();
         await entered.future.timeout(const Duration(seconds: 3));
         expect(requests.last, 56);
@@ -679,9 +677,11 @@ void main() {
               (await client.read('Entry', {'id': 'e55'}))?['text'] == 'fresh',
         );
         expect((await client.read('Entry', {'id': 'e1'}))?['text'], 'fresh');
-        // The record only the earlier session delivered is retained as it was.
-        expect((await client.read('Entry', {'id': 'e56'}))?['text'], 'live');
-        expect((await client.query('Entry')).length, 56);
+        // The fresh session pulls to the server's head: the record the earlier
+        // session delivered is delivered again, on a newer stamp.
+        expect((await client.read('Entry', {'id': 'e56'}))?['text'], 'fresh');
+        expect((await client.read('Entry', {'id': 'e57'}))?['text'], 'fresh');
+        expect((await client.query('Entry')).length, 57);
         expect(errors, isEmpty);
         await connection.close();
       } finally {
@@ -914,13 +914,7 @@ void moreTests() {
           sockets.add(socket);
           socket.listen((message) {
             final sub = jsonDecode(message as String) as Map;
-            socket.add(
-              jsonEncode({
-                'type': 'subscribed',
-                'scopes': sub['scopes'],
-                'rejections': [],
-              }),
-            );
+            socket.add(ack(sub, 1));
           });
           return;
         }
@@ -931,17 +925,14 @@ void moreTests() {
           r.response.write(jsonEncode(receiptFor(body, stamps)));
         } else {
           pulls++;
-          final from = body['fromCursor'] as int;
+          final from = (body['cursors'] as Map)['scope'] as int;
           // The catch-up page carries a stamp newer than the receipt's, so it
           // is authority that updates the row.
           r.response.write(
             jsonEncode({
-              'scope': 'scope',
-              'fromCursor': from,
-              'toCursor': from + 1,
+              'cursors': {'scope': range(from, from + 1)},
               'changes': [
                 {
-                  'syncId': from + 1,
                   'model': 'Entry',
                   'identity': {'id': 'live'},
                   'stamp': stamps.next + 1,
@@ -1052,12 +1043,9 @@ void moreTests() {
       var head = 1, pulls = 0;
       final pullCursors = <int>[];
       Map<String, dynamic> page(String text, int cursor, int to) => {
-        'scope': 'scope',
-        'fromCursor': cursor,
-        'toCursor': to,
+        'cursors': {'scope': range(cursor, to)},
         'changes': [
           {
-            'syncId': to,
             'model': 'Entry',
             'identity': {'id': 'live'},
             'stamp': to,
@@ -1080,19 +1068,13 @@ void moreTests() {
           sockets.add(socket);
           socket.listen((message) {
             final sub = jsonDecode(message as String) as Map;
-            socket.add(
-              jsonEncode({
-                'type': 'subscribed',
-                'scopes': sub['scopes'],
-                'rejections': [],
-              }),
-            );
+            socket.add(ack(sub, 1));
           });
           return;
         }
         final body = jsonDecode(await utf8.decoder.bind(r).join()) as Map;
         pulls++;
-        final from = body['fromCursor'] as int;
+        final from = (body['cursors'] as Map)['scope'] as int;
         pullCursors.add(from);
         final response = page('head $head', from, head);
         if (pulls == 1) {
@@ -1204,14 +1186,7 @@ void moreTests() {
         if (request.uri.path == '/sync/pull') {
           final pull =
               jsonDecode(await utf8.decoder.bind(request).join()) as Map;
-          request.response.write(
-            jsonEncode({
-              'scope': pull['scope'],
-              'fromCursor': pull['fromCursor'],
-              'toCursor': pull['fromCursor'],
-              'changes': <Object>[],
-            }),
-          );
+          request.response.write(jsonEncode(emptyPage(pull)));
           await request.response.close();
           return;
         }
@@ -1219,13 +1194,7 @@ void moreTests() {
         sockets.add(socket);
         socket.listen((message) {
           final sub = jsonDecode(message as String) as Map;
-          socket.add(
-            jsonEncode({
-              'type': 'subscribed',
-              'scopes': sub['scopes'],
-              'rejections': <Object>[],
-            }),
-          );
+          socket.add(ack(sub));
           if (!accepted.isCompleted) accepted.complete();
         });
       });
@@ -1351,14 +1320,7 @@ void moreTests() {
         if (request.uri.path == '/sync/pull') {
           final pull =
               jsonDecode(await utf8.decoder.bind(request).join()) as Map;
-          request.response.write(
-            jsonEncode({
-              'scope': pull['scope'],
-              'fromCursor': pull['fromCursor'],
-              'toCursor': pull['fromCursor'],
-              'changes': <Object>[],
-            }),
-          );
+          request.response.write(jsonEncode(emptyPage(pull)));
           await request.response.close();
           return;
         }
@@ -1368,13 +1330,7 @@ void moreTests() {
         socket.listen((message) {
           final sub = jsonDecode(message as String) as Map<String, dynamic>;
           subscribes.add(sub);
-          socket.add(
-            jsonEncode({
-              'type': 'subscribed',
-              'scopes': sub['scopes'],
-              'rejections': <Object>[],
-            }),
-          );
+          socket.add(ack(sub));
         });
       });
       Future<void> until(
@@ -1425,17 +1381,14 @@ void moreTests() {
         await until(() => subscribes.length == 2, 'second subscribe');
         expect(subscribes[1], {
           'type': 'subscribe',
-          'scopes': ['scope'],
+          'channels': ['scope'],
           'models': {'Entry': 1},
         });
         sockets[1].add(
           jsonEncode({
-            'scope': 'scope',
-            'fromCursor': 0,
-            'toCursor': 1,
+            'cursors': {'scope': range(0, 1)},
             'changes': [
               {
-                'syncId': 1,
                 'model': 'Entry',
                 'identity': {'id': 'live'},
                 'stamp': 1,
@@ -1483,12 +1436,9 @@ void moreTests() {
       var head = 1, pulls = 0;
       final pullCursors = <int>[];
       Map<String, dynamic> page(String text, int cursor, int to) => {
-        'scope': 'scope',
-        'fromCursor': cursor,
-        'toCursor': to,
+        'cursors': {'scope': range(cursor, to)},
         'changes': [
           {
-            'syncId': to,
             'model': 'Entry',
             'identity': {'id': 'live'},
             'stamp': to,
@@ -1521,19 +1471,13 @@ void moreTests() {
           sockets.add(socket);
           socket.listen((message) {
             final sub = jsonDecode(message as String) as Map;
-            socket.add(
-              jsonEncode({
-                'type': 'subscribed',
-                'scopes': sub['scopes'],
-                'rejections': [],
-              }),
-            );
+            socket.add(ack(sub, 1));
           });
           return;
         }
         final body = jsonDecode(await utf8.decoder.bind(r).join()) as Map;
         pulls++;
-        final from = body['fromCursor'] as int;
+        final from = (body['cursors'] as Map)['scope'] as int;
         pullCursors.add(from);
         final response = page('head $head', from, head);
         if (pulls == 1) {
@@ -1677,6 +1621,198 @@ void moreTests() {
         );
       } finally {
         await client.close();
+        await server.close(force: true);
+        await dir.delete(recursive: true);
+      }
+    },
+  );
+
+  test(
+    'what a page cannot apply reaches onError as an AheadReport: read failures, skipped changes and divergence',
+    () async {
+      final dir = await Directory.systemTemp.createTemp('ahead-dart-reports-');
+      final schema =
+          jsonDecode(
+                await File('../../fixtures/schemas/entry.json').readAsString(),
+              )
+              as Map<String, dynamic>;
+      final client = await Client.open(
+        path: '${dir.path}/db',
+        schema: schema,
+        libraryPath: Platform.environment['AHEAD_LIBRARY']!,
+      );
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final sockets = <WebSocket>[];
+      final errors = <Object>[];
+      var allowPush = false;
+      var breakReceipt = false;
+      final stamps = FakeStamps()..next = 10;
+      Future<void> until(FutureOr<bool> Function() check) async {
+        final deadline = DateTime.now().add(const Duration(seconds: 5));
+        while (DateTime.now().isBefore(deadline)) {
+          if (await check()) return;
+          await Future<void>.delayed(const Duration(milliseconds: 5));
+        }
+        throw StateError('condition timed out: $errors');
+      }
+
+      server.listen((r) async {
+        if (WebSocketTransformer.isUpgradeRequest(r)) {
+          final socket = await WebSocketTransformer.upgrade(r);
+          sockets.add(socket);
+          socket.listen((message) {
+            socket.add(ack(jsonDecode(message as String) as Map));
+          });
+          return;
+        }
+        final body = jsonDecode(await utf8.decoder.bind(r).join()) as Map;
+        r.response.headers.contentType = ContentType.json;
+        if (r.uri.path == '/sync/mutations') {
+          if (!allowPush) {
+            r.response.statusCode = HttpStatus.serviceUnavailable;
+            await r.response.close();
+            return;
+          }
+          final receipt = receiptFor(body, stamps);
+          if (breakReceipt) {
+            ((receipt['records'] as List).first as Map)['state'] = {
+              'text': 5,
+              'note': null,
+            };
+          }
+          r.response.write(jsonEncode(receipt));
+        } else {
+          r.response.write(jsonEncode(emptyPage(body)));
+        }
+        await r.response.close();
+      });
+      Map<String, dynamic> record(
+        String id,
+        int stamp,
+        Map<String, dynamic>? state,
+      ) => {
+        'model': 'Entry',
+        'identity': {'id': id},
+        'stamp': stamp,
+        'state': state,
+      };
+      try {
+        await client.subscribe('scope');
+        final connection = await client.connect(
+          SyncServer(
+            url: 'http://127.0.0.1:${server.port}',
+            token: () => 'secret',
+          ),
+          onError: errors.add,
+        );
+        await until(() => sockets.length == 1);
+        sockets.first.add(
+          jsonEncode({
+            'cursors': {'scope': range(0, 1)},
+            'changes': [
+              record('live', 1, {'text': 'first', 'note': null}),
+            ],
+          }),
+        );
+        await until(
+          () async =>
+              (await client.read('Entry', {'id': 'live'}))?['text'] == 'first',
+        );
+        // A record the server could not read, and one whose state does not
+        // fit the schema: each is reported, the page still lands.
+        sockets.first.add(
+          jsonEncode({
+            'cursors': {'scope': range(1, 3)},
+            'changes': [
+              {
+                'model': 'Entry',
+                'identity': {'id': 'live'},
+                'stamp': 9,
+                'error': 'loader.failed',
+              },
+              record('bad', 2, {'text': 5, 'note': null}),
+            ],
+          }),
+        );
+        await until(() => errors.length == 2);
+        final reports = errors.cast<AheadReport>();
+        expect(reports[0].kind, 'readFailed');
+        expect(reports[0].code, 'loader.failed');
+        expect(reports[0].identity, {'id': 'live'});
+        expect(reports[0].stamp, 9);
+        expect(reports[0].toString(), contains('loader.failed'));
+        expect(reports[1].kind, 'skipped');
+        expect(reports[1].identity, {'id': 'bad'});
+        expect(
+          (await client.read('Entry', {'id': 'live'}))?['text'],
+          'first',
+          reason: 'a read failure keeps the local content',
+        );
+        expect((await client.syncState())['cursors']['scope'], 3);
+        // A queued edit whose replay fails over new authority: the server's
+        // row is visible, the edit is reported diverged and still sent.
+        errors.clear();
+        await client.mutate({
+          'name': 'Edit',
+          'operations': [
+            {
+              'model': 'Entry',
+              'op': 'update',
+              'identity': {'id': 'live'},
+              'values': {'text': 'edited offline'},
+            },
+          ],
+        });
+        sockets.first.add(
+          jsonEncode({
+            'cursors': {'scope': range(3, 4)},
+            'changes': [record('live', 2, null)],
+          }),
+        );
+        await until(() => errors.whereType<AheadReport>().isNotEmpty);
+        final diverged = errors.whereType<AheadReport>().first;
+        expect(diverged.kind, 'diverged');
+        expect(diverged.ordinal, isA<int>());
+        expect(diverged.identity, {'id': 'live'});
+        expect(
+          await client.read('Entry', {'id': 'live'}),
+          isNull,
+          reason: "the server's row (a deletion) is visible",
+        );
+        expect((await client.syncState())['pending'], 1);
+        allowPush = true;
+        await until(() async => (await client.syncState())['pending'] == 0);
+        expect(
+          (await client.read('Entry', {'id': 'live'}))?['text'],
+          'edited offline',
+          reason: 'the diverged edit was sent and completed from its receipt',
+        );
+        // A receipt record that does not fit is reported with its batch, and
+        // the batch still completes.
+        errors.clear();
+        breakReceipt = true;
+        await client.mutate({
+          'name': 'Create',
+          'operations': [
+            {
+              'model': 'Entry',
+              'op': 'create',
+              'identity': {'id': 'odd'},
+              'values': {'text': 'local', 'note': null},
+            },
+          ],
+        });
+        await until(() async => (await client.syncState())['pending'] == 0);
+        final skipped = errors.whereType<AheadReport>().single;
+        expect(skipped.kind, 'skipped');
+        expect(skipped.identity, {'id': 'odd'});
+        expect((skipped.detail as Map)['batch'], isA<int>());
+        await connection.close();
+      } finally {
+        await client.close();
+        for (final socket in sockets) {
+          await socket.close();
+        }
         await server.close(force: true);
         await dir.delete(recursive: true);
       }

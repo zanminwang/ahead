@@ -71,7 +71,7 @@ fn a1_server_value_overrides_optimism_and_later_edits_replay() {
     sim.check().unwrap();
 }
 
-/// A2: a page whose fromCursor is behind is stale and does not move the cursor back;
+/// A2: a page whose channel range is already covered is stale and does not move the cursor back;
 /// a page ahead is refused.
 #[test]
 fn a2_pages_apply_only_in_cursor_order() {
@@ -82,11 +82,7 @@ fn a2_pages_apply_only_in_cursor_order() {
         channels: vec!["a".into()],
     })
     .unwrap();
-    sim.apply(Action::Pull {
-        client: 0,
-        channel: "a".into(),
-    })
-    .unwrap();
+    sim.apply(Action::Pull { client: 0 }).unwrap();
     sim.apply(Action::Deliver).unwrap();
     sim.apply(Action::Duplicate).unwrap(); // the same page twice
     sim.apply(Action::Deliver).unwrap();
@@ -106,11 +102,7 @@ fn reordered_receipt_and_page_agree_in_either_order() {
         edit(&mut sim, 0, "x");
         sim.apply(Action::Freeze { client: 0 }).unwrap();
         sim.apply(Action::Deliver).unwrap(); // executed, receipt queued
-        sim.apply(Action::Pull {
-            client: 0,
-            channel: "a".into(),
-        })
-        .unwrap();
+        sim.apply(Action::Pull { client: 0 }).unwrap();
         sim.apply(Action::Hold).unwrap(); // receipt to the back
         sim.apply(Action::Deliver).unwrap(); // pull request -> page queued
         if page_first {
@@ -223,11 +215,7 @@ fn a2_page_from_a_previous_subscription_is_stale_not_a_gap() {
     .unwrap();
     sim.apply(Action::Freeze { client: 0 }).unwrap();
     sim.drain();
-    sim.apply(Action::Pull {
-        client: 0,
-        channel: "a".into(),
-    })
-    .unwrap();
+    sim.apply(Action::Pull { client: 0 }).unwrap();
     sim.drain();
     sim.apply(Action::Enqueue {
         client: 0,
@@ -239,11 +227,7 @@ fn a2_page_from_a_previous_subscription_is_stale_not_a_gap() {
     .unwrap();
     sim.apply(Action::Freeze { client: 0 }).unwrap();
     sim.drain();
-    sim.apply(Action::Pull {
-        client: 0,
-        channel: "a".into(),
-    })
-    .unwrap();
+    sim.apply(Action::Pull { client: 0 }).unwrap();
     sim.apply(Action::Unsubscribe {
         client: 0,
         channel: "a".into(),
@@ -368,11 +352,7 @@ fn deletion_completes_from_the_receipt_and_reaches_a_peer_at_the_same_stamp() {
         sim.read_text(1, &entry_key("e1")).as_deref(),
         Some("doomed")
     );
-    sim.apply(Action::Pull {
-        client: 1,
-        channel: "a".into(),
-    })
-    .unwrap();
+    sim.apply(Action::Pull { client: 1 }).unwrap();
     sim.drain();
     assert_eq!(sim.read_text(1, &entry_key("e1")), None);
     assert_eq!(sim.client(1).record_stamp(&entry_key("e1")).unwrap(), stamp);

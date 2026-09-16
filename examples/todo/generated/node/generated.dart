@@ -175,8 +175,8 @@ class GeneratedClient {
  late final Channels channels = Channels(client);
  GeneratedClient._(this.client, this.connection);
  /// Opens the local database at [path]. With a [server], the connection starts immediately and retries on its own.
- static Future<GeneratedClient> open({required String path, SyncServer? server, String? libraryPath, Map<String,dynamic>? migration, void Function(Object)? onError, Future<void> Function()? refreshAuth}) async {
-  final client = await Client.open(path:path, schema:schema, libraryPath:libraryPath, migration:migration);
+ static Future<GeneratedClient> open({required String path, SyncServer? server, String? libraryPath, Map<String,dynamic>? migration, bool discardPending = false, void Function(Object)? onError, Future<void> Function()? refreshAuth}) async {
+  final client = await Client.open(path:path, schema:schema, libraryPath:libraryPath, migration:migration, discardPending:discardPending);
   try {
   final connection = server == null ? null : await client.connect(server, onError:onError, refreshAuth:refreshAuth);
   return GeneratedClient._(client, connection);
@@ -187,6 +187,8 @@ class GeneratedClient {
  String get clientId => client.clientId;
  /// The client's sync state: a local snapshot, not a network probe.
  Future<Map<String,dynamic>> syncState() => client.syncState();
+ /// Leave an incompatible database behind for a fresh file; refused while unsent work remains unless [discardPending].
+ Future<Map<String,dynamic>> rebuild({bool discardPending = false}) => client.rebuild(discardPending: discardPending);
  /// Remove a handled rejection from the local inbox; it is not retried.
  Future<void> dismissRejection(int ordinal) => client.dismissRejection(ordinal);
  /// Remove unsent work and recompute local state; frozen work cannot be dropped.

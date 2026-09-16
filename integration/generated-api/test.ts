@@ -1,4 +1,5 @@
 import type {Handlers,Loaders,EntryV1} from './backend.ts';
+import type {GeneratedClient} from './client.ts';
 import {CreateEntry,EditEntry,RemoveEntries,decodeEntry,encodeEntry,EntryModel,EntryLiveModel,GeneratedTransaction,Mutate,type Entry,type ReadPort,type LivePort,type WritePort,type MutationName,type SyncState} from './generated.ts';
 const row:Entry={id:'123e4567-e89b-42d3-a456-426614174000',title:'hello',note:null,at:new Date('2026-01-01T00:00:00Z'),tags:['x'],status:'active'};
 function check(v:unknown,m:string){if(!v)throw Error(m)}
@@ -82,3 +83,13 @@ if(false){
 const tx=new GeneratedTransaction({...reads,async mutate(m){check(JSON.stringify(m)===JSON.stringify(create),'forwarding');return 1},async direct(op){check(JSON.stringify(op)===JSON.stringify({model:'Entry',op:'delete',identity:{id:row.id}}),'local write');}});
 async function main(){check((await tx.models.entry.get({id:row.id}))?.at instanceof Date,'read decode');check((await tx.models.entry.query()).length===1,'query facade');check(await tx.mutate.createEntry({entry:row})===1,'mutate facade');await tx.models.entry.delete({id:row.id});}
 main();
+// The generated client carries the schema check and the rebuild call.
+type Rebuilt=Awaited<ReturnType<GeneratedClient['rebuild']>>;
+type SchemaCheck=Awaited<ReturnType<GeneratedClient['syncState']>>['schema'];
+const rebuildShape=(report:Rebuilt,state:SchemaCheck):[number,number,boolean]=>[report.leftPending,report.leftDirect,state.rebuilt];
+void rebuildShape;
+function misuse(app:GeneratedClient){
+ // @ts-expect-error rebuild takes an options object
+ void app.rebuild(true);
+}
+void misuse;

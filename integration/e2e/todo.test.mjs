@@ -223,7 +223,11 @@ test('a distinct create with an existing id is rejected as todo.id_conflict and 
   await setDone(bob, 'conflict-1', true);
   await ctx.settled(bob);
   assert.equal((await ctx.row('conflict-1')).done, true, 'the connection stays usable after the refusal');
-  assert.equal(ctx.errors.length, 0, String(ctx.errors));
+  // If the page carrying Alice's row lands before Bob's receipt, Bob's queued
+  // create no longer replays over it and is reported as diverged (D8). Nothing
+  // else may reach onError.
+  const others = ctx.errors.filter(error => !(error?.kind === 'diverged' && error.identity?.id === 'conflict-1'));
+  assert.equal(others.length, 0, String(others));
  });
 });
 

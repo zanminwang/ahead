@@ -209,4 +209,51 @@ void main() {
       }
     },
   );
+
+  test(
+    'an incompatible schema keeps unsent work in the old file until rebuild is asked to leave it',
+    () async {
+      final fixture = await Fixture.create('ahead-dart-rebuild-');
+      final breaking =
+          jsonDecode(jsonEncode(fixture.schema)) as Map<String, dynamic>;
+      (breaking['models'][0]['fields'] as List).add({
+        'name': 'due',
+        'nullable': false,
+        'type': {'kind': 'scalar', 'name': 'string'},
+      });
+      try {
+        var client = await fixture.open();
+        expect((await client.syncState())['schema']['rebuilt'], false);
+        await seed(client);
+        await client.mutate({
+          'name': 'Edit',
+          'operations': [update('offline')],
+        });
+        expect(await client.freeze(), isNotNull);
+        await client.close();
+
+        client = await Client.open(
+          path: fixture.path,
+          schema: breaking,
+          libraryPath: Platform.environment['AHEAD_LIBRARY']!,
+        );
+        var status = await client.syncState();
+        expect(status['schema']['rebuilt'], false);
+        expect(status['schema']['pending']['pending'], 1);
+        expect(status['schema']['pending']['reason'], contains('due'));
+        await expectLater(client.rebuild(), throwsStateError);
+        final report = await client.rebuild(discardPending: true);
+        expect(report['leftPending'], 1);
+        expect(report['newFile'], endsWith('db.1'));
+        status = await client.syncState();
+        expect(status['schema']['rebuilt'], true);
+        expect(status['schema']['pending'], isNull);
+        expect(await text(client), isNull);
+        expect(File(fixture.path).existsSync(), isTrue);
+        await client.close();
+      } finally {
+        await fixture.dispose();
+      }
+    },
+  );
 }

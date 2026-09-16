@@ -13,7 +13,9 @@ export type {
   ClientSyncState,
   ModelSyncState,
   PendingMutation,
+  RebuildReport,
   Rejection,
+  SchemaState,
 } from "../client-js/runtime.mts";
 
 const native = requireNativeModule<{

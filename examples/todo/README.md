@@ -66,7 +66,7 @@ Each installation keeps its own database file and client identity under Applicat
 
 ## Walkthrough
 
-1. **Two tables.** `models/todo.model` declares `User(id, name)` and `Todo(id, title, done, createdById)` with `createdBy` as a reference. The backend adds no other application tables; Ahead's own sync tables come from `packages/persistence-prisma/migration.sql`.
+1. **Two tables.** `models/todo.model` declares `User(id, name)` and `Todo(id, title, done, createdById)` with `createdBy` as a reference. The backend adds no other application tables; Ahead's own sync tables come from `packages/postgres/migration.sql`.
 2. **Two operations.** `AddTodo` creates a task; `SetTodoDone` updates only `done`. The compiler emits typed builders for the app and typed `Handlers`/`Loaders` for the backend from the same file, so the wire shapes cannot drift.
 3. **Backend rules.** `server.mts` trims the title and refuses empty ones, requires the creator to be the authenticated user and `done` to start false, and turns only a proven primary-key collision into `todo.id_conflict`. Each handler publishes the changed record on channel `todo:demo` inside the same database transaction, so a notification never precedes its data.
 4. **Local watch.** `mobile/src/todo.ts` opens the generated client on a per-user database, subscribes to `todo:demo`, and exposes `watch`, `add` and `setDone`. `add` and `setDone` return after the local commit; the screen renders from watch callbacks only, never from a second in-memory store.

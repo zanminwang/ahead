@@ -21,31 +21,32 @@ The generated client is the whole client: besides the [typed model and mutation 
 
 The compiled schema is embedded in the generated client. `client.clientId` is a read-only, persistent identity for that database, used for retry deduplication. Use one active client per database and a separate file per signed-in user. Do not duplicate a database and then let both copies independently send mutations under the same client identity.
 
-Both forms accept `migration`. For an explicitly changed descriptor:
+When the schema compiled into the client differs from the one the database was built for, the runtime decides at open ([local storage](storage.md)): an added model or nullable field is applied in place; anything else leaves the file untouched and opens a fresh database file beside it, `local.sqlite.1`, which resynchronises from the backend. If the old file still holds unsent mutations, it stays open for them instead; `syncState().schema.pending` tells you, and once they are sent you call `rebuild()`:
 
 === "TypeScript"
 
     ```ts
-    const client = await GeneratedClient.open({
-      path: 'local.sqlite',
-      migration: { defaults: { Entry: { addedField: null } }, replayPull: true },
-    });
+    const { schema: state } = await client.syncState();
+    if (state.pending) {
+      console.log(`sending ${state.pending.pending} changes before upgrading`);
+      // … connect, wait for pending to reach 0, then:
+      const report = await client.rebuild();
+      console.log(report.newFile, report.leftPending);
+    }
     ```
 
 === "Flutter"
 
     ```dart
-    final client = await GeneratedClient.open(
-      path: 'local.sqlite',
-      libraryPath: '/absolute/path/to/libahead_dart.dylib',
-      migration: {
-        'defaults': {'Entry': {'addedField': null}},
-        'replayPull': true,
-      },
-    );
+    final state = (await client.syncState())['schema'] as Map<String, dynamic>;
+    if (state['pending'] != null) {
+      // … connect, wait for pending to reach 0, then:
+      final report = await client.rebuild();
+      print(report['newFile']);
+    }
     ```
 
-Defaults must fit the new field's type. Migration is atomic and preserves client identity, queued work and frozen request bytes. `replayPull` requests cursor rewind when applying the changed descriptor. Arbitrary identity/type changes are not supported; see [local storage](storage.md).
+`rebuild()` switches the same client to the new file and rejects while unsent mutations remain. `rebuild({ discardPending: true })`, or `discardPending: true` at open, rebuilds at once; the report names `leftPending` mutations and `leftDirect` local-only records that stay in `oldFile`. Nothing is moved between schemas and the old file is never deleted by the runtime. `migration` is still accepted for compatibility and ignored.
 
 ## Escape-hatch reads
 
@@ -173,11 +174,11 @@ Here `backendUrl`, `accessToken` and `renewAccessToken` belong to your applicati
 
 Ahead manages these phases automatically:
 
-1. Connect to `/sync/live` and subscribe to the current channel set. The server installs listeners before acknowledging the subscription.
-2. Fetch missing records through `POST /sync/pull`, starting from each channel's saved cursor. Queue WebSocket pages arriving while catch-up runs.
+1. Connect to `/sync/live` and subscribe to the current channel set. The server installs listeners, then acknowledges the subscription with each channel's current position.
+2. If a saved cursor is behind, fetch missing records through one `POST /sync/pull` for all channels, repeated while a channel has more. Queue WebSocket pages arriving while catch-up runs. If every cursor is current, skip this step.
 3. Continue receiving WebSocket updates. HTTP and WebSocket pages enter the same serialized Rust processing path, using each channel's saved cursor.
 
-For either source, a page already covered by the cursor is discarded. A page spanning the current cursor applies only its unseen changes; for example, at cursor `100`, a page covering `90 → 120` applies changes after `100` and advances to `120`. Only a page starting beyond the current cursor has a gap and requires HTTP recovery. Pages update SQLite and watches through the same engine logic.
+For either source, a page applies as one transaction and names a range for each channel it covers. A channel already covered by its cursor is left alone. A range spanning the current cursor applies: for example, at cursor `100`, a range `90 → 120` advances the channel to `120`, and each record's stamp decides whether its content is newer. A range starting beyond the current cursor is a gap. Then nothing from the page applies, and HTTP recovery fetches the missing range. Pages update SQLite and watches through the same engine logic.
 
 Mutation submission runs independently through `POST /sync/mutations`. A connection with no subscribed channels can still submit mutations without opening a socket.
 
@@ -199,7 +200,7 @@ All controls return promise/future void. Pause/close cancel network activity and
 
 ## Pending work and recovery
 
-`client.syncState()` returns `{ clientId, pending, beforeImages, cursors, channels, rejections }`. `pending` counts queued mutations; `beforeImages` is a diagnostic count; `cursors` maps channels to received positions; `channels` lists desired subscriptions; `rejections` contains `{ ordinal, code }` entries. `client.models.<name>.syncState(identity)` returns one record's `{ pending, rejections }`, typed by the model: pending entries carry the ordinal, the mutation name (one of the schema's), the phase and prerequisite states. Both are local snapshots, not network probes.
+`client.syncState()` returns `{ clientId, pending, beforeImages, cursors, channels, rejections, schema }`. `pending` counts queued mutations; `schema` is `{ rebuilt, pending, lastRebuild }` from the open-time schema check ([opening and schema changes](#opening-and-schema-changes)); `beforeImages` is a diagnostic count; `cursors` maps channels to received positions; `channels` lists desired subscriptions; `rejections` contains `{ ordinal, code }` entries. `client.models.<name>.syncState(identity)` returns one record's `{ pending, rejections }`, typed by the model: pending entries carry the ordinal, the mutation name (one of the schema's), the phase, prerequisite states and `diverged` when its replay failed over newer server state. Both are local snapshots, not network probes.
 
 === "TypeScript"
 
@@ -232,7 +233,7 @@ All controls return promise/future void. Pause/close cancel network activity and
 | Method | Result / effect |
 | --- | --- |
 | `syncState()` | The client's snapshot above |
-| `models.<name>.syncState(identity)` | `{ pending, rejections }` for that record |
+| `models.<name>.syncState(identity)` | `{ pending, rejections }` for that record; pending entries carry `diverged` |
 | `dismissRejection(ordinal)` | Remove a handled rejection from the durable local inbox; does not retry it |
 | `drop(ordinal)` | Remove eligible unsent work and recompute local state; frozen/sent work cannot be cancelled this way |
 
@@ -270,4 +271,4 @@ Callback failures are recorded as failed tasks with their reason rather than ret
 
 ## Protocol primitives
 
-The engine's protocol methods (`freeze`, `acknowledge`, `applyPull`) are not part of the application surface; they exist on the runtime handle the framework's own tests use. Application synchronization is managed by `connect`. Wire fields are defined in the [protocol source](https://github.com/zanminwang/ahead/blob/main/crates/core/src/protocol.rs) and exercised by [shared wire fixtures](https://github.com/zanminwang/ahead/blob/main/fixtures). Do not manufacture receipts, advance cursors yourself or rewrite frozen requests to recover from a network failure.
+The engine's protocol methods (`freeze`, `acknowledge`, `applyPull`, the last two returning reports for records they could not apply) are not part of the application surface; they exist on the runtime handle the framework's own tests use. Application synchronization is managed by `connect`. Wire fields are defined in the [protocol source](https://github.com/zanminwang/ahead/blob/main/crates/core/src/protocol.rs) and exercised by [shared wire fixtures](https://github.com/zanminwang/ahead/blob/main/fixtures). Do not manufacture receipts, advance cursors yourself or rewrite frozen requests to recover from a network failure.

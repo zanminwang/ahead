@@ -45,7 +45,7 @@ Writes update local SQLite immediately, so reads see changes before sync complet
 | --- | --- |
 | Frontend / client | [TypeScript](website/docs/frontend/setup.md) · [Flutter](website/docs/frontend/setup.md) |
 | Backend | [TypeScript](website/docs/backend/setup.md) |
-| Database adapter | [Prisma with PostgreSQL](website/docs/backend/prisma.md) |
+| Database | [PostgreSQL](website/docs/backend/database.md) through `pg`, Prisma or Drizzle |
 
 The TypeScript client and backend currently run on Node.js. The clients use native runtimes; browser support is not yet implemented. See [platform validation](website/docs/frontend/platforms.md) for tested environments.
 
@@ -113,7 +113,7 @@ Ahead sends queued writes when the network allows, retries failed sync requests,
 
 ### 3. Implement handlers and loaders for your backend
 
-This example uses Prisma with PostgreSQL and the [included database adapter](website/docs/backend/prisma.md).
+This example uses Prisma with PostgreSQL through the [included `prisma` shim](website/docs/backend/database.md).
 
 ```ts
 // Handle a write using your database transaction.
@@ -141,7 +141,7 @@ Add these imports and the transaction type before the handlers and loaders above
 
 ```ts
 import { PrismaClient, type Prisma } from "@prisma/client";
-import { prisma } from "./packages/persistence-prisma/index.mts";
+import { prisma } from "./packages/postgres/index.mts";
 import {
   createBackend,
   devAuth,

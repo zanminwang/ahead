@@ -8,12 +8,13 @@ pub struct TransportAction {
 #[derive(Default)]
 pub struct SyncCycle {
     push_only: bool,
-    completed: BTreeSet<String>,
+    /// Every subscribed channel reached its head in this cycle.
+    completed: bool,
     active: Option<TransportAction>,
 }
 impl SyncCycle {
     pub fn restart(&mut self) {
-        self.completed.clear();
+        self.completed = false;
         self.active = None;
         self.push_only = false;
     }
@@ -37,74 +38,101 @@ impl SyncCycle {
             self.active = Some(action.clone());
             return Ok(Some(action));
         }
-        if self.push_only {
+        if self.push_only || self.completed {
             return Ok(None);
         }
-        // Subscribed channels only: a pull on any other channel would be discarded by
-        // `apply_page`.
-        let channels = client.desired_channels()?;
-        if let Some(channel) = channels.iter().find(|c| !self.completed.contains(*c)) {
-            let action = TransportAction {
-                kind: "pull".into(),
-                body: client.downlink_request(channel)?,
-            };
-            self.active = Some(action.clone());
-            return Ok(Some(action));
-        }
-        Ok(None)
+        // One pull covers every subscribed channel; a pull on any other channel
+        // would be discarded by `apply_page`.
+        let Some(body) = client.downlink_request()? else {
+            self.completed = true;
+            return Ok(None);
+        };
+        let action = TransportAction {
+            kind: "pull".into(),
+            body,
+        };
+        self.active = Some(action.clone());
+        Ok(Some(action))
     }
-    pub fn complete<S: ClientStore>(&mut self, client: &mut Client<S>, bytes: &[u8]) -> Result<()> {
+    /// Apply the answer to the action in flight and return what it could not
+    /// apply, for the host to hand to the application.
+    pub fn complete<S: ClientStore>(
+        &mut self,
+        client: &mut Client<S>,
+        bytes: &[u8],
+    ) -> Result<Vec<Report>> {
         let action = self
             .active
             .clone()
             .ok_or_else(|| invalid("no transport action"))?;
-        if action.kind == "push" {
+        let report = if action.kind == "push" {
             let request = PushRequest::decode(action.body.as_bytes())?;
-            client.acknowledge(request.batch_sequence, PushReceipt::decode(bytes)?)?;
-            self.completed.clear();
+            let report = client.acknowledge(request.batch_sequence, PushReceipt::decode(bytes)?)?;
+            self.completed = false;
+            report
         } else {
             let request = PullRequest::decode(action.body.as_bytes())?;
             let page = PullPage::decode(bytes)?;
-            if page.channel != request.channel || page.from_cursor != request.from_cursor {
+            if !answers(&page, &request) {
                 return Err(invalid("response does not match pull request"));
             }
-            let end = !page.continues();
-            client.apply_page(page)?;
+            let end = !page.cursors.values().any(CursorRange::continues);
+            let report = client.apply_page(page)?;
             if end {
-                self.completed.insert(request.channel);
+                self.completed = true;
             }
-        }
+            report
+        };
         self.active = None;
-        Ok(())
+        Ok(report.reports)
     }
 }
 
+/// Whether a page answers a request: the same channels, each from the cursor
+/// the request named.
+fn answers(page: &PullPage, request: &PullRequest) -> bool {
+    page.cursors.len() == request.cursors.len()
+        && page
+            .cursors
+            .iter()
+            .all(|(c, r)| request.cursors.get(c) == Some(&r.from))
+}
+
 impl<S: ClientStore> Client<S> {
-    /// The downlink never borrows the mutation cycle: HTTP writes can progress independently.
-    pub fn downlink_request(&mut self, channel: &str) -> Result<String> {
-        if !self.desired_channels()?.iter().any(|c| c == channel) {
-            return Err(invalid("channel is not subscribed"));
+    /// One pull for every subscribed channel from its durable cursor; `None`
+    /// when nothing is subscribed. The downlink never borrows the mutation
+    /// cycle: HTTP writes can progress independently.
+    pub fn downlink_request(&mut self) -> Result<Option<String>> {
+        let cursors: BTreeMap<String, u64> = self.subscriptions()?.into_iter().collect();
+        if cursors.is_empty() {
+            return Ok(None);
         }
-        let from_cursor = self.cursor(channel)?;
         let request = PullRequest {
-            client_id: self.client_id().into(),
-            channel: channel.into(),
-            from_cursor,
+            cursors: cursors.clone(),
             models: self.declared_models(),
         };
-        self.pulls.issue(channel, from_cursor);
-        String::from_utf8(request.encode()?).map_err(|_| invalid("utf8"))
+        self.pulls.issue(&cursors);
+        Ok(Some(
+            String::from_utf8(request.encode()?).map_err(|_| invalid("utf8"))?,
+        ))
     }
 
     /// Whether a page answers a pull this client issued under an earlier
-    /// subscription of its channel. Such a page is stale: the resubscribe reset
-    /// the cursor and a fresh pull from it delivers everything.
+    /// subscription of one of its channels. Such a page is stale: the
+    /// resubscribe reset the cursor and a fresh pull from it delivers everything.
     pub(crate) fn stale_subscription_page(&mut self, page: &PullPage) -> bool {
-        self.pulls.stale(&page.channel, page.from_cursor)
+        let cursors = page
+            .cursors
+            .iter()
+            .map(|(c, r)| (c.clone(), r.from))
+            .collect();
+        self.pulls.stale(&cursors)
     }
 
-    /// One incoming path for HTTP catch-up and WebSocket pages. Optional request
-    /// metadata only validates HTTP response identity; cursor policy is shared.
+    /// One incoming path for HTTP catch-up and WebSocket frames. Optional
+    /// request metadata only validates HTTP response identity; the per-channel
+    /// cursor policy is shared. Whatever the page could not apply is in the
+    /// report, never an error.
     pub fn receive_downlink(
         &mut self,
         page: PullPage,
@@ -112,34 +140,60 @@ impl<S: ClientStore> Client<S> {
     ) -> Result<DownlinkProgress> {
         page.validate()?;
         if let Some(request) = request
-            && (page.channel != request.channel || page.from_cursor != request.from_cursor)
+            && !answers(&page, &request)
         {
             return Err(invalid("response does not match pull request"));
         }
-        let continues = page.continues();
-        let cursor = self.cursor(&page.channel)?;
-        let disposition = if self.stale_subscription_page(&page)
-            || !self.desired_channels()?.contains(&page.channel)
-            || page.to_cursor <= cursor
-        {
-            "covered"
-        } else if page.from_cursor > cursor {
-            "recover"
-        } else {
-            // The page passed the epoch check above; the cursor gate below filters
-            // changes already covered by the durable cursor.
-            self.apply_current_page(page)?;
-            "applied"
-        };
-        Ok(DownlinkProgress {
-            disposition,
+        let continues: Vec<String> = page
+            .cursors
+            .iter()
+            .filter(|(_, r)| r.continues())
+            .map(|(c, _)| c.clone())
+            .collect();
+        let mut progress = DownlinkProgress {
+            disposition: "covered",
+            gaps: vec![],
             continues,
-        })
+            report: ApplyReport::default(),
+        };
+        if self.stale_subscription_page(&page) {
+            return Ok(progress);
+        }
+        let subscribed = self.desired_channels()?;
+        let mut live = false;
+        for (channel, range) in &page.cursors {
+            if !subscribed.contains(channel) {
+                continue;
+            }
+            let cursor = self.cursor(channel)?;
+            if range.to <= cursor {
+                continue;
+            }
+            if range.from > cursor {
+                progress.gaps.push(channel.clone());
+            } else {
+                live = true;
+            }
+        }
+        if !progress.gaps.is_empty() {
+            progress.disposition = "recover";
+        } else if live {
+            // The page passed the epoch check above; the cursor gate is shared.
+            progress.report = self.apply_current_page(page)?;
+            progress.disposition = "applied";
+        }
+        Ok(progress)
     }
 }
 
+/// What became of one incoming page: `applied`, `covered` (nothing new for
+/// any subscribed channel), or `recover` (`gaps` names the channels whose
+/// `from` is beyond the cursor; nothing was applied). `continues` names the
+/// channels the page says hold more.
 #[derive(Debug, Serialize)]
 pub struct DownlinkProgress {
     pub disposition: &'static str,
-    pub continues: bool,
+    pub gaps: Vec<String>,
+    pub continues: Vec<String>,
+    pub report: ApplyReport,
 }

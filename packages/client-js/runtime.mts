@@ -1,9 +1,11 @@
 import {
+  AheadReport,
   startConnection,
   startLiveLane,
   type Connection,
   type ConnectionOptions,
   type LiveLane,
+  type ReportDetails,
   type Transport,
 } from "./connection.mts";
 export type { Connection, ConnectionOptions } from "./connection.mts";
@@ -27,6 +29,26 @@ export type ModelSyncState<Name extends string = string> = {
   rejections: Rejection[];
 };
 /** The whole client's sync state: a local snapshot, not a network probe. */
+/** What a rebuild left in the old database file. */
+export type RebuildReport = {
+  oldFile: string;
+  newFile: string;
+  reason: string;
+  leftPending: number;
+  leftDirect: number;
+};
+/** The open-time schema check: whether this open rebuilt, or is waiting to. */
+export type SchemaState = {
+  rebuilt: boolean;
+  /** The incompatible file is still in use because it holds unsent work. */
+  pending: {
+    oldFile: string;
+    reason: string;
+    pending: number;
+    direct: number;
+  } | null;
+  lastRebuild: RebuildReport | null;
+};
 export type ClientSyncState = {
   clientId: string;
   pending: number;
@@ -34,6 +56,7 @@ export type ClientSyncState = {
   cursors: Record<string, number>;
   channels: string[];
   rejections: Rejection[];
+  schema: SchemaState;
 };
 import { strictJson, type QuerySpec, type RecordValue } from "./values.mts";
 import type { ServerOptions, ServerConnection } from "./live.mts";
@@ -71,6 +94,8 @@ export function createClient<
       path: string;
       schema: object;
       migration?: { defaults?: RecordValue; replayPull?: boolean };
+      /** Rebuild at once when the schema is incompatible, leaving unsent work in the old file. */
+      discardPending?: boolean;
     }) {
       const result = JSON.parse(
         await native.clientCall(strictJson({ op: "open", ...options })),
@@ -226,7 +251,7 @@ export function createClient<
           );
         const connection = await startConnection(
           (event) => control(event),
-          (t) => this.#runSync(t),
+          (t) => this.#runSync(t, options.onError),
           live.push,
           driverOptions,
         );
@@ -281,7 +306,10 @@ export function createClient<
         finished();
       }
     }
-    #runSync(transport: Transport): Promise<void> {
+    #runSync(
+      transport: Transport,
+      onError?: (error: unknown) => void,
+    ): Promise<void> {
       if (this.#syncing) return this.#syncing;
       const run = async () => {
         await this.#exclusive(() =>
@@ -293,9 +321,12 @@ export function createClient<
           );
           if (action === null) return;
           const response = await transport(action.kind, action.body);
-          await this.#exclusive(() =>
+          const reports = (await this.#exclusive(() =>
             this.#send({ op: "complete", response: JSON.parse(response) }),
-          );
+          )) as ReportDetails[];
+          // What the receipt or page could not apply; the client stays
+          // consistent and the application hears about each one.
+          for (const report of reports) onError?.(new AheadReport(report));
         }
       };
       this.#syncing = run().finally(() => {
@@ -351,6 +382,22 @@ export function createClient<
         model === undefined
           ? this.#send({ op: "status" })
           : this.#send({ op: "recordStatus", key: { model, identity } }),
+      );
+    }
+    /**
+     * Leave an incompatible database behind and open a fresh file for the
+     * schema this client asked for. Refused while unsent mutations remain
+     * unless `discardPending`; the report says what the old file keeps.
+     */
+    rebuild(
+      options: { discardPending?: boolean } = {},
+    ): Promise<RebuildReport> {
+      return this.#exclusive(() =>
+        this.#send({ op: "rebuild", ...options }).then((value) => {
+          this.#events.emit("change");
+          this.#events.emit("work");
+          return value;
+        }),
       );
     }
     pendingTasks(): Promise<RecordValue[]> {

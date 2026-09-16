@@ -2,11 +2,13 @@
 //! push receipt or a channel page. Content is ordered by record stamp alone;
 //! channels and cursors never enter here
 //! ([Settlement](../../../docs/engineering/architecture/client/engine/settlement.md)).
+use crate::ApplyReport;
 use crate::engine::Engine;
 use crate::rows::merge_identity;
 use crate::store::ClientStore;
+use crate::{Report, ReportKind};
 use ahead_core::{AuthorityRecord, RecordKey, Result};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 /// How one authoritative record compared with what the client already held.
@@ -91,21 +93,73 @@ impl<S: ClientStore> Engine<'_, S> {
     /// Replay the remaining operations of every held key over its staged base
     /// and extend queued deletes to descendants that appeared. Called once,
     /// after the caller's queue changes, so each key is rebuilt from the final
-    /// queue state.
-    pub fn rebuild_held(&mut self, held: &Held) -> Result<()> {
+    /// queue state. Every replay that failed is a `Diverged` report.
+    pub fn rebuild_held(&mut self, held: &Held) -> Result<Vec<Report>> {
+        let mut reports = vec![];
         for key in held.values() {
-            self.rebuild(key)?;
+            if let Some(ordinal) = self.rebuild(key)? {
+                let stamp = self.record_stamp(key)?;
+                let mut report =
+                    Report::new(ReportKind::Diverged, &key.model, &key.identity, stamp);
+                report.ordinal = Some(ordinal);
+                reports.push(report);
+            }
         }
-        self.refresh_pending()
+        self.refresh_pending()?;
+        Ok(reports)
     }
-    /// Apply one authoritative record whose queue state will not change:
-    /// stage it and rebuild at once.
-    pub fn apply_authority(&mut self, record: &AuthorityRecord) -> Result<Disposition> {
-        let mut held = Held::new();
-        let disposition = self.stage_authority(record, &mut held)?;
-        if disposition == Disposition::Applied {
-            self.rebuild_held(&held)?;
+    /// Stage one delivered record in its own savepoint. A record the server
+    /// could not read, or one this client cannot apply (a state the schema
+    /// refuses, a local constraint it violates), is reported and leaves
+    /// nothing half-written; the caller carries on with the next record.
+    pub(crate) fn stage_isolated(
+        &mut self,
+        record: &AuthorityRecord,
+        held: &mut Held,
+    ) -> Result<(bool, Option<Report>)> {
+        let mut entry = Report::new(
+            ReportKind::ReadFailed,
+            &record.model,
+            &record.identity,
+            record.stamp,
+        );
+        if let Some(code) = &record.error {
+            entry.code = Some(code.clone());
+            return Ok((false, Some(entry)));
         }
-        Ok(disposition)
+        self.store.savepoint("record")?;
+        let staged = self.stage_authority(record, held);
+        match &staged {
+            Ok(_) => self.store.release("record")?,
+            Err(_) => self.store.rollback_to("record")?,
+        }
+        Ok(match staged {
+            Ok(Disposition::Applied) => (true, None),
+            Ok(Disposition::Older | Disposition::Same) => (false, None),
+            Ok(Disposition::Conflict { local, incoming }) => {
+                entry.kind = ReportKind::Conflict;
+                entry.detail = json!({ "local": local, "incoming": incoming });
+                (false, Some(entry))
+            }
+            Err(e) => {
+                entry.kind = ReportKind::Skipped;
+                entry.detail = json!({ "error": e.to_string() });
+                (false, Some(entry))
+            }
+        })
+    }
+    /// Stage every record of one delivery, then rebuild the held keys once.
+    /// A record that cannot be staged is reported and leaves nothing behind;
+    /// the others are unaffected.
+    pub fn apply_records(&mut self, records: &[AuthorityRecord]) -> Result<ApplyReport> {
+        let mut report = ApplyReport::default();
+        let mut held = Held::new();
+        for record in records {
+            let (applied, entry) = self.stage_isolated(record, &mut held)?;
+            report.applied += usize::from(applied);
+            report.reports.extend(entry);
+        }
+        report.reports.extend(self.rebuild_held(&held)?);
+        Ok(report)
     }
 }
