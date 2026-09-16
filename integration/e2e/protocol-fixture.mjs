@@ -10,7 +10,7 @@ export async function syncProtocol(client, transport, models) {
    completed.clear();
    continue;
   }
-  const status=await client.status();const scope=status.channels.find(scope=>!completed.has(scope));
+  const status=await client.syncState();const scope=status.channels.find(scope=>!completed.has(scope));
   if(scope===undefined)return;
   const body=JSON.stringify({clientId:client.clientId,scope,fromCursor:status.cursors[scope]??0,models});
   const page=JSON.parse(await transport('pull',body));await client.applyPull(page);

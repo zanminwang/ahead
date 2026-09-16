@@ -36,7 +36,7 @@ async function nodeScript(url,directory,schema){
  try{
   await client.subscribe('book:demo');
   const connection=await client.connect({url,token:'demo-user'});
-  const settled=async()=>(await client.status()).pending===0;
+  const settled=async()=>(await client.syncState()).pending===0;
   await waitFor(async()=>(await client.read('Entry',{id:'entry-1'}))!==null,'initial catch-up');
   const initial=(await client.read('Entry',{id:'entry-1'})).text;
   await client.mutate(edit('  parity  '));await waitFor(settled,'accepted edit');
@@ -45,13 +45,13 @@ async function nodeScript(url,directory,schema){
   await client.transaction(tx=>tx.direct({model:'Entry',op:'create',identity:{id:'local-only'},values:{text:'local',note:null}}));
   await connection.close();
   const entries=(await client.query('Entry')).sort((a,b)=>a.id<b.id?-1:a.id>b.id?1:0);
-  const status=await client.status();
+  const status=await client.syncState();
   return {
    initial,afterAccepted,
    entries:entries.map(row=>({id:row.id,text:row.text,note:row.note})),
    pending:status.pending,beforeImages:status.beforeImages,channels:status.channels,rejections:status.rejections,
-   entry1:await client.recordStatus('Entry',{id:'entry-1'}),
-   localOnly:await client.recordStatus('Entry',{id:'local-only'}),
+   entry1:await client.syncState('Entry',{id:'entry-1'}),
+   localOnly:await client.syncState('Entry',{id:'local-only'}),
   };
  }finally{await client.close();}
 }

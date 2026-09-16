@@ -69,7 +69,7 @@ export async function runSmoke(show: (message: string) => void) {
     const current = client;
     if (expectedClientId)
       check(
-        current.client.clientId === expectedClientId,
+        current.clientId === expectedClientId,
         "client identity changed across restart",
       );
     await current.channels.subscribe("book:demo");
@@ -81,7 +81,7 @@ export async function runSmoke(show: (message: string) => void) {
       (await current.models.entry.get({ id }))?.text;
     const settled = () =>
       until(
-        async () => (await current.status()).pending === 0,
+        async () => (await current.syncState()).pending === 0,
         "pending queue drains",
       );
     if (phase === "online") {
@@ -150,7 +150,7 @@ export async function runSmoke(show: (message: string) => void) {
         "offline local watch",
       );
       check(
-        (await current.status()).pending === 2,
+        (await current.syncState()).pending === 2,
         "offline queue must contain create and dependent edit",
       );
     } else if (phase === "restart") {
@@ -159,7 +159,7 @@ export async function runSmoke(show: (message: string) => void) {
         "offline work lost across process restart",
       );
       check(
-        (await current.status()).pending === 2,
+        (await current.syncState()).pending === 2,
         "queued work lost across process restart",
       );
     } else if (phase === "remote") {
@@ -181,19 +181,19 @@ export async function runSmoke(show: (message: string) => void) {
       );
       await settled();
     } else throw Error(`Unknown phase: ${phase}`);
-    const status = await current.status();
+    const status = await current.syncState();
     const rows = await current.models.entry.query();
     const result = {
       ok: true,
       user,
       phase,
-      clientId: current.client.clientId,
+      clientId: current.clientId,
       pending: status.pending,
       rows,
     };
     await writeResult(result);
     show(
-      `PASS ${user}: ${phase}\nclient ${current.client.clientId}\npending ${status.pending}\n${rows.map((row) => `${row.id}: ${row.text}`).join("\n")}`,
+      `PASS ${user}: ${phase}\nclient ${current.clientId}\npending ${status.pending}\n${rows.map((row) => `${row.id}: ${row.text}`).join("\n")}`,
     );
     // Keep the real connection alive until the runner terminates the process.
   } catch (error) {

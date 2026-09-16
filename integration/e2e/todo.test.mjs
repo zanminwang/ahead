@@ -57,8 +57,8 @@ async function scenario(body) {
    clients.delete(client);
    await client.close();
   },
-  settled: client => wait(async () => (await client.status()).pending === 0, `${client.client.clientId} settled`),
-  rejection: (client, code) => wait(async () => (await client.status()).rejections.some(r => r.code === code), `rejection ${code}`),
+  settled: client => wait(async () => (await client.syncState()).pending === 0, `${client.clientId} settled`),
+  rejection: (client, code) => wait(async () => (await client.syncState()).rejections.some(r => r.code === code), `rejection ${code}`),
   row: id => app.db.todo.findUnique({ where: { id } }),
   /** Stops the backend process state (HTTP server and Prisma client) and starts a fresh one on the same port and database. */
   async restart() {
@@ -145,8 +145,8 @@ test('happy path: Alice adds, Bob completes, PostgreSQL and both clients converg
   assert.deepEqual(await alice.models.todo.get({ id: 'happy-1' }), await ctx.row('happy-1'));
   assert.deepEqual(await bob.models.todo.get({ id: 'happy-1' }), await ctx.row('happy-1'));
   unwatch();
-  assert.deepEqual((await alice.status()).rejections, []);
-  assert.deepEqual((await bob.status()).rejections, []);
+  assert.deepEqual((await alice.syncState()).rejections, []);
+  assert.deepEqual((await bob.syncState()).rejections, []);
   assert.equal(ctx.errors.length, 0, String(ctx.errors));
  });
 });
@@ -178,8 +178,8 @@ test('unknown identity token is refused with HTTP 401 and persists nothing', asy
   await addTodo(mallory, { id: 'mallory-1', title: 'Intruder', done: false, createdById: 'mallory' });
   await wait(() => ctx.errors.some(error => error?.status === 401), 'connection.onError reports 401');
   assert.equal(await ctx.row('mallory-1'), null);
-  assert.equal((await mallory.status()).pending, 1, 'the mutation stays queued locally');
-  assert.deepEqual((await mallory.status()).rejections, []);
+  assert.equal((await mallory.syncState()).pending, 1, 'the mutation stays queued locally');
+  assert.deepEqual((await mallory.syncState()).rejections, []);
   assert.equal((await mallory.models.todo.query()).length, 1, 'no seeds are delivered to an unauthenticated client');
   await never(async () => (await ctx.row('mallory-1')) !== null, 'row persisted for unknown identity');
  });
@@ -198,7 +198,7 @@ test('setTodoDone on a task the server no longer has is rejected as todo.missing
   assert.equal((await alice.models.todo.get({ id: 'missing-1' })).done, false, 'local completion rolled back');
   await setDone(alice, 'seed-1', false);
   await ctx.settled(alice);
-  assert.deepEqual((await alice.status()).rejections.map(r => r.code), ['todo.missing'], 'the transaction stays usable after a rejection');
+  assert.deepEqual((await alice.syncState()).rejections.map(r => r.code), ['todo.missing'], 'the transaction stays usable after a rejection');
   assert.equal(ctx.errors.length, 0, String(ctx.errors));
  });
 });
@@ -248,11 +248,11 @@ test('a retried frozen request after a lost receipt runs the handler once and st
   }, models), /lost receipt/);
   assert.equal(ctx.app.handlerCalls, before + 1, 'the first push committed');
   assert.deepEqual(await ctx.row('retry-1'), { id: 'retry-1', title: 'Once', done: false, createdById: 'alice' });
-  assert.equal((await alice.status()).pending, 1, 'the request stays frozen until acknowledged');
+  assert.equal((await alice.syncState()).pending, 1, 'the request stays frozen until acknowledged');
   await syncProtocol(alice.client, transport, models);
   assert.equal(ctx.app.handlerCalls, before + 1, 'the replayed receipt does not run the handler again');
-  assert.equal((await alice.status()).pending, 0);
-  assert.deepEqual((await alice.status()).rejections, []);
+  assert.equal((await alice.syncState()).pending, 0);
+  assert.deepEqual((await alice.syncState()).rejections, []);
   assert.equal(await ctx.app.db.todo.count({ where: { id: 'retry-1' } }), 1);
  });
 });
@@ -265,26 +265,26 @@ test('offline add-then-done survives relaunch and syncs in order while Bob keeps
   await alice.connection.pause();
   await addTodo(alice, { id: 'offline-1', title: 'Offline task', done: false, createdById: 'alice' });
   await setDone(alice, 'offline-1', true);
-  assert.equal((await alice.status()).pending, 2);
+  assert.equal((await alice.syncState()).pending, 2);
   assert.equal((await alice.models.todo.get({ id: 'offline-1' })).done, true);
   await addTodo(bob, { id: 'offline-2', title: 'Meanwhile', done: false, createdById: 'bob' });
   await ctx.settled(bob);
   assert.equal(await ctx.row('offline-1'), null, 'nothing reaches the server while paused');
   await never(async () => (await alice.models.todo.get({ id: 'offline-2' })) !== null, 'paused Alice receives remote rows');
-  const clientId = alice.client.clientId;
+  const clientId = alice.clientId;
   await ctx.close(alice);
   alice = await ctx.open('alice', 'alice', { server: false, subscribe: false });
-  assert.equal(alice.client.clientId, clientId, 'client identity survives relaunch');
-  assert.equal((await alice.status()).pending, 2, 'queued work survives relaunch');
+  assert.equal(alice.clientId, clientId, 'client identity survives relaunch');
+  assert.equal((await alice.syncState()).pending, 2, 'queued work survives relaunch');
   assert.deepEqual(await alice.models.todo.get({ id: 'offline-1' }), { id: 'offline-1', title: 'Offline task', done: true, createdById: 'alice' });
-  const connection = await alice.client.connect({ url: ctx.url, token: 'alice' }, { onError: error => ctx.errors.push(error) });
+  const connection = await alice.connect({ url: ctx.url, token: 'alice' }, { onError: error => ctx.errors.push(error) });
   try {
    await ctx.settled(alice);
    assert.deepEqual(await ctx.row('offline-1'), { id: 'offline-1', title: 'Offline task', done: true, createdById: 'alice' });
    await wait(async () => (await alice.models.todo.get({ id: 'offline-2' }))?.title === 'Meanwhile', 'Alice receives Bob\'s task');
    await wait(async () => (await bob.models.todo.get({ id: 'offline-1' }))?.done === true, 'Bob receives the completed task');
    assert.equal(await ctx.app.db.todo.count({ where: { id: { in: ['offline-1', 'offline-2'] } } }), 2, 'no duplicates');
-   assert.deepEqual((await alice.status()).rejections, []);
+   assert.deepEqual((await alice.syncState()).rejections, []);
    assert.equal(ctx.errors.length, 0, String(ctx.errors));
   } finally {
    await connection.close();
@@ -311,7 +311,7 @@ for (const [order, heldToken, heldValue, freeToken, freeValue] of [
    await setDone(free, id, freeValue);
    await ctx.settled(free);
    assert.equal((await ctx.row(id)).done, freeValue, 'the free client commits first');
-   assert.equal((await held.status()).pending, 1, 'the held push is still in flight');
+   assert.equal((await held.syncState()).pending, 1, 'the held push is still in flight');
    gate.release();
    await ctx.settled(held);
    const final = await ctx.row(id);
@@ -319,8 +319,8 @@ for (const [order, heldToken, heldValue, freeToken, freeValue] of [
    await wait(async () => (await held.models.todo.get({ id }))?.done === final.done, 'held client converges');
    await wait(async () => (await free.models.todo.get({ id }))?.done === final.done, 'free client converges');
    await ctx.settled(free);
-   assert.deepEqual((await held.status()).rejections, []);
-   assert.deepEqual((await free.status()).rejections, []);
+   assert.deepEqual((await held.syncState()).rejections, []);
+   assert.deepEqual((await free.syncState()).rejections, []);
    assert.equal(ctx.errors.length, 0, String(ctx.errors));
   });
  });
@@ -335,7 +335,7 @@ test('setting done true twice remains true', async () => {
   await ctx.settled(alice);
   assert.equal((await ctx.row('twice-1')).done, true);
   assert.equal((await alice.models.todo.get({ id: 'twice-1' })).done, true);
-  assert.deepEqual((await alice.status()).rejections, []);
+  assert.deepEqual((await alice.syncState()).rejections, []);
  });
 });
 
@@ -367,7 +367,7 @@ test('a completion request without a boolean done is an empty patch: a no-op the
   await alice.client.mutate({ name: 'SetTodoDone', version: 1, operations: [{ model: 'Todo', op: 'update', identity: { id: 'seed-1' }, values: {} }] });
   await ctx.settled(alice);
   assert.equal(ctx.app.handlerCalls, before + 1, 'the handler runs with an empty patch');
-  assert.deepEqual((await alice.status()).rejections, []);
+  assert.deepEqual((await alice.syncState()).rejections, []);
   assert.equal((await ctx.row('seed-1')).done, false, 'nothing was written');
  });
 });

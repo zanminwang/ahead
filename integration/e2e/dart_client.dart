@@ -37,12 +37,12 @@ Future<void> main(List<String> args) async {
         },
       ],
     });
-    for (var i = 0; i < 200 && (await client.status())['pending'] != 0; i++) {
+    for (var i = 0; i < 200 && (await client.syncState())['pending'] != 0; i++) {
       await Future<void>.delayed(const Duration(milliseconds: 10));
     }
     await connection.close();
     final row = await client.read('Entry', {'id': 'entry-1'});
-    final status = await client.status();
+    final status = await client.syncState();
     if (row?['text'] != 'from Dart' || status['pending'] != 0)
       throw StateError('Dart settlement mismatch: $row $status');
     print('Dart -> Rust -> HTTP -> Rust -> Prisma -> SQLite: passed');

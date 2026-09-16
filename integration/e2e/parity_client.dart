@@ -39,7 +39,7 @@ Future<void> main(List<String> args) async {
     final connection = await client.connect(
       SyncServer(url: args[0], token: () => 'demo-user'),
     );
-    Future<bool> settled() async => (await client.status())['pending'] == 0;
+    Future<bool> settled() async => (await client.syncState())['pending'] == 0;
     await waitFor(
       () async => await client.read('Entry', {'id': 'entry-1'}) != null,
       'initial catch-up',
@@ -63,7 +63,7 @@ Future<void> main(List<String> args) async {
     await connection.close();
     final entries = (await client.query('Entry'))
       ..sort((a, b) => (a['id'] as String).compareTo(b['id'] as String));
-    final status = await client.status();
+    final status = await client.syncState();
     final dump = {
       'initial': initial,
       'afterAccepted': afterAccepted,
@@ -75,8 +75,8 @@ Future<void> main(List<String> args) async {
       'beforeImages': status['beforeImages'],
       'channels': status['channels'],
       'rejections': status['rejections'],
-      'entry1': await client.recordStatus('Entry', {'id': 'entry-1'}),
-      'localOnly': await client.recordStatus('Entry', {'id': 'local-only'}),
+      'entry1': await client.recordSyncState('Entry', {'id': 'entry-1'}),
+      'localOnly': await client.recordSyncState('Entry', {'id': 'local-only'}),
     };
     stdout.writeln('PARITY ${jsonEncode(dump)}');
   } finally {

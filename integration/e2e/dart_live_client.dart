@@ -55,15 +55,15 @@ Future<void> main(List<String> args) async {
     });
     await client.mutate(edit('entry-1', ' Dart first '));
     await client.mutate(edit('entry-1', ' Dart second '));
-    await wait(() async => (await client.status())['pending'] == 0 && seen);
+    await wait(() async => (await client.syncState())['pending'] == 0 && seen);
     await connection.pause();
     await client.mutate(edit('entry-1', ' Dart offline '));
     await writer.mutate(edit('paged-54', 'Dart missed remote'));
-    await wait(() async => (await writer.status())['pending'] == 0);
+    await wait(() async => (await writer.syncState())['pending'] == 0);
     await connection.resume();
     await wait(
       () async =>
-          (await client.status())['pending'] == 0 &&
+          (await client.syncState())['pending'] == 0 &&
           (await client.read('Entry', {'id': 'paged-54'}))?['text'] ==
               'Dart missed remote',
     );

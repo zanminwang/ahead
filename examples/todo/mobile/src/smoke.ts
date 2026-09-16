@@ -39,7 +39,7 @@ export async function runSmoke(config: LaunchConfig, show: (message: string) => 
     });
     const { session, client } = opened;
     if (expectedClientId)
-      check(client.client.clientId === expectedClientId, "client identity changed across restart");
+      check(client.clientId === expectedClientId, "client identity changed across restart");
     let watched: Todo[] = [];
     session.watch(
       (rows) => {
@@ -48,7 +48,7 @@ export async function runSmoke(config: LaunchConfig, show: (message: string) => 
       (error) => console.log("watch:", String(error)),
     );
     const todo = (id: string) => client.models.todo.get({ id });
-    const pending = async () => (await client.status()).pending as number;
+    const pending = async () => (await client.syncState()).pending as number;
     const settled = () => until(async () => (await pending()) === 0, "pending queue drains");
     const seeded = () =>
       until(
@@ -109,13 +109,13 @@ export async function runSmoke(config: LaunchConfig, show: (message: string) => 
       ok: true,
       user,
       phase,
-      clientId: client.client.clientId,
+      clientId: client.clientId,
       pending: await pending(),
       rows,
     };
     await writeResult(result);
     show(
-      `PASS ${user}: ${phase}\nclient ${client.client.clientId}\npending ${result.pending}\n${rows
+      `PASS ${user}: ${phase}\nclient ${client.clientId}\npending ${result.pending}\n${rows
         .map((row) => `${row.done ? "☑" : "☐"} ${row.title}`)
         .join("\n")}`,
     );

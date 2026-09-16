@@ -68,8 +68,8 @@ export async function openTodoSession(options: {
     session,
     client,
     user: () => client.models.user.get({ id: options.user }),
-    rejections: async () => (await client.status()).rejections as Rejection[],
-    dismiss: (ordinal) => client.client.dismissRejection(ordinal).then(() => undefined),
+    rejections: async () => (await client.syncState()).rejections as Rejection[],
+    dismiss: (ordinal) => client.dismissRejection(ordinal).then(() => undefined),
   };
 }
 
