@@ -128,6 +128,8 @@ class GeneratedClient {
  /// Remove unsent work and recompute local state; frozen work cannot be dropped.
  Future<void> drop(int ordinal) => client.drop(ordinal);
  Future<List<Map<String,dynamic>>> pendingTasks() => client.pendingTasks();
+ /// Mark a prerequisite task by its opaque key: `ready`, `pending` or `failed`.
+ Future<void> setReadiness(String key, String state) => client.setReadiness(key, state);
  Future<void> runPrerequisites(Map<String, Future<void> Function(Map<String,dynamic>)> handlers) => client.runPrerequisites(handlers);
  /// Start the background connection when `open` was called without a server.
  Future<RuntimeConnection> connect(SyncServer server, {void Function(Object)? onError, Future<void> Function()? refreshAuth}) async => connection = await client.connect(server, onError:onError, refreshAuth:refreshAuth);

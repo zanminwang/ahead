@@ -36,6 +36,8 @@ export class GeneratedClient {
  /** Remove unsent work and recompute local state; frozen work cannot be dropped. */
  drop(ordinal: number): Promise<void> { return this.client.drop(ordinal); }
  pendingTasks(): Promise<RecordValue[]> { return this.client.pendingTasks(); }
+ /** Mark a prerequisite task by its opaque key. */
+ setReadiness(key: string, state: "ready" | "pending" | "failed"): Promise<void> { return this.client.setReadiness(key, state); }
  runPrerequisites(handlers: Record<string, (arguments_: RecordValue) => Promise<void>>): Promise<void> { return this.client.runPrerequisites(handlers); }
  /** Start the background connection when `open` was called without a server. */
  async connect(server: ServerOptions, options: ConnectionOptions = {}): Promise<Connection> { this.connection = await this.client.connect(server, options); return this.connection; }

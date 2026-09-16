@@ -169,6 +169,7 @@ fn generated_clients_are_the_whole_client() {
         "dismissRejection(ordinal: number)",
         "drop(ordinal: number)",
         "pendingTasks()",
+        "setReadiness(key: string",
         "runPrerequisites(",
         "async connect(server: ServerOptions",
         "querySpec(model: string",
