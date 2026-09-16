@@ -18,6 +18,7 @@ name = "ahead-client"
 version = "0.1.0"
 dependencies = [
  "ahead-core",
+ "chrono",
  "serde",
  "serde_json",
  "uuid",
