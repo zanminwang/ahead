@@ -1,5 +1,7 @@
-//! Pull copies the current record stamp from the scan row; an external
-//! notification allocates one stamp per record and publishes it at that stamp.
+//! Pull copies the current record stamp from the scan row, covers every
+//! channel of one request and isolates a record its loader cannot read; an
+//! external notification allocates one stamp per record and publishes it at
+//! that stamp.
 use ahead_server::{Config, Host, host::HostRequest};
 use serde_json::{Value, json};
 use std::{
@@ -88,9 +90,7 @@ fn pull_body() -> Vec<u8> {
 /// A pull on `a` from cursor 0 declaring these read contracts.
 fn pull_body_declaring(models: &[(&str, u64)]) -> Vec<u8> {
     ahead_core::PullRequest {
-        client_id: "c".into(),
-        channel: "a".into(),
-        from_cursor: 0,
+        cursors: [("a".to_string(), 0)].into(),
         models: models
             .iter()
             .map(|(name, version)| ((*name).to_string(), *version))
@@ -323,11 +323,11 @@ fn live_negotiation_establishes_current_heads_and_rejects_cursor_modes() {
     let result = run(ahead_server::live::negotiate(
         &config(),
         "u",
-        br#"{"type":"subscribe","scopes":["a"],"models":{"Entry":1}}"#,
+        br#"{"type":"subscribe","channels":["a"],"models":{"Entry":1}}"#,
         &host,
     ))
     .unwrap();
-    assert_eq!(result.subscriptions[0].from_cursor, 5);
+    assert_eq!(result.heads["a"], 5);
     assert_eq!(
         result.models.get("Entry"),
         Some(&1),
@@ -336,15 +336,15 @@ fn live_negotiation_establishes_current_heads_and_rejects_cursor_modes() {
     // The declaration is checked at the handshake, like a pull's.
     for (frame, code) in [
         (
-            r#"{"type":"subscribe","scopes":["a"]}"#,
+            r#"{"type":"subscribe","channels":["a"]}"#,
             ahead_server::code::REQUEST_INVALID,
         ),
         (
-            r#"{"type":"subscribe","scopes":["a"],"models":{"Entry":2}}"#,
+            r#"{"type":"subscribe","channels":["a"],"models":{"Entry":2}}"#,
             ahead_server::code::MODEL_VERSION_UNSUPPORTED,
         ),
         (
-            r#"{"type":"subscribe","scopes":["a"],"models":{"Ghost":1}}"#,
+            r#"{"type":"subscribe","channels":["a"],"models":{"Ghost":1}}"#,
             ahead_server::code::MODEL_VERSION_UNSUPPORTED,
         ),
     ] {
@@ -371,7 +371,7 @@ fn live_negotiation_establishes_current_heads_and_rejects_cursor_modes() {
         json!([]),
     ] {
         let request =
-            json!({"type":"subscribe","scopes":["a"],"models":{"Entry":1},"cursors":cursors});
+            json!({"type":"subscribe","channels":["a"],"models":{"Entry":1},"cursors":cursors});
         assert!(
             run(ahead_server::live::negotiate(
                 &config(),
@@ -383,4 +383,314 @@ fn live_negotiation_establishes_current_heads_and_rejects_cursor_modes() {
             "accepted {request}"
         );
     }
+}
+
+/// A scripted host for pulls: per-channel scan rows and per-call load answers.
+struct Multi {
+    scans: BTreeMap<String, Value>,
+    heads: BTreeMap<String, u64>,
+    /// Answers for `load`, consumed in call order; a missing answer loads rows.
+    loads: Mutex<Vec<Value>>,
+    log: Mutex<Vec<HostRequest>>,
+}
+use std::collections::BTreeMap;
+impl Host for Multi {
+    fn call(
+        &self,
+        r: Value,
+    ) -> Pin<Box<dyn Future<Output = ahead_server::HostResult<Value>> + Send + '_>> {
+        Box::pin(async move {
+            let request: HostRequest = serde_json::from_value(r)
+                .map_err(|error| format!("unsupported host request: {error}"))?;
+            self.log.lock().unwrap().push(request.clone());
+            Ok(match &request {
+                HostRequest::Head { channel } => {
+                    json!(self.heads.get(channel).copied().unwrap_or(0))
+                }
+                HostRequest::Scan { channel, .. } => {
+                    self.scans.get(channel).cloned().unwrap_or(json!([]))
+                }
+                HostRequest::Load { identities, .. } => {
+                    let scripted = self.loads.lock().unwrap();
+                    if scripted.is_empty() {
+                        Value::Array(
+                            identities
+                                .iter()
+                                .map(|id| json!({"id":id["id"],"text":format!("t-{}", id["id"].as_str().unwrap())}))
+                                .collect(),
+                        )
+                    } else {
+                        drop(scripted);
+                        self.loads.lock().unwrap().remove(0)
+                    }
+                }
+                other => return Err(format!("unsupported {}", other.label())),
+            })
+        })
+    }
+}
+fn scan_row(channel: &str, cursor: u64, id: &str, stamp: u64) -> Value {
+    json!({"channel":channel,"cursor":cursor,"model":"Entry","identity":{"id":id},"identityKey":format!("{{\"id\":\"{id}\"}}"),"stamp":stamp})
+}
+fn multi(scans: &[(&str, Vec<Value>, u64)], loads: Vec<Value>) -> Multi {
+    Multi {
+        scans: scans
+            .iter()
+            .map(|(c, rows, _)| (c.to_string(), json!(rows)))
+            .collect(),
+        heads: scans
+            .iter()
+            .map(|(c, _, head)| (c.to_string(), *head))
+            .collect(),
+        loads: Mutex::new(loads),
+        log: Mutex::new(vec![]),
+    }
+}
+fn pull_all(host: &Multi, cursors: &[(&str, u64)]) -> ahead_server::Result<ahead_core::PullPage> {
+    let request = ahead_core::PullRequest {
+        cursors: cursors.iter().map(|(c, n)| (c.to_string(), *n)).collect(),
+        models: [("Entry".to_string(), 1)].into(),
+    }
+    .encode()
+    .unwrap();
+    run(ahead_server::process_pull(&config(), "u", &request, host))
+        .map(|text| ahead_core::PullPage::decode(text.as_bytes()).unwrap())
+}
+
+/// One pull covers every channel: each channel scans after its own cursor and
+/// reports its own progress and head, and a record both channels changed is
+/// delivered once at its current stamp.
+#[test]
+fn one_pull_covers_every_channel_and_delivers_a_shared_record_once() {
+    let host = multi(
+        &[
+            (
+                "a",
+                vec![scan_row("a", 1, "e", 4), scan_row("a", 2, "f", 1)],
+                2,
+            ),
+            ("b", vec![scan_row("b", 7, "e", 4)], 9),
+        ],
+        vec![],
+    );
+    let page = pull_all(&host, &[("a", 0), ("b", 5)]).unwrap();
+    assert_eq!(
+        page.cursors["a"],
+        ahead_core::CursorRange {
+            from: 0,
+            to: 2,
+            head: 2
+        }
+    );
+    assert_eq!(
+        page.cursors["b"],
+        ahead_core::CursorRange {
+            from: 5,
+            to: 9,
+            head: 9
+        }
+    );
+    assert_eq!(page.changes.len(), 2, "e once, f once");
+    assert_eq!(page.changes[0].identity["id"], "e");
+    assert_eq!(page.changes[0].stamp, 4);
+    assert_eq!(page.changes[0].state["text"], "t-e");
+    let loads = host
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| matches!(r, HostRequest::Load { .. }))
+        .count();
+    assert_eq!(loads, 1, "one load per model for the whole page");
+}
+
+/// A channel whose scan filled the page stops at its last row below the head
+/// and continues; the other channel reaches its head.
+#[test]
+fn a_full_channel_continues_independently_of_the_others() {
+    let rows: Vec<Value> = (1..=50)
+        .map(|c| scan_row("a", c, &format!("r{c}"), 1))
+        .collect();
+    let host = multi(&[("a", rows, 80), ("b", vec![], 3)], vec![]);
+    let page = pull_all(&host, &[("a", 0), ("b", 3)]).unwrap();
+    assert_eq!(
+        page.cursors["a"],
+        ahead_core::CursorRange {
+            from: 0,
+            to: 50,
+            head: 80
+        }
+    );
+    assert!(page.cursors["a"].continues());
+    assert_eq!(
+        page.cursors["b"],
+        ahead_core::CursorRange {
+            from: 3,
+            to: 3,
+            head: 3
+        }
+    );
+    assert!(!page.cursors["b"].continues());
+    assert_eq!(page.changes.len(), 50);
+}
+
+/// A loader that refuses a batched call is asked one identity at a time; the
+/// refused record becomes an error change, the others get their rows.
+#[test]
+fn a_loader_refusal_isolates_one_record_after_a_per_identity_retry() {
+    let host = multi(
+        &[(
+            "a",
+            vec![scan_row("a", 1, "e", 2), scan_row("a", 2, "g", 5)],
+            2,
+        )],
+        vec![
+            json!({"rejection":"entry.forbidden"}), // the batched call
+            json!([{"id":"e","text":"t-e"}]),       // e alone
+            json!({"rejection":"entry.forbidden"}), // g alone
+        ],
+    );
+    let page = pull_all(&host, &[("a", 0)]).unwrap();
+    assert_eq!(page.changes.len(), 2);
+    assert_eq!(page.changes[0].state["text"], "t-e");
+    assert!(!page.changes[0].is_error());
+    assert_eq!(page.changes[1].error.as_deref(), Some("entry.forbidden"));
+    assert_eq!(
+        page.changes[1].stamp, 5,
+        "the failed record keeps its current stamp"
+    );
+    assert!(page.changes[1].state.is_null());
+    let loads: Vec<usize> = host
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|r| match r {
+            HostRequest::Load { identities, .. } => Some(identities.len()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        loads,
+        vec![2, 1, 1],
+        "one batched call, then one per identity"
+    );
+}
+
+/// A thrown loader error answered as a failure isolates the same way, coded
+/// `loader.failed`; a single-record call needs no retry.
+#[test]
+fn a_loader_failure_is_an_error_change_and_a_single_record_needs_no_retry() {
+    let host = multi(
+        &[("a", vec![scan_row("a", 1, "e", 2)], 1)],
+        vec![json!({"error":"boom"})],
+    );
+    let page = pull_all(&host, &[("a", 0)]).unwrap();
+    assert_eq!(page.changes[0].error.as_deref(), Some("loader.failed"));
+    let loads = host
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| matches!(r, HostRequest::Load { .. }))
+        .count();
+    assert_eq!(loads, 1);
+}
+
+/// A row the served contract does not accept fails only its record, coded
+/// `loader.invalid`; the other records of the same batched call keep their rows.
+#[test]
+fn a_malformed_loader_row_fails_only_its_record() {
+    let host = multi(
+        &[(
+            "a",
+            vec![scan_row("a", 1, "e", 2), scan_row("a", 2, "g", 5)],
+            2,
+        )],
+        vec![json!([{"id":"e","text":"t-e"},{"id":"g","text":7}])],
+    );
+    let page = pull_all(&host, &[("a", 0)]).unwrap();
+    assert_eq!(page.changes[0].state["text"], "t-e");
+    assert_eq!(page.changes[1].error.as_deref(), Some("loader.invalid"));
+    assert_eq!(page.changes[1].stamp, 5);
+    assert_eq!(page.cursors["a"].to, 2, "the channel still advances");
+}
+
+/// A batched answer with the wrong number of rows cannot be matched to its
+/// records: each is loaded on its own, and a single-identity answer of the
+/// wrong length fails only that record.
+#[test]
+fn a_misaligned_loader_answer_is_retried_per_identity() {
+    let host = multi(
+        &[(
+            "a",
+            vec![scan_row("a", 1, "e", 2), scan_row("a", 2, "g", 5)],
+            2,
+        )],
+        vec![
+            json!([{"id":"e","text":"t-e"}]), // the batched call: one row for two records
+            json!([{"id":"e","text":"t-e"}]), // e alone
+            json!([]),                        // g alone: misaligned
+        ],
+    );
+    let page = pull_all(&host, &[("a", 0)]).unwrap();
+    assert_eq!(page.changes[0].state["text"], "t-e");
+    assert_eq!(page.changes[1].error.as_deref(), Some("loader.invalid"));
+    let loads: Vec<usize> = host
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|r| match r {
+            HostRequest::Load { identities, .. } => Some(identities.len()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(loads, vec![2, 1, 1]);
+}
+
+/// A host error (not a failure answer) still fails the request: nothing about
+/// a broken transaction is a record's fault.
+#[test]
+fn a_thrown_host_error_still_fails_the_pull() {
+    struct Throws;
+    impl Host for Throws {
+        fn call(
+            &self,
+            r: Value,
+        ) -> Pin<Box<dyn Future<Output = ahead_server::HostResult<Value>> + Send + '_>> {
+            Box::pin(async move {
+                let request: HostRequest = serde_json::from_value(r).map_err(|e| e.to_string())?;
+                Ok(match request {
+                    HostRequest::Head { .. } => json!(1),
+                    HostRequest::Scan { .. } => json!([scan_row("a", 1, "e", 2)]),
+                    HostRequest::Load { .. } => return Err("connection reset".into()),
+                    other => return Err(format!("unsupported {}", other.label())),
+                })
+            })
+        }
+    }
+    let request = ahead_core::PullRequest {
+        cursors: [("a".to_string(), 0)].into(),
+        models: [("Entry".to_string(), 1)].into(),
+    }
+    .encode()
+    .unwrap();
+    let err = run(ahead_server::process_pull(
+        &config(),
+        "u",
+        &request,
+        &Throws,
+    ))
+    .unwrap_err();
+    assert_eq!(err.code, ahead_server::code::HOST);
+}
+
+/// A cursor past a channel's head is refused, naming the channel.
+#[test]
+fn a_cursor_ahead_of_its_channel_head_is_refused() {
+    let host = multi(&[("a", vec![], 2), ("b", vec![], 9)], vec![]);
+    let err = pull_all(&host, &[("a", 3), ("b", 0)]).unwrap_err();
+    assert_eq!(err.code, ahead_server::code::REQUEST_INVALID);
+    assert!(err.message.contains("on a"), "{err}");
 }

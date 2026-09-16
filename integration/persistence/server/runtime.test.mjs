@@ -42,7 +42,9 @@ const backend=createBackend({config,database:database(),authenticate,handlers:{
 const mutation=(ordinal,title,id='a')=>({ordinal,name:'edit',operations:[{model:'Task',op:'update',identity:{id},values:{title}}]});
 const push=(clientId,batchSequence,mutations)=>JSON.stringify({clientId,batchSequence,mutations,models:{Task:1}});
 const authority=(id,stamp,state)=>({identity:{id},model:'Task',stamp,state});
-const pull=(scope='shared',fromCursor=0)=>backend.pull('alice',JSON.stringify({clientId:'c',scope,fromCursor,models:{Task:1}})).then(JSON.parse);
+const pullBody=(cursors,models={Task:1})=>JSON.stringify({cursors,models});
+const pull=(scope='shared',fromCursor=0)=>backend.pull('alice',pullBody({[scope]:fromCursor})).then(JSON.parse);
+const to=(page,scope='shared')=>page.cursors[scope].to;
 const count=async table=>Number((await db.$queryRawUnsafe(`SELECT count(*) AS count FROM ${table}`))[0].count);
 const key=id=>`{"id":"${id}"}`;
 const recordStamp=async id=>{const rows=await db.$queryRawUnsafe('SELECT stamp FROM ahead_record WHERE model=$1 AND identity_key=$2','Task',key(id));return rows.length?Number(rows[0].stamp):null;};
@@ -105,19 +107,19 @@ test('push commits business + compacted publication + exact durable receipt toge
  assert.deepEqual(await db.$queryRawUnsafe("SELECT title FROM business_task WHERE id='a'"),[{title:'first'}]);assert.equal(await count('ahead_invalidation'),rows);
  await assert.rejects(()=>backend.push('bob',request),/owner_mismatch/);
  await assert.rejects(()=>backend.push('alice',push('dedup',3,[mutation(1,'gap')])),/gap/);
- const page=await pull();assert.deepEqual(page,{scope:'shared',fromCursor:0,toCursor:1,changes:[{syncId:1,model:'Task',identity:{id:'a'},stamp:1,state:{title:'first'}}]});assert.equal(prepared,2,'the push readback and the pull each prepared the loader once; the replays did not');
+ const page=await pull();assert.deepEqual(page,{cursors:{shared:{from:0,to:1,head:1}},changes:[{model:'Task',identity:{id:'a'},stamp:1,state:{title:'first'}}]});assert.equal(prepared,2,'the push readback and the pull each prepared the loader once; the replays did not');
 });
 test('explicit rejection rolls back only mutation and its publication',async()=>{
  const result=JSON.parse(await backend.push('alice',push('refusal',1,[mutation(1,'good','b'),mutation(2,'refuse','c'),mutation(3,'last','d')])));
  assert.deepEqual(result.rejections,[{ordinal:2,code:'task.refused'}]);assert.equal(await count('business_task'),3);
- assert.deepEqual(result.records,[authority('b',1,{title:'good'}),authority('d',1,{title:'last'})],'only the successful mutations contribute authority');assert.equal((await pull()).toCursor,3);
+ assert.deepEqual(result.records,[authority('b',1,{title:'good'}),authority('d',1,{title:'last'})],'only the successful mutations contribute authority');assert.equal(to(await pull()),3);
  assert.equal((await db.$queryRawUnsafe("SELECT * FROM business_task WHERE id='c'")).length,0);
 });
 test('rejected mutation publishes nothing even though it called publish first',async()=>{
- const head=(await pull()).toCursor;
+ const head=to(await pull());
  const result=JSON.parse(await backend.push('alice',push('refuse-only',1,[mutation(1,'refuse','refuse-only-a')])));
  assert.deepEqual(result.rejections,[{ordinal:1,code:'task.refused'}]);
- assert.equal((await pull()).toCursor,head);
+ assert.equal(to(await pull()),head);
 });
 test('a handler that throws rejects only its mutation and reaches onError',async()=>{
  const errors=[];
@@ -199,41 +201,52 @@ test('a pull reaches the loader of the declared model version and normalizes row
   async v1({ids}){reached.push(1);return ids.map(id=>({id:id.id,title:'old'}))},
   async v2({ids}){reached.push(2);return ids.map(id=>({id:id.id,title:'new',note:'n'}))},
  }}});
- const page=await versioned.pull('alice',JSON.stringify({clientId:'c',scope:'shared',fromCursor:0,models:{Task:2}}));
+ const page=await versioned.pull('alice',pullBody({shared:0},{Task:2}));
  const changes=JSON.parse(page).changes.filter(ch=>ch.state!==null);
  assert.ok(changes.length>0);assert.deepEqual(changes[0].state,{title:'new',note:'n'});
  assert.deepEqual([...new Set(reached)],[2],"only the declared version's loader ran");
- const old=await versioned.pull('alice',JSON.stringify({clientId:'c1',scope:'shared',fromCursor:0,models:{Task:1}}));
+ const old=await versioned.pull('alice',pullBody({shared:0},{Task:1}));
  assert.deepEqual(JSON.parse(old).changes.filter(ch=>ch.state!==null)[0].state,{title:'old'},'the same data reaches a v1 client in its own shape');
  assert.deepEqual(reached.at(-1),1);
  // A missing declaration is a malformed request; an unretained version or an
  // unknown model is refused with the model named.
- await assert.rejects(()=>versioned.pull('alice',JSON.stringify({clientId:'c',scope:'shared',fromCursor:0})),error=>error instanceof EngineError&&error.code==='request.invalid');
- await assert.rejects(()=>versioned.pull('alice',JSON.stringify({clientId:'c',scope:'shared',fromCursor:0,models:{Task:3}})),error=>error instanceof EngineError&&error.code==='model_version_unsupported'&&error.details.model==='Task'&&error.details.version===3);
- await assert.rejects(()=>versioned.pull('alice',JSON.stringify({clientId:'c',scope:'shared',fromCursor:0,models:{Task:2,Ghost:1}})),error=>error instanceof EngineError&&error.code==='model_version_unsupported'&&error.details.model==='Ghost');
- // A row outside the served contract is a loader defect, not silently trimmed.
+ await assert.rejects(()=>versioned.pull('alice',JSON.stringify({cursors:{shared:0}})),error=>error instanceof EngineError&&error.code==='request.invalid');
+ await assert.rejects(()=>versioned.pull('alice',pullBody({shared:0},{Task:3})),error=>error instanceof EngineError&&error.code==='model_version_unsupported'&&error.details.model==='Task'&&error.details.version===3);
+ await assert.rejects(()=>versioned.pull('alice',pullBody({shared:0},{Task:2,Ghost:1})),error=>error instanceof EngineError&&error.code==='model_version_unsupported'&&error.details.model==='Ghost');
+ // A row outside the served contract is a loader defect, never silently trimmed:
+ // that record fails alone as loader.invalid.
  const wide=createBackend({config:c,database:database(),authenticate,handlers:{},loaders:{task:{
   async v1({ids}){return ids.map(id=>({id:id.id,title:'old'}))},
   async v2({ids}){return ids.map(id=>({id:id.id,title:'new',note:'n',extra:true}))},
  }}});
- await assert.rejects(()=>wide.pull('alice',JSON.stringify({clientId:'c',scope:'shared',fromCursor:0,models:{Task:2}})),/unknown|state field/);
+ const widePage=JSON.parse(await wide.pull('alice',pullBody({shared:0},{Task:2})));
+ assert.ok(widePage.changes.length>0);
+ assert.ok(widePage.changes.every(c=>c.error==='loader.invalid'&&c.state===null),'every malformed row fails alone');
 });
 test('compaction materializes latest state; deletion is aligned null',async()=>{
  await backend.push('alice',push('dedup',2,[mutation(1,'updated')]));await assert.rejects(()=>backend.push('alice',push('dedup',1,[mutation(1,'first')])),/overlap/);
- await backend.transaction(async({tx,changes,publish})=>{await tx.$executeRawUnsafe("DELETE FROM business_task WHERE id='a'");for(const r of [{model:'Task',identity:{id:'a'}}])changes.add(r);publish({channel:'shared'});});
- const page=await pull();assert.equal(page.changes.length,4);assert.deepEqual(page.changes.at(-1).state,null);assert.equal(page.toCursor,6);
+ await backend.transaction(async({tx,changes,publish})=>{await tx.$executeRawUnsafe("DELETE FROM business_task WHERE id='a'");changes.add({model:'Task',identity:{id:'a'}});publish({channel:'shared'});});
+ const page=await pull();assert.equal(page.changes.length,4);assert.deepEqual(page.changes.find(c=>c.identity.id==='a').state,null);assert.equal(to(page),6);
  await assert.rejects(()=>pull('shared',999),/cursor ahead/);
 });
 test('50-row pages retain original cursor progression and remainder reaches head',async()=>{
  await backend.transaction(async({tx,changes,publish})=>{for(let i=0;i<51;i++){await tx.$executeRawUnsafe('INSERT INTO business_task(id,title) VALUES($1,$2)',`page-${i}`,'page');changes.add({model:'Task',identity:{id:`page-${i}`}});}publish({channel:'shared'});});
- const first=await pull('shared',6);assert.equal(first.changes.length,50);assert.equal(first.toCursor,56);const last=await pull('shared',56);assert.equal(last.changes.length,1);assert.equal(last.toCursor,57);
+ const first=await pull('shared',6);assert.equal(first.changes.length,50);assert.equal(to(first),56);assert.equal(first.cursors.shared.head,57);const last=await pull('shared',56);assert.equal(last.changes.length,1);assert.equal(to(last),57);assert.equal(last.cursors.shared.head,57);
 });
 test('concurrent same-client retry executes once under PostgreSQL lock',async()=>{const before=called;const request=push('race',1,[mutation(1,'race','race')]);const receipts=await Promise.all([backend.push('alice',request),backend.push('alice',request)]);assert.equal(receipts[0],receipts[1]);assert.equal(called,before+1);});
-test('publication rollback uses user transaction and rejects unregistered models',async()=>{const before=(await pull('shared',56)).toCursor;await assert.rejects(()=>backend.transaction(async({tx,changes,publish})=>{for(const r of [{model:'Task',identity:{id:'rollback'}}])changes.add(r);publish({channel:'shared'});throw new Error('cancel');}),/cancel/);assert.equal((await pull('shared',56)).toCursor,before);await assert.rejects(()=>external(backend,'shared',[{model:'Unknown',identity:{id:'x'}}]),/unregistered loader/);});
-test('loader defects abort pull instead of silently advancing its cursor',async()=>{
+test('publication rollback uses user transaction and rejects unregistered models',async()=>{const before=to(await pull('shared',56));await assert.rejects(()=>backend.transaction(async({changes,publish})=>{changes.add({model:'Task',identity:{id:'rollback'}});publish({channel:'shared'});throw new Error('cancel');}),/cancel/);assert.equal(to(await pull('shared',56)),before);await assert.rejects(()=>external(backend,'shared',[{model:'Unknown',identity:{id:'x'}}]),/unregistered loader/);});
+test('loader defects fail only their records; the page is served and the cursor advances',async()=>{
  const make=load=>createBackend({config:{...config,mutations:[]},database:database(),authenticate,handlers:{},loaders:{task:load}});
- await assert.rejects(()=>make(async()=>[]).pull('alice',JSON.stringify({clientId:'c',scope:'shared',fromCursor:56,models:{Task:1}})),/misaligned loader/);
- await assert.rejects(()=>make(async({ids})=>ids.map(()=>({title:'x',unexpected:true}))).pull('alice',JSON.stringify({clientId:'c',scope:'shared',fromCursor:56,models:{Task:1}})),/unknown|state field/);
+ const misaligned=JSON.parse(await make(async()=>[]).pull('alice',pullBody({shared:0})));
+ assert.ok(misaligned.changes.length>0);
+ assert.ok(misaligned.changes.every(c=>c.error==='loader.invalid'),'an answer that cannot be matched fails each record');
+ assert.ok(to(misaligned)>0,'the cursor advances past the failed records');
+ const reported=[];
+ const malformed=JSON.parse(await createBackend({config:{...config,mutations:[]},database:database(),authenticate,onError:e=>reported.push(e.message),handlers:{},loaders:{task:async({ids})=>ids.map(id=>id.id==='a'?({title:'x',unexpected:true}):({title:'ok'}))}}).pull('alice',pullBody({shared:0})));
+ assert.equal(reported.length,1,reported.join('; '));assert.match(reported[0],/Task contract does not accept: \{"id":"a"\}/);
+ const bad=malformed.changes.filter(c=>c.error);
+ assert.deepEqual(bad.map(c=>[c.identity.id,c.error]),[['a','loader.invalid']],'only the malformed row fails');
+ assert.ok(malformed.changes.filter(c=>!c.error).every(c=>c.state===null||c.state.title==='ok'));
 });
 test('registered translator rejects one mutation; malformed translator code aborts transaction',async()=>{
  const make=code=>createBackend({config,database:database(),authenticate,translateRejection:()=>code,handlers:{async edit({tx}){await tx.$executeRawUnsafe("INSERT INTO business_task(id,title) VALUES('translated','temporary')");throw new Error('product refusal');}},loaders:{async task(){return []}}});
@@ -244,25 +257,33 @@ test('registered translator rejects one mutation; malformed translator code abor
 test('HTTP adapter authenticates and serves the real native persistence path',async()=>{
  const server=await backend.listen({port:0});const url=server.url;
  try {
-  const denied=await fetch(`${url}/sync/pull`,{method:'POST',body:JSON.stringify({clientId:'c',scope:'shared',fromCursor:0,models:{Task:1}})});assert.equal(denied.status,401);
+  const denied=await fetch(`${url}/sync/pull`,{method:'POST',body:pullBody({shared:0})});assert.equal(denied.status,401);
   const result=await fetch(`${url}/sync/mutations`,{method:'POST',headers:{authorization:'Bearer alice'},body:push('http',1,[mutation(1,'network','http')])});assert.equal(result.status,200);assert.deepEqual((await result.json()).rejections,[]);
-  const page=await fetch(`${url}/sync/pull`,{method:'POST',headers:{authorization:'Bearer alice'},body:JSON.stringify({clientId:'c',scope:'shared',fromCursor:58,models:{Task:1}})});assert.equal(page.status,200);assert.equal((await page.json()).changes[0].state.title,'network');
+  const page=await fetch(`${url}/sync/pull`,{method:'POST',headers:{authorization:'Bearer alice'},body:pullBody({shared:58})});assert.equal(page.status,200);assert.equal((await page.json()).changes[0].state.title,'network');
   const bad=await fetch(`${url}/sync/pull`,{method:'POST',headers:{authorization:'Bearer alice'},body:'{'});assert.equal(bad.status,400);
  }finally{await server.close();}
 });
-test('undefined loader entries remain defects and never become tombstones',async()=>{
- const bad=createBackend({config:{...config,mutations:[]},database:database(),authenticate,handlers:{},loaders:{async task({ids}){return ids.map(()=>undefined)}}});
- await assert.rejects(()=>bad.pull('alice',JSON.stringify({clientId:'c',scope:'shared',fromCursor:56,models:{Task:1}})),/undefined|invalid loader/);
+test('an undefined loader entry fails only its record, reaches onError and never becomes a tombstone',async()=>{
+ const errors=[];
+ const bad=createBackend({config:{...config,mutations:[]},database:database(),authenticate,onError:e=>errors.push(e.message),handlers:{},loaders:{async task({ids}){return ids.map(id=>id.id==='a'?undefined:null)}}});
+ const page=JSON.parse(await bad.pull('alice',pullBody({shared:0})));
+ const failed=page.changes.filter(c=>c.error);
+ assert.deepEqual(failed.map(c=>[c.identity.id,c.error,c.state]),[['a','loader.failed',null]]);
+ assert.ok(errors.some(m=>/undefined entry/.test(m)),errors.join('; '));
 });
 test('publication failures poison push and roll back business writes',async()=>{
  const broken=createBackend({config,database:database(),authenticate,handlers:{async edit({tx,publish}){await tx.$executeRawUnsafe("INSERT INTO business_task(id,title) VALUES('caught','bad')");publish({channel:'shared',records:[{model:'Unknown',identity:{id:'caught'}}]});}},loaders:{async task({ids}){return ids.map(()=>null)}}});
  await assert.rejects(()=>broken.push('alice',push('caught',1,[mutation(1,'x')])),/unregistered loader/);
  assert.equal((await db.$queryRawUnsafe("SELECT * FROM business_task WHERE id='caught'")).length,0);assert.equal((await db.$queryRawUnsafe("SELECT * FROM ahead_client WHERE client_id='caught'")).length,0);
 });
-test('nonfinite nullable loader values are defects rather than null clears',async()=>{
+test('a nonfinite loader value fails its record rather than clearing to null',async()=>{
  const expanded=structuredClone(config);expanded.schema.models[0].fields.push({name:'score',type:{kind:'scalar',name:'float'},nullable:true});
- expanded.mutations=[];const bad=createBackend({config:expanded,database:database(),authenticate,handlers:{},loaders:{async task({ids}){return ids.map(()=>({title:'x',score:NaN}))}}});
- await assert.rejects(()=>bad.pull('alice',JSON.stringify({clientId:'c',scope:'shared',fromCursor:56,models:{Task:1}})),/nonfinite/);
+ const errors=[];
+ expanded.mutations=[];const bad=createBackend({config:expanded,database:database(),authenticate,onError:e=>errors.push(e.message),handlers:{},loaders:{async task({ids}){return ids.map(()=>({title:'x',score:NaN}))}}});
+ const page=JSON.parse(await bad.pull('alice',pullBody({shared:56})));
+ assert.ok(page.changes.length>0);
+ assert.ok(page.changes.every(c=>c.error==='loader.failed'&&c.state===null));
+ assert.ok(errors.some(m=>/nonfinite/.test(m)),errors.join('; '));
 });
 test('backend.transaction rolls the business write back when the settlement is rejected',async()=>{
  await assert.rejects(()=>backend.transaction(async({tx,changes,publish})=>{await tx.$executeRawUnsafe("INSERT INTO business_task(id,title) VALUES('external','bad')");changes.add({model:'Unknown',identity:{id:'x'}});publish({channel:'shared'});}),/unregistered loader/);
@@ -271,8 +292,8 @@ test('backend.transaction rolls the business write back when the settlement is r
 test('repeatable-read runner keeps head, scan, and loader coherent across concurrent publication',async()=>{
  await external(backend,'snapshot',[{model:'Task',identity:{id:'a'}}]);let changed=false;
  const reader=createBackend({config:{...config,mutations:[]},database:{transaction:run,persistence:tx=>{const storage=store(tx);return {call:async r=>{const result=await storage.call(r);if(r.op==='head'&&!changed){changed=true;await external(backend,'snapshot',[{model:'Task',identity:{id:'b'}}]);}return result;}}}},authenticate,handlers:{},loaders:{async task({ids}){return ids.map(()=>null)}}});
- const page=JSON.parse(await reader.pull('alice',JSON.stringify({clientId:'c',scope:'snapshot',fromCursor:0,models:{Task:1}})));assert.equal(page.toCursor,1);assert.equal(page.changes.length,1);
- const next=JSON.parse(await reader.pull('alice',JSON.stringify({clientId:'c',scope:'snapshot',fromCursor:1,models:{Task:1}})));assert.equal(next.toCursor,2);assert.equal(next.changes.length,1);
+ const page=JSON.parse(await reader.pull('alice',pullBody({snapshot:0})));assert.equal(to(page,'snapshot'),1);assert.equal(page.changes.length,1);
+ const next=JSON.parse(await reader.pull('alice',pullBody({snapshot:1})));assert.equal(to(next,'snapshot'),2);assert.equal(next.changes.length,1);
 });
 
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
@@ -292,9 +313,9 @@ const nextMessage=socket=>new Promise((resolve,reject)=>{
 test('live transport negotiates, wakes only after commit, reconnects, and cleans up',async()=>{
  const server=await backend.listen({port:0});const port=Number(new URL(server.url).port);
  const socket=await openSocket(port);const frames=[];socket.addEventListener('message',event=>frames.push(JSON.parse(String(event.data))));
- socket.send(JSON.stringify({type:'subscribe',scopes:['shared','bob','shared'],models:{Task:1}}));
+ socket.send(JSON.stringify({type:'subscribe',channels:['shared','bob','shared'],models:{Task:1}}));
  while(frames.length<1)await delay(5);
- assert.deepEqual(frames[0],{rejections:[],scopes:['bob','shared'],type:'subscribed'});
+ assert.equal(frames[0].type,'subscribed');assert.deepEqual(Object.keys(frames[0].cursors),['bob','shared']);assert.equal(frames[0].cursors.bob,0,'a fresh channel is at head 0');assert.ok(frames[0].cursors.shared>0,'the acknowledgement carries the current head');
 
  let release,ready;const held=new Promise(resolve=>{release=resolve;});const started=new Promise(resolve=>{ready=resolve;});
  const committing=backend.transaction(async({tx,changes,publish})=>{
@@ -303,23 +324,23 @@ test('live transport negotiates, wakes only after commit, reconnects, and cleans
  });
  await started;await delay(80);assert.equal(frames.length,1,'uncommitted publication must stay silent');release();await committing;
  while(frames.length<2)await delay(5);
- assert.deepEqual(frames[1].changes.at(-1),{syncId:frames[1].toCursor,model:'Task',identity:{id:'live-external'},stamp:1,state:{title:'committed'}});
+ assert.deepEqual(frames[1].changes.at(-1),{model:'Task',identity:{id:'live-external'},stamp:1,state:{title:'committed'}});assert.deepEqual(Object.keys(frames[1].cursors),['shared'],'a frame names only the channels that moved');assert.equal(frames[1].cursors.shared.from,frames[0].cursors.shared);
 
  const pageStart=frames.length;
  await backend.transaction(async({tx,changes,publish})=>{for(let i=0;i<51;i++){const id=`live-page-${i}`;await tx.$executeRawUnsafe('INSERT INTO business_task(id,title) VALUES($1,$2)',id,'paged');changes.add({model:'Task',identity:{id}});}publish({channel:'shared'});});
- while(frames.length<pageStart+2)await delay(5);assert.equal(frames[pageStart].changes.length,50);assert.equal(frames[pageStart+1].changes.length,1);assert.equal(frames[pageStart+1].fromCursor,frames[pageStart].toCursor);
+ while(frames.length<pageStart+2)await delay(5);assert.equal(frames[pageStart].changes.length,50);assert.equal(frames[pageStart+1].changes.length,1);assert.equal(frames[pageStart+1].cursors.shared.from,frames[pageStart].cursors.shared.to);assert.ok(frames[pageStart].cursors.shared.to<frames[pageStart].cursors.shared.head,'a full frame says the channel continues');
 
  const beforeRollback=frames.length;
  await assert.rejects(()=>backend.transaction(async({changes,publish})=>{changes.add({model:'Task',identity:{id:'live-rollback'}});publish({channel:'shared'});throw new Error('rollback live');}),/rollback live/);
  await delay(80);assert.equal(frames.length,beforeRollback);
 
  socket.close();await new Promise(resolve=>socket.addEventListener('close',resolve,{once:true}));
- const reconnected=await openSocket(port);reconnected.send(JSON.stringify({type:'subscribe',scopes:['shared'],models:{Task:1}}));await nextMessage(reconnected);
+ const reconnected=await openSocket(port);reconnected.send(JSON.stringify({type:'subscribe',channels:['shared'],models:{Task:1}}));await nextMessage(reconnected);
  const pagePromise=nextMessage(reconnected);await backend.push('alice',push('live-push',1,[mutation(1,'from push','live-push')]));
  const page=await pagePromise;assert.deepEqual(page.changes.at(-1).state,{title:'from push'});
  const afterPush=[];reconnected.addEventListener('message',event=>afterPush.push(event));await backend.push('alice',push('live-push',1,[mutation(1,'from push','live-push')]));
  await delay(80);assert.equal(afterPush.length,0,'duplicate receipt must not wake live subscribers');
- const protocol=await openSocket(port);protocol.send(JSON.stringify({type:'subscribe',scopes:['shared'],models:{Task:1}}));await nextMessage(protocol);protocol.send('{}');
+ const protocol=await openSocket(port);protocol.send(JSON.stringify({type:'subscribe',channels:['shared'],models:{Task:1}}));await nextMessage(protocol);protocol.send('{}');
  const closeCode=await new Promise(resolve=>protocol.addEventListener('close',event=>resolve(event.code),{once:true}));assert.equal(closeCode,1002);
  reconnected.close();await new Promise(resolve=>reconnected.addEventListener('close',resolve,{once:true}));
  await server.close();
@@ -335,14 +356,14 @@ test('a publication committed between negotiation and the acknowledgement is del
  try{
   const socket=await openSocket(port);const frames=[];socket.addEventListener('message',event=>frames.push(JSON.parse(String(event.data))));
   let release;hold=new Promise(resolve=>{release=resolve;});
-  socket.send(JSON.stringify({type:'subscribe',scopes:['shared'],models:{Task:1}}));
+  socket.send(JSON.stringify({type:'subscribe',channels:['shared'],models:{Task:1}}));
   await delay(100);assert.equal(frames.length,0,'the acknowledgement is held on the gate');
   await gatedBackend.push('alice',push('between',1,[mutation(1,'between negotiation and ack','live-between')]));
   await delay(50);assert.equal(frames.length,0,'no listener exists yet, so the commit wakes nobody');
   release();
   while(frames.length<2)await delay(5);
-  assert.deepEqual(frames[0],{rejections:[],scopes:['shared'],type:'subscribed'});
-  assert.deepEqual(frames[1].changes.at(-1),{syncId:frames[1].toCursor,model:'Task',identity:{id:'live-between'},stamp:1,state:{title:'between negotiation and ack'}});
+  assert.equal(frames[0].type,'subscribed');assert.deepEqual(Object.keys(frames[0].cursors),['shared']);
+  assert.deepEqual(frames[1].changes.at(-1),{model:'Task',identity:{id:'live-between'},stamp:1,state:{title:'between negotiation and ack'}});
   socket.close();await new Promise(resolve=>socket.addEventListener('close',resolve,{once:true}));
  }finally{await server.close();}
 });
@@ -362,7 +383,7 @@ test('loader safely converts PostgreSQL BigInt scalar and list values without wi
     )}},
   });
   await external(bigintBackend,'bigints',[{model: 'Counter', identity: {id: 'one'}}]);
-  const request = JSON.stringify({clientId: 'bigint-reader', scope: 'bigints', fromCursor: 0,models:{Counter:1}});
+  const request = pullBody({bigints: 0},{Counter:1});
   let page = JSON.parse(await bigintBackend.pull('alice', request));
   assert.deepEqual(page.changes[0].state, {count: Number.MAX_SAFE_INTEGER, counts: [Number.MAX_SAFE_INTEGER, -Number.MAX_SAFE_INTEGER]});
   value = -9007199254740991n;
@@ -370,14 +391,16 @@ test('loader safely converts PostgreSQL BigInt scalar and list values without wi
   assert.equal(page.changes[0].state.count, -Number.MAX_SAFE_INTEGER);
   for (const overflow of [9007199254740992n, -9007199254740992n]) {
     value = overflow;
-    await assert.rejects(bigintBackend.pull('alice', request), /bigint outside safe integer range/);
+    page = JSON.parse(await bigintBackend.pull('alice', request));
+    assert.equal(page.changes[0].error, 'loader.failed');
+    assert.equal(page.changes[0].state, null);
   }
 });
 test('listen answers pull over HTTP with authentication and closes cleanly',async()=>{
  const server=await backend.listen({port:0});
  try{
   const denied=await fetch(`${server.url}/sync/pull`,{method:'POST',body:'{}'});assert.equal(denied.status,401);
-  const ok=await fetch(`${server.url}/sync/pull`,{method:'POST',headers:{authorization:'Bearer alice'},body:JSON.stringify({clientId:'listen',scope:'shared',fromCursor:0,models:{Task:1}})});assert.equal(ok.status,200);
+  const ok=await fetch(`${server.url}/sync/pull`,{method:'POST',headers:{authorization:'Bearer alice'},body:pullBody({shared:0})});assert.equal(ok.status,200);
  }finally{await server.close();}
 });
 test('onError captures server-side failures and HTTP responds with {code:"server"}',async()=>{
@@ -418,7 +441,7 @@ test('explicit records publish only those, never join the change set, and are in
  const second=JSON.parse(await backend.push('alice',push('pub-only',2,[mutation(2,'publish-only','pub-only-b')])));
  assert.deepEqual(second.records,[authority('pub-only-b',1,{title:'publish-only'})]);
  assert.equal(await head('other'),other+1,'the channel head advanced');assert.deepEqual(await invalidations('pub-only'),[['other',other+1,1]],'the invalidation moved to the new cursor at the same stamp');assert.equal(await recordStamp('pub-only'),1,'publishing an unchanged record never advances it');
- const page=await pull('other',0);assert.deepEqual(page.changes.find(c=>c.identity.id==='pub-only'),{syncId:other+1,model:'Task',identity:{id:'pub-only'},stamp:1,state:null});
+ const page=await pull('other',0);assert.deepEqual(page.changes.find(c=>c.identity.id==='pub-only'),{model:'Task',identity:{id:'pub-only'},stamp:1,state:null});
  assert.equal(page.changes.some(c=>c.identity.id.startsWith('pub-only-')),false,'the changed records went to shared only');
 });
 test('a loader refusal during push rejects only that mutation; so does a thrown loader error',async()=>{
@@ -448,8 +471,8 @@ test('a handler may keep using the transaction after publish; the publication go
  }},loaders:{task:readTasks}});
  const receipt=JSON.parse(await deferredBackend.push('alice',push('deferred',1,[mutation(1,'deferred','deferred-a')])));
  assert.deepEqual(receipt,{batchSequence:1,clientId:'deferred',records:[authority('deferred-a',1,{title:'deferred'})],rejections:[]});
- const page=JSON.parse(await deferredBackend.pull('alice',JSON.stringify({clientId:'deferred-reader',scope:'deferred',fromCursor:0,models:{Task:1}})));
- assert.deepEqual(page.changes.at(-1),{syncId:1,model:'Task',identity:{id:'deferred-a'},stamp:1,state:{title:'deferred'}});
+ const page=JSON.parse(await deferredBackend.pull('alice',pullBody({deferred:0})));
+ assert.deepEqual(page.changes.at(-1),{model:'Task',identity:{id:'deferred-a'},stamp:1,state:{title:'deferred'}});
 });
 test('an all-rejected batch settles with no records',async()=>{
  const receipt=JSON.parse(await backend.push('alice',push('allrej',1,[mutation(1,'refuse','rej-a')])));
@@ -499,7 +522,7 @@ test('scan pairs the invalidation cursor with the current record stamp; a missin
  await backend.push('alice',push('join',2,[mutation(2,'quiet','join-a')]));
  assert.equal(await recordStamp('join-a'),2);assert.deepEqual(await invalidations('join-a'),[['shared',cursor,1]],'no publication: the invalidation row is untouched');
  const page=await pull('shared',cursor-1);
- assert.deepEqual(page.changes[0],{syncId:cursor,model:'Task',identity:{id:'join-a'},stamp:2,state:{title:'quiet'}},'the original cursor with the current stamp and content');
+ assert.deepEqual(page.changes[0],{model:'Task',identity:{id:'join-a'},stamp:2,state:{title:'quiet'}},'the original cursor with the current stamp and content');
  const rows=await db.$transaction(tx=>store(tx).call({op:'scan',channel:'shared',after:cursor-1,limit:1}));assert.deepEqual(rows.map(r=>[r.cursor,r.stamp]),[[cursor,2]]);
  await db.$transaction(async tx=>{const storage=store(tx);const stamp=await storage.call({op:'ensureStamp',model:'Task',identityKey:key('orphan')});await storage.call({op:'publish',channel:'orphan',model:'Task',identity:{id:'orphan'},identityKey:key('orphan'),stamp});});
  await db.$executeRawUnsafe('DELETE FROM ahead_record WHERE identity_key=$1',key('orphan'));
@@ -538,13 +561,13 @@ test('a reverse proxy forwarding HTTP and the WebSocket upgrade with headers ser
  try{
   const pushed=await fetch(`${proxy.url}/sync/mutations`,{method:'POST',headers:{authorization:'Bearer alice'},body:push('proxied',1,[mutation(1,'through proxy','proxy-a')])});
   assert.equal(pushed.status,200);assert.deepEqual((await pushed.json()).rejections,[]);
-  const seen=[];for(let fromCursor=0;;){const page=await fetch(`${proxy.url}/sync/pull`,{method:'POST',headers:{authorization:'Bearer alice'},body:JSON.stringify({clientId:'c',scope:'shared',fromCursor,models:{Task:1}})});
-   assert.equal(page.status,200);const body=await page.json();seen.push(...body.changes);if(body.changes.length<50)break;fromCursor=body.toCursor;}
+  const seen=[];for(let fromCursor=0;;){const page=await fetch(`${proxy.url}/sync/pull`,{method:'POST',headers:{authorization:'Bearer alice'},body:pullBody({shared:fromCursor})});
+   assert.equal(page.status,200);const body=await page.json();seen.push(...body.changes);if(body.cursors.shared.to>=body.cursors.shared.head)break;fromCursor=body.cursors.shared.to;}
   assert.ok(seen.some(c=>c.identity.id==='proxy-a'&&c.state.title==='through proxy'),'the pushed record is pulled through the proxy');
   const socket=new serverSdk.WebSocket(`${proxy.url.replace('http','ws')}/sync/live`,{headers:{authorization:'Bearer alice'}});
   await new Promise((resolve,reject)=>{socket.on('open',resolve);socket.on('error',reject);});
   const frames=[];socket.on('message',data=>frames.push(JSON.parse(String(data))));
-  socket.send(JSON.stringify({type:'subscribe',scopes:['shared'],models:{Task:1}}));while(frames.length<1)await delay(5);
+  socket.send(JSON.stringify({type:'subscribe',channels:['shared'],models:{Task:1}}));while(frames.length<1)await delay(5);
   assert.equal(frames[0].type,'subscribed');
   await backend.push('alice',push('proxied',2,[mutation(2,'live through proxy','proxy-a')]));
   while(frames.length<2)await delay(5);assert.equal(frames.at(-1).changes.at(-1).state.title,'live through proxy');
@@ -573,14 +596,14 @@ test('HTTP maps engine codes to statuses: 403, 409 gap/overlap/version fields, 4
   finally{await bobServer.close();}
   const version=await post('/sync/mutations',push('map',3,[{...mutation(3,'x','map-a'),version:7}]));assert.equal(version.status,200,'an unsupported mutation version rejects only that mutation; the batch still settles');
   assert.deepEqual((await version.json()).rejections,[{ordinal:3,code:'mutation_version_unsupported'}]);
-  const ahead=await post('/sync/pull',JSON.stringify({clientId:'c',scope:'shared',fromCursor:1e9,models:{Task:1}}));assert.equal(ahead.status,400);assert.deepEqual(await ahead.json(),{code:'request.invalid'});
-  const undeclared=await post('/sync/pull',JSON.stringify({clientId:'c',scope:'shared',fromCursor:0}));assert.equal(undeclared.status,400);assert.deepEqual(await undeclared.json(),{code:'request.invalid'});
-  const unretained=await post('/sync/pull',JSON.stringify({clientId:'c',scope:'shared',fromCursor:0,models:{Task:9}}));assert.equal(unretained.status,409);
+  const ahead=await post('/sync/pull',pullBody({shared:1e9}));assert.equal(ahead.status,400);assert.deepEqual(await ahead.json(),{code:'request.invalid'});
+  const undeclared=await post('/sync/pull',JSON.stringify({cursors:{shared:0}}));assert.equal(undeclared.status,400);assert.deepEqual(await undeclared.json(),{code:'request.invalid'});
+  const unretained=await post('/sync/pull',pullBody({shared:0},{Task:9}));assert.equal(unretained.status,409);
   assert.deepEqual(await unretained.json(),{code:'model_version_unsupported',model:'Task',version:9});
   const array=await post('/sync/pull','[]');assert.equal(array.status,400);assert.deepEqual(await array.json(),{code:'request.invalid'});
   const missing=await post('/sync/nowhere','{}');assert.equal(missing.status,404);assert.deepEqual(await missing.json(),{code:'not_found'});
   const get=await fetch(`${url}/sync/pull`,{headers:{authorization:'Bearer alice'}});assert.equal(get.status,405);assert.equal(get.headers.get('allow'),'POST');assert.deepEqual(await get.json(),{code:'method_not_allowed'});
-  const large=await post('/sync/pull',JSON.stringify({clientId:'c',scope:'shared',fromCursor:0,padding:'x'.repeat(1_048_577)}));assert.equal(large.status,413);assert.deepEqual(await large.json(),{code:'request_too_large'});
+  const large=await post('/sync/pull',JSON.stringify({cursors:{shared:0},padding:'x'.repeat(1_048_577)}));assert.equal(large.status,413);assert.deepEqual(await large.json(),{code:'request_too_large'});
  }finally{await server.close();}
 });
 test('HTTP classifies native failures by code, not message wording; unknown codes fall back to 500',async()=>{
@@ -596,11 +619,11 @@ test('HTTP classifies native failures by code, not message wording; unknown code
   const version=await fetch(`${server.url}/sync/pull`,{method:'POST',headers:{authorization:'Bearer alice'},body:'{}'});assert.equal(version.status,409);assert.deepEqual(await version.json(),{code:'mutation_version_unsupported',ordinal:2,name:'edit',version:9});
   assert.equal(errors.length,0,'classified refusals are not server errors');
   const socket=new serverSdk.WebSocket(`${server.url.replace('http','ws')}/sync/live`,{headers:{authorization:'Bearer alice'}});
-  const closed=await new Promise(resolve=>{socket.on('open',()=>socket.send(JSON.stringify({type:'subscribe',scopes:['shared'],models:{Task:1}})));socket.on('close',(code,reasonText)=>resolve({code,reason:String(reasonText)}));socket.on('error',()=>{});});
+  const closed=await new Promise(resolve=>{socket.on('open',()=>socket.send(JSON.stringify({type:'subscribe',channels:['shared'],models:{Task:1}})));socket.on('close',(code,reasonText)=>resolve({code,reason:String(reasonText)}));socket.on('error',()=>{});});
   assert.equal(closed.code,1002);assert.equal(errors.length,0);
-  fake.negotiateLive=async()=>JSON.stringify({handle:1,actions:[{type:'listen',scope:'shared'},{type:'send',frame:JSON.stringify({type:'subscribed',scopes:['shared'],rejections:[]})},{type:'pull',scope:'shared',fromCursor:0,models:{Task:1}}]});
+  fake.negotiateLive=async()=>JSON.stringify({handle:1,actions:[{type:'listen',scope:'shared'},{type:'send',frame:JSON.stringify({type:'subscribed',cursors:{shared:0}})},{type:'pull',cursors:{shared:0},models:{Task:1}}]});
   const drained=new serverSdk.WebSocket(`${server.url.replace('http','ws')}/sync/live`,{headers:{authorization:'Bearer alice'}});
-  const drainClose=await new Promise(resolve=>{drained.on('open',()=>drained.send(JSON.stringify({type:'subscribe',scopes:['shared'],models:{Task:1}})));drained.on('close',code=>resolve(code));drained.on('error',()=>{});});
+  const drainClose=await new Promise(resolve=>{drained.on('open',()=>drained.send(JSON.stringify({type:'subscribe',channels:['shared'],models:{Task:1}})));drained.on('close',code=>resolve(code));drained.on('error',()=>{});});
   assert.equal(drainClose,1011);assert.equal(errors.length,1);assert.ok(errors[0] instanceof EngineError);assert.equal(errors[0].code,'loader.unregistered');
   fake.processPush=async()=>{throw reason('storage.invalid','receipt missing');};
   const unknown=await fetch(`${server.url}/sync/mutations`,{method:'POST',headers:{authorization:'Bearer alice'},body:'{}'});assert.equal(unknown.status,500);assert.deepEqual(await unknown.json(),{code:'server'});
@@ -719,7 +742,7 @@ test('the live stream serves the declared model version and refuses an unretaine
   const shapes=[];
   for(const [version,expected] of [[1,{title:'old'}],[2,{title:'new',note:'n'}]]){
    const socket=await openSocket(port);const frames=[];socket.addEventListener('message',event=>frames.push(JSON.parse(String(event.data))));
-   socket.send(JSON.stringify({type:'subscribe',scopes:['shared'],models:{Task:version}}));
+   socket.send(JSON.stringify({type:'subscribe',channels:['shared'],models:{Task:version}}));
    while(frames.length<1)await delay(5);
    assert.equal(frames[0].type,'subscribed');
    // Streaming starts at the head: publish after the handshake; the commit
@@ -732,11 +755,11 @@ test('the live stream serves the declared model version and refuses an unretaine
   }
   const refused=await openSocket(port);
   const closed=new Promise(resolve=>refused.addEventListener('close',event=>resolve({code:event.code,reason:String(event.reason)}),{once:true}));
-  refused.send(JSON.stringify({type:'subscribe',scopes:['shared'],models:{Task:3}}));
+  refused.send(JSON.stringify({type:'subscribe',channels:['shared'],models:{Task:3}}));
   assert.deepEqual(await closed,{code:1002,reason:'model_version_unsupported'});
   const undeclared=await openSocket(port);
   const closedToo=new Promise(resolve=>undeclared.addEventListener('close',event=>resolve(event.code),{once:true}));
-  undeclared.send(JSON.stringify({type:'subscribe',scopes:['shared']}));
+  undeclared.send(JSON.stringify({type:'subscribe',channels:['shared']}));
   assert.equal(await closedToo,1002);
  }finally{await server.close();}
 });
@@ -760,7 +783,7 @@ test('backend.transaction rolls back a failing body and wakes nobody',async()=>{
 test('backend.transaction wakes a connected live subscriber without reconnect',async()=>{
  const server=await backend.listen({port:0});const port=Number(new URL(server.url).port);
  const socket=await openSocket(port);const frames=[];socket.addEventListener('message',event=>frames.push(JSON.parse(String(event.data))));
- socket.send(JSON.stringify({type:'subscribe',scopes:['shared'],models:{Task:1}}));while(frames.length<1)await delay(5);
+ socket.send(JSON.stringify({type:'subscribe',channels:['shared'],models:{Task:1}}));while(frames.length<1)await delay(5);
  await backend.transaction(async({tx,changes,publish})=>{await write(tx,'tx-live','live via transaction');for(const r of [{model:'Task',identity:{id:'tx-live'}}])changes.add(r);publish({channel:'shared'});});
  while(frames.length<2)await delay(5);
  assert.deepEqual(frames[1].changes.at(-1).identity,{id:'tx-live'});assert.deepEqual(frames[1].changes.at(-1).state,{title:'live via transaction'});
@@ -781,4 +804,40 @@ test('publishing an unchanged record does not advance its stamp; a body without 
  assert.equal(await stampOf(),first,'publication-only records keep their stamp');assert.equal(await head('shared'),headBefore+1,'but are still published');
  await backend.transaction(async({changes})=>{changes.add({model:'Task',identity:{id:'stamp-probe'}});});
  assert.equal(await stampOf(),first+1,'changes advance even without a publish');assert.equal(await head('shared'),headBefore+1,'and nothing is published');
+});
+test('a pull covers every channel in one request and delivers a record shared by two channels once',async()=>{
+ await db.$executeRawUnsafe("INSERT INTO business_task(id,title) VALUES('multi-a','A'),('multi-b','B') ON CONFLICT(id) DO NOTHING");
+ await backend.transaction(async({changes,publish})=>{changes.add({model:'Task',identity:{id:'multi-a'}});changes.add({model:'Task',identity:{id:'multi-b'}});publish({channel:'multi-x'});publish({channel:'multi-y',records:[{model:'Task',identity:{id:'multi-a'}}]});});
+ const page=JSON.parse(await backend.pull('alice',pullBody({'multi-x':0,'multi-y':0})));
+ assert.deepEqual(Object.keys(page.cursors),['multi-x','multi-y']);
+ assert.deepEqual(page.cursors['multi-x'],{from:0,to:2,head:2});assert.deepEqual(page.cursors['multi-y'],{from:0,to:1,head:1});
+ assert.deepEqual(page.changes.map(c=>c.identity.id),['multi-a','multi-b'],'multi-a is delivered once although both channels changed it');
+ assert.equal(page.changes[0].stamp,await recordStamp('multi-a'));
+ const nothing=JSON.parse(await backend.pull('alice',pullBody({'multi-x':2,'multi-y':1})));
+ assert.deepEqual(nothing,{cursors:{'multi-x':{from:2,to:2,head:2},'multi-y':{from:1,to:1,head:1}},changes:[]});
+});
+test('a loader that throws for one id fails only that record and reaches onError',async()=>{
+ const errors=[];const calls=[];
+ const flaky=createBackend({config:{...config,mutations:[]},database:prisma(db),authenticate,onError:e=>errors.push(e),handlers:{},loaders:{task:async({ids,tx})=>{calls.push(ids.length);if(ids.some(id=>id.id==='multi-b'))throw new Error('b is broken');return readTasks({ids,tx});}}});
+ const page=JSON.parse(await flaky.pull('alice',pullBody({'multi-x':0})));
+ const a=page.changes.find(c=>c.identity.id==='multi-a'),b=page.changes.find(c=>c.identity.id==='multi-b');
+ assert.deepEqual(a.state,{title:'A'});assert.equal(a.error,undefined);
+ assert.equal(b.error,'loader.failed');assert.equal(b.state,null);assert.equal(b.stamp,await recordStamp('multi-b'));
+ assert.deepEqual(calls,[2,1,1],'the batched call, then one call per identity');
+ assert.equal(errors.length,2,'the batched failure and the single failure both reach onError');assert.equal(errors[0].message,'b is broken');
+});
+test('a loader refusal for one id is an error change carrying the refusal code',async()=>{
+ const refusing=createBackend({config:{...config,mutations:[]},database:prisma(db),authenticate,handlers:{},loaders:{task:async({ids,tx})=>{if(ids.some(id=>id.id==='multi-a'))throw new MutationRejected('task.forbidden');return readTasks({ids,tx});}}});
+ const page=JSON.parse(await refusing.pull('alice',pullBody({'multi-x':0})));
+ assert.equal(page.changes.find(c=>c.identity.id==='multi-a').error,'task.forbidden');
+ assert.deepEqual(page.changes.find(c=>c.identity.id==='multi-b').state,{title:'B'});
+});
+test('onError defaults to console.error so nothing is dropped silently',async()=>{
+ const seen=[];const original=console.error;console.error=(...args)=>seen.push(args);
+ try{
+  const quiet=createBackend({config:{...config,mutations:[]},database:prisma(db),authenticate,handlers:{},loaders:{task:async({ids})=>{if(ids.length===1)throw new Error('single');throw new Error('batched');}}});
+  const page=JSON.parse(await quiet.pull('alice',pullBody({'multi-x':0})));
+  assert.ok(page.changes.every(c=>c.error==='loader.failed'));
+  assert.ok(seen.some(args=>args[0]?.message==='batched'),'the batched failure was logged');
+ }finally{console.error=original;}
 });

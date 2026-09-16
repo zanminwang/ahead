@@ -36,8 +36,7 @@ export type Native = {
   pullLive(
     config: string,
     owner: string,
-    scope: string,
-    fromCursor: number,
+    cursors: string,
     models: string,
     callback: (request: string) => Promise<string>,
   ): Promise<string>;
@@ -46,10 +45,12 @@ export type Native = {
   /** Forgets the session; idempotent. */
   liveClose(handle: number): void;
 };
+/** One channel's progress in a page: after `from`, up to `to`, of a channel at `head`. */
+export type CursorRange = { from: number; to: number; head: number };
 /** What the executor reports to the Rust `Subscriptions` controller. */
 export type LiveEvent =
   | { type: "committed"; scope: string }
-  | { type: "pulled"; scope: string; page: string }
+  | { type: "pulled"; page: string }
   | { type: "closed" };
 /** What the controller asks the executor to do, in order. */
 export type LiveAction =
@@ -57,8 +58,8 @@ export type LiveAction =
   | { type: "send"; frame: string }
   | {
       type: "pull";
-      scope: string;
-      fromCursor: number;
+      /** The cursor to pull after, per channel: one pull covers them all. */
+      cursors: Record<string, number>;
       /** The read contracts the session declared: model name to version. */
       models: Record<string, number>;
     };
@@ -444,6 +445,9 @@ export function createBackend<T>(options: BackendOptions<T>) {
     options.native ??
       (require("../../bindings/node/ahead-node.node") as Native),
   );
+  // Nothing is dropped silently: without a handler, failures go to the console.
+  const onError: (error: unknown) => void =
+    options.onError ?? ((error) => console.error(error));
   const descriptor = options.config as {
     schema?: { models?: { name: string; version?: number }[] };
     mutations?: MutationDescriptor[];
@@ -531,7 +535,7 @@ export function createBackend<T>(options: BackendOptions<T>) {
         ? error.code
         : options.translateRejection?.(error);
     if (code != null) return { rejection: new MutationRejected(code).code };
-    options.onError?.(error);
+    onError(error);
     return { error: error instanceof Error ? error.message : String(error) };
   };
   /**
@@ -646,10 +650,10 @@ export function createBackend<T>(options: BackendOptions<T>) {
           };
           // A read refusal (`MutationRejected` or a translated error) is
           // answered as data: the engine records it as the mutation's
-          // rejection in a push and refuses the page in a pull. Any other
-          // thrown error is also answered as data - a failure - which the
-          // engine turns into `loader.failed` for the mutation it was
-          // reading back for.
+          // rejection in a push and as that record's `error` change in a
+          // pull. Any other thrown error is also answered as data - a
+          // failure - which becomes `loader.failed` for that one mutation or
+          // record.
           let refused: { rejection: string } | { error: string } | undefined;
           let rows: unknown;
           try {
@@ -660,13 +664,27 @@ export function createBackend<T>(options: BackendOptions<T>) {
           } catch (error) {
             refused = refusal(error);
           }
-          if (refused) result = refused;
-          else if (
-            !Array.isArray(rows) ||
-            rows.some((value) => value === undefined)
-          )
-            throw new Error("invalid loader: undefined or non-array result");
-          else result = rows;
+          if (refused) return callbackJson(refused);
+          // An answer JSON cannot carry faithfully is a failed read, never a
+          // null: the engine retries the records one by one, so only the
+          // record whose row is broken fails.
+          let reason: string | undefined;
+          let answer = "";
+          if (!Array.isArray(rows)) reason = "a non-array result";
+          else if (rows.some((value) => value === undefined))
+            reason = "an undefined entry";
+          else
+            try {
+              answer = callbackJson(rows);
+            } catch (error) {
+              reason = error instanceof Error ? error.message : String(error);
+            }
+          if (reason === undefined) return answer;
+          const invalid = new Error(
+            `invalid loader answer for ${req.model} v${req.version}: ${reason}`,
+          );
+          onError(invalid);
+          return callbackJson({ error: invalid.message });
         } else {
           // Everything the persistence owns, plus anything this build does not
           // know: an operation added to the contract without an arm here is a
@@ -767,16 +785,48 @@ export function createBackend<T>(options: BackendOptions<T>) {
     typeof request === "string"
       ? request
       : new TextDecoder("utf-8", { fatal: true }).decode(request);
+  // A loader row the served contract does not accept is checked by the
+  // engine, which fails only that record (`loader.invalid`). The developer
+  // still hears about each one.
+  const INVALID = '"loader.invalid"';
+  const reportInvalidPage = (page: string): string => {
+    if (!page.includes(INVALID)) return page;
+    const { changes } = JSON.parse(page) as {
+      changes: { model: string; identity: unknown; error?: string }[];
+    };
+    for (const change of changes)
+      if (change.error === "loader.invalid")
+        onError(
+          new Error(
+            `loader returned a row the served ${change.model} contract does not accept: ${JSON.stringify(change.identity)}`,
+          ),
+        );
+    return page;
+  };
+  const reportInvalidReceipt = (receipt: string): string => {
+    if (!receipt.includes(INVALID)) return receipt;
+    const { rejections } = JSON.parse(receipt) as {
+      rejections: { ordinal: number; code: string }[];
+    };
+    for (const rejection of rejections)
+      if (rejection.code === "loader.invalid")
+        onError(
+          new Error(
+            `loader returned a row the declared contract does not accept while reading back mutation ${rejection.ordinal}`,
+          ),
+        );
+    return receipt;
+  };
   /** @internal Raw protocol seams used by the framework's own tests; not part of the supported surface. */
   const api = {
     push: (owner: string, request: Uint8Array | string) =>
       run((tx, session) =>
         native.processPush(config, owner, text(request), host(tx, session)),
-      ),
+      ).then(reportInvalidReceipt),
     pull: (owner: string, request: Uint8Array | string) =>
       run((tx, session) =>
         native.processPull(config, owner, text(request), host(tx, session)),
-      ),
+      ).then(reportInvalidPage),
     negotiateLive: (
       owner: string,
       request: Uint8Array | string,
@@ -786,20 +836,25 @@ export function createBackend<T>(options: BackendOptions<T>) {
       ).then(JSON.parse),
     pullLive: (
       owner: string,
-      scope: string,
-      fromCursor: number,
+      cursors: Record<string, number>,
       models: Record<string, number>,
-    ): Promise<{ page: string; toCursor: number; continues: boolean }> =>
+    ): Promise<{ page: string; cursors: Record<string, CursorRange> }> =>
       run((tx, session) =>
         native.pullLive(
           config,
           owner,
-          scope,
-          fromCursor,
+          JSON.stringify(cursors),
           JSON.stringify(models),
           host(tx, session),
         ),
-      ).then(JSON.parse),
+      ).then((result) => {
+        const parsed = JSON.parse(result) as {
+          page: string;
+          cursors: Record<string, CursorRange>;
+        };
+        reportInvalidPage(parsed.page);
+        return parsed;
+      }),
     liveEvent: (handle: number, event: LiveEvent): LiveAction[] =>
       JSON.parse(native.liveEvent(handle, JSON.stringify(event))),
     liveClose: (handle: number): void => native.liveClose(handle),
@@ -826,13 +881,13 @@ export function createBackend<T>(options: BackendOptions<T>) {
       createHttpHandler({
         backend: api,
         authenticate,
-        ...(options.onError ? { onError: options.onError } : {}),
+        onError,
       }),
     );
     const live = attachLive(server, {
       backend: api,
       authenticate,
-      ...(options.onError ? { onError: options.onError } : {}),
+      onError,
     });
     await new Promise<void>((resolve, reject) => {
       const onError = (error: Error) => reject(error);
@@ -958,10 +1013,9 @@ interface LiveBackend {
   ): Promise<{ handle: number; actions: LiveAction[] }>;
   pullLive(
     owner: string,
-    scope: string,
-    fromCursor: number,
+    cursors: Record<string, number>,
     models: Record<string, number>,
-  ): Promise<{ page: string; toCursor: number; continues: boolean }>;
+  ): Promise<{ page: string; cursors: Record<string, CursorRange> }>;
   liveEvent(handle: number, event: LiveEvent): LiveAction[];
   liveClose(handle: number): void;
   onCommitted(scope: string, wake: () => void): () => void;
@@ -1029,8 +1083,8 @@ function attachLive(
 /**
  * Executes the Rust controller's actions for one socket. Every sync decision
  * (what to pull, when, what to send) is the controller's; this only carries
- * events in and performs actions out. Pulls for different scopes may run
- * concurrently; the controller keeps at most one outstanding per scope.
+ * events in and performs actions out. The controller keeps at most one pull
+ * outstanding per session; it covers every scope with a pending commit.
  */
 async function serveLive(
   connection: WebSocket,
@@ -1076,12 +1130,10 @@ async function serveLive(
       } else if (action.type === "send") {
         if (open()) connection.send(action.frame);
       } else {
-        const { scope } = action;
         backend
-          .pullLive(owner, scope, action.fromCursor, action.models)
+          .pullLive(owner, action.cursors, action.models)
           .then(
-            (progress) =>
-              dispatch({ type: "pulled", scope, page: progress.page }),
+            (progress) => dispatch({ type: "pulled", page: progress.page }),
             fail,
           );
       }

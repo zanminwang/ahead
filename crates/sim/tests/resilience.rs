@@ -56,10 +56,7 @@ fn script() -> Vec<Action> {
         Action::Freeze { client: 0 },
         Action::Deliver,
         Action::Deliver,
-        Action::Pull {
-            client: 0,
-            channel: "a".into(),
-        },
+        Action::Pull { client: 0 },
         Action::Deliver,
         Action::Deliver,
         Action::Enqueue {

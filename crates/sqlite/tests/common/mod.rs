@@ -3,6 +3,7 @@
 use ahead_client::*;
 use ahead_sqlite::SqliteStore;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 pub fn schema() -> Schema {
     Schema::from_value(
@@ -27,20 +28,31 @@ pub fn update(text: &str) -> Operation {
 pub fn mutation(text: &str) -> Mutation {
     Mutation::new("Edit", vec![update(text)])
 }
+/// A one-channel page moving `channel` from `from` to `to` (its head) with
+/// `Entry e` at stamp `to`.
 pub fn page(channel: &str, from: u64, to: u64, text: Option<&str>) -> PullPage {
     PullPage {
-        channel: channel.into(),
-        from_cursor: from,
-        to_cursor: to,
-        changes: vec![RecordChange {
-            cursor: to,
-            model: "Entry".into(),
-            identity: json!({"id":"e"}),
-            stamp: to,
-            state: text
-                .map(|t| json!({"text":t,"note":null}))
-                .unwrap_or(Value::Null),
-        }],
+        cursors: BTreeMap::from([(channel.to_string(), CursorRange { from, to, head: to })]),
+        changes: vec![authority(text, to)],
+    }
+}
+/// A page for several channels at once, each `(channel, from, to, head)`, with `changes`.
+pub fn multi(channels: &[(&str, u64, u64, u64)], changes: Vec<AuthorityRecord>) -> PullPage {
+    PullPage {
+        cursors: channels
+            .iter()
+            .map(|(c, from, to, head)| {
+                (
+                    c.to_string(),
+                    CursorRange {
+                        from: *from,
+                        to: *to,
+                        head: *head,
+                    },
+                )
+            })
+            .collect(),
+        changes,
     }
 }
 /// The authority of `Entry e` at `stamp`: a state, or `None` for a deletion.
@@ -52,6 +64,7 @@ pub fn authority(text: Option<&str>, stamp: u64) -> AuthorityRecord {
         state: text
             .map(|t| json!({"text":t,"note":null}))
             .unwrap_or(Value::Null),
+        error: None,
     }
 }
 /// The authority of any `Entry` at `stamp`.

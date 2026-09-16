@@ -169,7 +169,7 @@ loaders.entry = {
 };
 ```
 
-The generated `EntryV1` type is the record shape published for v1, so a v1 loader maps your current rows into it; Ahead does not convert between versions. A row with a field outside the served version's contract is a loader defect and aborts the pull. Registration is checked at startup like handlers: a bare function means v1 only, and a missing version, an unknown `v<n>` key or a non-function value is refused. A load reaches only the loader of the version it names.
+The generated `EntryV1` type is the record shape published for v1, so a v1 loader maps your current rows into it; Ahead does not convert between versions. A row with a field outside the served version's contract fails only that record, with `loader.invalid`, and is reported to `onError`. Registration is checked at startup like handlers: a bare function means v1 only, and a missing version, an unknown `v<n>` key or a non-function value is refused. A load reaches only the loader of the version it names.
 
 What each item may be:
 
@@ -177,13 +177,13 @@ What each item may be:
 | --- | --- | --- |
 | A row object | The record's current state for this user | Delivered with the record's current stamp |
 | `null` | The record does not exist, or this user must not see it | Delivered as a deletion. A newer stamp clears the authoritative row, whichever channel delivered it; the client keeps the stamp so older content cannot bring the record back; pending local operations are replayed on that state. |
-| a thrown `MutationRejected` (or an error `translateRejection` maps to a code) | A refused read | In a push, the mutation whose result is being read back is rejected with that code and rolled back; in a pull, the page fails with `loader.refused` and `onError`, and the client's cursor does not move |
-| any other thrown error, during a push's readback | A failure | The mutation whose result is being read back is rejected with `loader.failed`, is reported to `onError`, and the rest of the batch commits ([#95](https://github.com/zanminwang/ahead/issues/95)) |
-| `undefined`, a missing entry, a non-array result | A defect | The pull fails with `500 server` and `onError`; the client's cursor does not move |
+| a thrown `MutationRejected` (or an error `translateRejection` maps to a code) | A refused read | In a push, the mutation whose result is being read back is rejected with that code and rolled back. In a pull, that record is delivered as an error with that code: the client keeps its local copy and reports it, and the rest of the page applies |
+| any other thrown error | A failure | Reported to `onError` (default `console.error`). In a push, the mutation whose result is being read back is rejected with `loader.failed` and the rest of the batch commits; in a pull, that record is delivered as a `loader.failed` error and the rest of the page applies ([#95](https://github.com/zanminwang/ahead/issues/95)) |
+| `undefined`, a missing entry, a non-array result, a nonfinite number | A defect | Reported to `onError` and treated like a thrown error: only the records it affects fail. It is never read as `null` |
 
 A row object must match the generated model type exactly. Include every non-identity field: a nullable field that is absent reads as `null`, but an absent non-nullable field is a defect. The identity fields may be present. Any other property, such as an extra database column or a relation object, is a defect. Map your rows to the model type rather than returning a wider database row.
 
-Loaders run during synchronization and during a push's readback, not when the app calls local `get`, `query` or `watch`. A malformed result still fails the request outright; the backend does not silently skip the failed loader result and advance its cursor. A thrown error during a push's readback is isolated to that mutation as described above; the same error during a pull still fails the whole page, since loader errors on pull pages are a separate, still-open half of [#95](https://github.com/zanminwang/ahead/issues/95).
+Loaders run during synchronization and during a push's readback, not when the app calls local `get`, `query` or `watch`. A malformed result is never skipped silently: the affected record arrives as an error change, or the mutation being read back is rejected with `loader.invalid`, and `onError` hears about it.
 
 ## Publishing
 
@@ -245,7 +245,6 @@ Protocol refusals are answered with a status and a JSON body chosen by the engin
 | `client.owner_mismatch` | 403 | The client identity belongs to another user |
 | `gap`, `overlap` | 409 | The batch sequence is not the next one and not a retry of the last |
 | `model_version_unsupported` | 409 | Pull and live subscribe only: a model read contract this backend does not serve — the client declared an unknown model or an unretained version (body adds `model` and `version`), or a page holds a model the client did not declare (body adds `model`). On the WebSocket the handshake closes with `1002` and this code as the reason. Inside a push, this is a per-mutation rejection code instead (above), not an HTTP status. |
-| `loader.refused` | 500 `{ code: "server" }` | A loader refused a read while a page was being served; the `EngineError` with the model and code goes to `onError`. In a push the same refusal is the mutation's rejection, not a request failure. |
 | `handler.invalid` | 500 `{ code: "server" }` | The handler's settlement could not be used: an invalid rejection code, or a change or publication naming a record without a model or an object identity |
 | anything else | 500 `{ code: "server" }` | A server-side failure; the `EngineError` or thrown error goes to `onError` |
 

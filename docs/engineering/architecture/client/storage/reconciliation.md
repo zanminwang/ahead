@@ -20,7 +20,7 @@ What reconciliation does depends on the kind of difference. The three outcomes a
 
 | Difference between schema and table | Outcome |
 | --- | --- |
-| Layout from the checkpoint era: an `ahead_push_checkpoint` or `ahead_claim` table, or `ahead_client` without `last_completed_push` and `push_models` | **refused** before any DDL, with "this database was created by an earlier Ahead runtime (…); it cannot be opened by this one. Open a fresh database; the old file is left untouched"; every row, checkpoint and pending operation included, stays as found |
+| An earlier framework layout: an `ahead_push_checkpoint` or `ahead_claim` table, `ahead_client` without `last_completed_push` and `push_models`, or `ahead_mutation` without `diverged` | **refused** before any DDL, with "this database was created by an earlier Ahead runtime (…); it cannot be opened by this one. Open a fresh database; the old file is left untouched"; every row, checkpoint and pending operation included, stays as found |
 | Model table missing | created, with its before table and indexes |
 | Field missing from the table, nullable | column added to both tables |
 | Field missing, non-nullable, default in the descriptor | column added with that default |

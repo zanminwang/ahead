@@ -97,22 +97,26 @@ pub(crate) async fn read_back(
             // aborts the rest of the batch.
             Loaded::Failed { .. } => return Ok(Outcome::Refused(code::LOADER_FAILED.into())),
         };
+        // An answer the served contract cannot accept is this mutation's
+        // content problem: it rejects only this mutation.
         if rows.len() != encoded_keys.len() {
-            return Err(Error::new(code::LOADER_INVALID, "misaligned loader result"));
+            return Ok(Outcome::Refused(code::LOADER_INVALID.into()));
         }
         for (encoded, state) in encoded_keys.iter().zip(rows) {
             let key = &changes[*encoded];
             let state = match state {
                 None => Value::Null,
-                Some(state) => contract
-                    .normalize_state(model, &state)
-                    .map_err(|e| Error::new(code::LOADER_INVALID, e.to_string()))?,
+                Some(state) => match contract.normalize_state(model, &state) {
+                    Ok(state) => state,
+                    Err(_) => return Ok(Outcome::Refused(code::LOADER_INVALID.into())),
+                },
             };
             records.push(AuthorityRecord {
                 model: key.model.clone(),
                 identity: key.identity.clone(),
                 stamp: stamps[*encoded],
                 state,
+                error: None,
             });
         }
     }

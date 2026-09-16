@@ -26,6 +26,10 @@ pub const LEGACY_TABLES: &[&str] = &["ahead_claim", "ahead_push_checkpoint"];
 /// database created before they existed holds pending work under the old
 /// contract; it is refused, never converted or wiped.
 const CLIENT_COLUMNS: &[&str] = &["last_completed_push", "push_models"];
+/// `ahead_mutation` columns this layout requires: `diverged` marks a queued
+/// mutation whose replay failed over new authority
+/// ([#122](https://github.com/zanminwang/ahead/issues/122)).
+const MUTATION_COLUMNS: &[&str] = &["diverged"];
 
 pub const FRAMEWORK_DDL: &str = "
 CREATE TABLE IF NOT EXISTS ahead_client (
@@ -44,7 +48,8 @@ CREATE TABLE IF NOT EXISTS ahead_subscription (
   channel TEXT PRIMARY KEY, cursor INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS ahead_mutation (
-  ordinal INTEGER PRIMARY KEY, name TEXT NOT NULL, version INTEGER NOT NULL, push INTEGER
+  ordinal INTEGER PRIMARY KEY, name TEXT NOT NULL, version INTEGER NOT NULL, push INTEGER,
+  diverged INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS ahead_mutation_operation (
   ordinal INTEGER NOT NULL REFERENCES ahead_mutation(ordinal) ON DELETE CASCADE,
@@ -96,11 +101,17 @@ pub fn check_layout<S: ClientStore>(store: &mut S) -> Result<()> {
             return refuse(&format!("table {table}"));
         }
     }
-    if names.iter().any(|n| n == "ahead_client") {
-        let columns = store.query_committed("PRAGMA table_info(ahead_client)", &[])?;
-        for column in CLIENT_COLUMNS {
+    for (table, required) in [
+        ("ahead_client", CLIENT_COLUMNS),
+        ("ahead_mutation", MUTATION_COLUMNS),
+    ] {
+        if !names.iter().any(|n| n == table) {
+            continue;
+        }
+        let columns = store.query_committed(&format!("PRAGMA table_info({table})"), &[])?;
+        for column in required {
             if !columns.rows.iter().any(|r| r[1].as_str() == Some(column)) {
-                return refuse(&format!("ahead_client lacks {column}"));
+                return refuse(&format!("{table} lacks {column}"));
             }
         }
     }

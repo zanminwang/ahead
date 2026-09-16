@@ -21,8 +21,12 @@ fn delayed_page_from_another_channel_cannot_regress_newer_content() {
     subscribe(&mut c, "b");
     c.apply_page(stamped("b", 0, 5, 8, Some("new"))).unwrap();
     let report = c.apply_page(stamped("a", 0, 10, 7, Some("old"))).unwrap();
-    assert_eq!(report.applied, 1);
-    assert_eq!(report.conflicts, 0);
+    assert_eq!(report.applied, 0, "older content changes nothing");
+    assert_eq!(report.conflicts(), 0);
+    assert_eq!(
+        report.cursors["a"], 10,
+        "but the page still moves the channel"
+    );
     assert_eq!(c.read(&key()).unwrap().unwrap()["text"], "new");
     assert_eq!(c.cursor("a").unwrap(), 10);
     assert_eq!(c.cursor("b").unwrap(), 5);

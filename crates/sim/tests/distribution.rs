@@ -22,12 +22,8 @@ fn change(sim: &mut Sim, key: &str, text: Option<&str>, channels: &[&str]) {
     })
     .unwrap();
 }
-fn pull(sim: &mut Sim, client: usize, channel: &str) {
-    sim.apply(Action::Pull {
-        client,
-        channel: channel.into(),
-    })
-    .unwrap();
+fn pull(sim: &mut Sim, client: usize, _channel: &str) {
+    sim.apply(Action::Pull { client }).unwrap();
 }
 fn move_to(sim: &mut Sim, key: &str, channels: &[&str]) {
     sim.apply(Action::MoveMembership {
@@ -222,19 +218,22 @@ fn d5_delete_across_channels_outranks_a_delayed_upsert_and_keeps_its_stamp() {
         "b's delete removes the row"
     );
     assert_eq!(sim.client(0).record_stamp(&entry_key("e1")).unwrap(), 3);
-    sim.apply(Action::Deliver).unwrap(); // a's page: v2 at stamp 2, older
+    // b's page was one pull for both channels, so a's own delivery of the
+    // delete came with it; the earlier page is now covered on every channel.
+    assert_eq!(sim.client(0).cursor("a").unwrap(), 3);
+    sim.apply(Action::Deliver).unwrap(); // a's page: v2 at stamp 2, older and covered
     assert_eq!(
         sim.read_text(0, &entry_key("e1")),
         None,
         "stale content cannot resurrect a deleted record"
     );
-    assert_eq!(sim.client(0).cursor("a").unwrap(), 2);
+    assert_eq!(sim.client(0).cursor("a").unwrap(), 3);
     assert_eq!(
         stamp_rows(&mut sim, 0).len(),
         1,
         "the stamp row is retained"
     );
-    pull(&mut sim, 0, "a"); // a's row now carries the delete at stamp 3
+    pull(&mut sim, 0, "a"); // nothing new on either channel
     sim.drain();
     assert_eq!(sim.read_text(0, &entry_key("e1")), None);
     assert_eq!(sim.client(0).cursor("a").unwrap(), 3);

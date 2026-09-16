@@ -56,7 +56,7 @@ impl Sim {
     }
     fn choose(&mut self) -> Option<Action> {
         let running = self.running();
-        let roll = self.rng.below(101);
+        let roll = self.rng.below(104);
         let client = if running.is_empty() {
             None
         } else {
@@ -69,13 +69,7 @@ impl Sim {
                 Action::Enqueue { client, mutation }
             }
             20..32 => Action::Freeze { client: client? },
-            32..46 => {
-                let channel = self.pick_channel();
-                Action::Pull {
-                    client: client?,
-                    channel,
-                }
-            }
+            32..46 => Action::Pull { client: client? },
             46..66 => Action::Deliver,
             66..68 => {
                 if self.known_entries.is_empty() {
@@ -165,6 +159,18 @@ impl Sim {
             },
             98 => Action::FailNext,
             99 => Action::BreakNext,
+            101..103 => {
+                if self.known_entries.is_empty() {
+                    return Some(Action::Deliver);
+                }
+                let key = format!("Entry:{}", self.rng.pick(&self.known_entries));
+                if roll == 101 {
+                    Action::FailLoadNext { key }
+                } else {
+                    Action::RefuseLoadNext { key }
+                }
+            }
+            103 => Action::CorruptNextPage,
             _ => {
                 if !self.generate_direct || self.known_entries.is_empty() {
                     return Some(Action::Deliver);

@@ -196,6 +196,36 @@ fn a_database_from_the_checkpoint_era_is_refused_untouched() {
         "no column was added"
     );
 
+    // An `ahead_mutation` table without the divergence column (#122).
+    let undiverged = dir.path().join("undiverged");
+    {
+        let mut s = SqliteStore::open(&undiverged).unwrap();
+        s.execute_batch(
+            "CREATE TABLE ahead_client (client_id TEXT PRIMARY KEY, next_ordinal INTEGER NOT NULL, next_push INTEGER NOT NULL, generation INTEGER NOT NULL, last_completed_push INTEGER NOT NULL DEFAULT 0, push_models TEXT);
+             CREATE TABLE ahead_mutation (ordinal INTEGER PRIMARY KEY, name TEXT NOT NULL, version INTEGER NOT NULL, push INTEGER);
+             INSERT INTO ahead_mutation VALUES (7, 'Edit', 1, NULL);",
+        )
+        .unwrap();
+    }
+    refused(&undiverged);
+    assert_eq!(
+        count(
+            &undiverged,
+            "SELECT COUNT(*) FROM ahead_mutation WHERE ordinal = 7"
+        ),
+        1,
+        "the queued mutation is left untouched"
+    );
+    assert_eq!(
+        columns(
+            &mut SqliteStore::open(&undiverged).unwrap(),
+            "ahead_mutation"
+        )
+        .len(),
+        4,
+        "no column was added"
+    );
+
     // A database this runtime created reopens.
     let fresh = dir.path().join("fresh");
     drop(ahead_client::Client::open(SqliteStore::open(&fresh).unwrap(), entry.clone()).unwrap());

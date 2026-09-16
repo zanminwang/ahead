@@ -41,11 +41,7 @@ fn l1_merged_view_shows_pending_edits_in_order() {
     })
     .unwrap();
     sim.drain();
-    sim.apply(Action::Pull {
-        client: 0,
-        channel: "a".into(),
-    })
-    .unwrap();
+    sim.apply(Action::Pull { client: 0 }).unwrap();
     sim.drain();
     assert_eq!(sim.read_text(0, &entry_key("e1")).as_deref(), Some("three"));
     sim.settle();
@@ -165,11 +161,7 @@ fn l4_stale_duplicate_page_does_not_undo_a_direct_write() {
         channels: vec!["a".into()],
     })
     .unwrap();
-    sim.apply(Action::Pull {
-        client: 0,
-        channel: "a".into(),
-    })
-    .unwrap();
+    sim.apply(Action::Pull { client: 0 }).unwrap();
     sim.apply(Action::Deliver).unwrap(); // server answers the pull
     sim.apply(Action::Duplicate).unwrap(); // the page is now queued twice
     sim.apply(Action::Deliver).unwrap(); // first copy applies

@@ -1,7 +1,8 @@
-//! The live session: subscribe over WebSocket, catch up over HTTP from the
-//! durable cursor, stream pages, recover from gaps, overflow and subscription
-//! changes. Rust decides; the host owns sockets, HTTP, timers, its frame
-//! buffer and credential refresh, and reports what happened as events.
+//! The live session: subscribe over WebSocket, compare the acknowledged heads
+//! with the durable cursors, catch up over HTTP only when behind, then consume
+//! the stream through a gated in-memory frame queue. Rust decides; the host
+//! owns sockets, HTTP, timers and credential refresh, and reports what
+//! happened as events ([Live session](../../../docs/engineering/architecture/client/connection/controller/live-session.md)).
 use crate::*;
 use std::collections::VecDeque;
 
@@ -23,7 +24,7 @@ pub enum LiveEvent {
     Wake,
     /// The host's timer fired, or it wants the next decision.
     Next,
-    /// A frame arrived on the socket of this epoch.
+    /// A frame arrived on the socket of this epoch: the acknowledgement or a page.
     Message {
         epoch: u64,
         body: String,
@@ -33,7 +34,8 @@ pub enum LiveEvent {
         epoch: u64,
         body: String,
     },
-    /// The host's frame buffer for this epoch overflowed and frames were dropped.
+    /// The host's own frame buffer for this epoch overflowed and frames were
+    /// dropped before they reached the session.
     Overflow {
         epoch: u64,
     },
@@ -51,57 +53,41 @@ pub enum LiveAction {
     /// Open the socket and send `subscribe` once it is open. Frames it delivers
     /// are `message` events of this epoch; its end is `closed`.
     Open { epoch: u64, subscribe: String },
-    /// `POST /sync/pull` with `body`; the response is a `catchUp` event of this
-    /// epoch, a failure is `closed`.
-    Request {
-        epoch: u64,
-        channel: String,
-        body: String,
-    },
+    /// `POST /sync/pull` with `body`, one request for every subscribed channel;
+    /// the response is a `catchUp` event of this epoch, a failure is `closed`.
+    Request { epoch: u64, body: String },
     /// Close the socket of this epoch and abandon its request, if any. A
     /// `reason` is a protocol violation the host reports as an error.
     Close { epoch: u64, reason: Option<String> },
     /// A page applied and may have settled a batch: wake the push lane.
     Wake { lane: &'static str },
+    /// What the last page could not apply; the host hands it to the application.
+    Report { reports: Vec<Report> },
     /// Nothing to do for `millis`; then report `next`.
     Wait { millis: u64 },
-}
-
-struct Request {
-    channel: String,
-    request: PullRequest,
-}
-impl Session {
-    fn catching_up(&self, channel: &str) -> bool {
-        self.active
-            .as_ref()
-            .is_some_and(|active| active.channel == channel)
-            || self.queue.iter().any(|c| c == channel)
-    }
 }
 
 struct Session {
     epoch: u64,
     /// The subscription generation the channels were snapshotted under.
     generation: u64,
-    channels: Vec<String>,
     subscribe: SubscribeRequest,
     acknowledged: bool,
-    /// Channels waiting for a catch-up round, in order; no duplicates.
-    queue: VecDeque<String>,
     /// The one HTTP request in flight.
-    active: Option<Request>,
-    /// Channels that need another round once their current round ends.
-    again: BTreeSet<String>,
-    /// Streamed pages of channels still catching up. They pass the cursor gate
-    /// once their channel's round ends; until then the catch-up is the truth.
-    deferred: VecDeque<PullPage>,
+    active: Option<PullRequest>,
+    /// Another pull is needed once the one in flight ends (an overflow while
+    /// pulling: the lost frames may lie beyond the response).
+    again: bool,
+    /// Streamed pages not yet applied, in arrival order. The front is applied
+    /// when every channel it names connects to its cursor; a page with a gap
+    /// stays until a pull connects it or covers it.
+    queue: VecDeque<PullPage>,
 }
 
-/// Pages held for channels still catching up. Beyond this the held pages are
-/// dropped and their channels recover from the durable cursor, like a host
-/// buffer overflow; the host's own bound only governs delivery backpressure.
-pub const DEFERRED_PAGES: usize = 64;
+/// Frames held in the queue. Beyond this the queue is discarded whole and
+/// every channel recovers from the durable cursor: the server log is the
+/// durable queue, the cursor the pointer into it.
+pub const QUEUED_FRAMES: usize = 64;
 
 /// One live lane: [`ConnectionDriver`] scheduling around one session at a time.
 #[derive(Default)]
@@ -111,9 +97,25 @@ pub struct LiveSession {
     session: Option<Session>,
 }
 
+/// Collect one page's outcome into the actions: a wake when it applied,
+/// its reports when it has any.
+fn settle(progress: &DownlinkProgress, actions: &mut Vec<LiveAction>) {
+    if progress.disposition == "applied" {
+        actions.push(LiveAction::Wake { lane: "push" });
+    }
+    if !progress.report.reports.is_empty() {
+        actions.push(LiveAction::Report {
+            reports: progress.report.reports.clone(),
+        });
+    }
+}
+
 impl LiveSession {
     fn current(&self, epoch: u64) -> bool {
         self.session.as_ref().is_some_and(|s| s.epoch == epoch)
+    }
+    fn session(&mut self) -> &mut Session {
+        self.session.as_mut().expect("current session")
     }
 
     /// End the session; the host closes its socket and abandons its request.
@@ -218,19 +220,17 @@ impl LiveSession {
             self.driver.complete(true, now, 0);
             return Ok(());
         }
-        let subscribe = SubscribeRequest::new(channels.clone(), client.declared_models())?;
+        let subscribe = SubscribeRequest::new(channels, client.declared_models())?;
         let frame = String::from_utf8(subscribe.encode()?).map_err(|_| invalid("utf8"))?;
         self.epoch += 1;
         self.session = Some(Session {
             epoch: self.epoch,
             generation: client.subscription_generation(),
-            channels,
             subscribe,
             acknowledged: false,
-            queue: VecDeque::new(),
             active: None,
-            again: BTreeSet::new(),
-            deferred: VecDeque::new(),
+            again: false,
+            queue: VecDeque::new(),
         });
         actions.push(LiveAction::Open {
             epoch: self.epoch,
@@ -247,7 +247,6 @@ impl LiveSession {
         entropy: u64,
         actions: &mut Vec<LiveAction>,
     ) -> Result<()> {
-        let session = self.session.as_mut().expect("current session");
         let decoded = match LiveMessage::decode(body.as_bytes()) {
             Ok(decoded) => decoded,
             Err(e) => {
@@ -255,6 +254,7 @@ impl LiveSession {
                 return Ok(());
             }
         };
+        let session = self.session();
         match decoded {
             LiveMessage::Acknowledged(ack) => {
                 if session.acknowledged || !ack.confirms(&session.subscribe) {
@@ -266,11 +266,19 @@ impl LiveSession {
                     );
                     return Ok(());
                 }
-                // Catch up every channel from its durable cursor before the
-                // stream is trusted: streamed pages start at the server's head.
                 session.acknowledged = true;
-                session.queue = session.channels.iter().cloned().collect();
-                self.advance(client, actions)
+                // Every channel at its head: the stream is the truth from here.
+                // Any channel behind: one pull from the durable cursors first.
+                let mut behind = false;
+                for (channel, head) in &ack.cursors {
+                    if *head > client.cursor(channel)? {
+                        behind = true;
+                    }
+                }
+                if behind {
+                    self.pull(client, actions)?;
+                }
+                Ok(())
             }
             LiveMessage::Page(page) => {
                 if !session.acknowledged {
@@ -282,137 +290,75 @@ impl LiveSession {
                     );
                     return Ok(());
                 }
-                if session.catching_up(&page.channel) {
-                    self.defer(page);
-                    return Ok(());
+                if session.queue.len() >= QUEUED_FRAMES {
+                    return self.overflow(client, actions);
                 }
-                let channel = page.channel.clone();
-                let progress = client.receive_downlink(page, None)?;
-                self.settle(&channel, &progress, client, actions)
+                session.queue.push_back(page);
+                self.drain(client, actions)
             }
         }
     }
 
-    /// Hold a streamed page until its channel's catch-up round ends.
-    fn defer(&mut self, page: PullPage) {
-        let session = self.session.as_mut().expect("current session");
-        if session.deferred.len() < DEFERRED_PAGES {
-            session.deferred.push_back(page);
-            return;
-        }
-        let mut lost: BTreeSet<String> = session.deferred.drain(..).map(|p| p.channel).collect();
-        lost.insert(page.channel);
-        for channel in lost {
-            self.recover(&channel);
-        }
-    }
-
-    /// The channel's round ended: its held pages go through the cursor gate in
-    /// order. A gap among them starts another round and keeps the rest held.
-    fn flush<S: ClientStore>(
+    /// Apply queued frames from the front while no pull is in flight. A frame
+    /// that applied or is covered leaves the queue; a frame with a gap stays
+    /// and one pull from the durable cursors runs.
+    fn drain<S: ClientStore>(
         &mut self,
-        channel: &str,
         client: &mut Client<S>,
         actions: &mut Vec<LiveAction>,
     ) -> Result<()> {
-        let session = self.session.as_mut().expect("current session");
-        let (mine, rest): (Vec<_>, Vec<_>) = session
-            .deferred
-            .drain(..)
-            .partition(|page| page.channel == channel);
-        session.deferred = rest.into();
-        let mut held = mine.into_iter();
-        for page in held.by_ref() {
-            let progress = client.receive_downlink(page, None)?;
-            self.settle(channel, &progress, client, actions)?;
+        loop {
+            let session = self.session();
+            if session.active.is_some() {
+                return Ok(());
+            }
+            let Some(front) = session.queue.front() else {
+                return Ok(());
+            };
+            let progress = client.receive_downlink(front.clone(), None)?;
+            settle(&progress, actions);
             if progress.disposition == "recover" {
-                break;
+                return self.pull(client, actions);
             }
-        }
-        let session = self.session.as_mut().expect("current session");
-        session.deferred.extend(held);
-        Ok(())
-    }
-
-    /// After a page went through the cursor gate: an applied page may have
-    /// settled a batch, a gap means the channel catches up again.
-    fn settle<S: ClientStore>(
-        &mut self,
-        channel: &str,
-        progress: &DownlinkProgress,
-        client: &mut Client<S>,
-        actions: &mut Vec<LiveAction>,
-    ) -> Result<()> {
-        match progress.disposition {
-            "applied" => actions.push(LiveAction::Wake { lane: "push" }),
-            "recover" => {
-                self.recover(channel);
-                self.advance(client, actions)?;
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    /// The channel needs a catch-up round from the durable cursor: after the
-    /// round in flight if that is its own, otherwise as soon as its turn comes.
-    fn recover(&mut self, channel: &str) {
-        let session = self.session.as_mut().expect("current session");
-        if !session.acknowledged {
-            return;
-        }
-        if session
-            .active
-            .as_ref()
-            .is_some_and(|active| active.channel == channel)
-        {
-            session.again.insert(channel.to_string());
-        } else if !session.queue.iter().any(|c| c == channel) {
-            session.queue.push_back(channel.to_string());
+            self.session().queue.pop_front();
         }
     }
 
-    /// Frames were lost; which channels they belonged to is unknown, so every
-    /// channel recovers. The request in flight keeps its progress.
+    /// Frames were lost between the socket and the session; which channels
+    /// they belonged to is unknown, so the queue is discarded and every
+    /// channel recovers from its durable cursor. A pull in flight keeps its
+    /// progress and another follows it.
     fn overflow<S: ClientStore>(
         &mut self,
         client: &mut Client<S>,
         actions: &mut Vec<LiveAction>,
     ) -> Result<()> {
-        let channels = self
-            .session
-            .as_ref()
-            .expect("current session")
-            .channels
-            .clone();
-        for channel in &channels {
-            self.recover(channel);
+        let session = self.session();
+        if !session.acknowledged {
+            return Ok(());
         }
-        self.advance(client, actions)
+        session.queue.clear();
+        self.pull(client, actions)
     }
 
-    /// Issue the next catch-up request when none is in flight.
-    fn advance<S: ClientStore>(
+    /// Issue one pull for every subscribed channel when none is in flight;
+    /// otherwise remember that another is needed.
+    fn pull<S: ClientStore>(
         &mut self,
         client: &mut Client<S>,
         actions: &mut Vec<LiveAction>,
     ) -> Result<()> {
-        let session = self.session.as_mut().expect("current session");
+        let session = self.session();
         if session.active.is_some() {
+            session.again = true;
             return Ok(());
         }
-        let Some(channel) = session.queue.pop_front() else {
+        let Some(body) = client.downlink_request()? else {
             return Ok(());
         };
-        let body = client.downlink_request(&channel)?;
-        let request = PullRequest::decode(body.as_bytes())?;
-        session.active = Some(Request {
-            channel: channel.clone(),
-            request,
-        });
+        session.active = Some(PullRequest::decode(body.as_bytes())?);
         actions.push(LiveAction::Request {
             epoch: session.epoch,
-            channel,
             body,
         });
         Ok(())
@@ -426,8 +372,8 @@ impl LiveSession {
         entropy: u64,
         actions: &mut Vec<LiveAction>,
     ) -> Result<()> {
-        let session = self.session.as_mut().expect("current session");
-        let Some(active) = session.active.take() else {
+        let session = self.session();
+        let Some(request) = session.active.take() else {
             return Err(invalid("catch-up response without a request"));
         };
         let page = match PullPage::decode(body.as_bytes()) {
@@ -442,7 +388,7 @@ impl LiveSession {
                 return Ok(());
             }
         };
-        let progress = match client.receive_downlink(page, Some(active.request)) {
+        let progress = match client.receive_downlink(page, Some(request)) {
             Ok(progress) => progress,
             Err(e) if e.to_string() == "response does not match pull request" => {
                 self.fail(Some(e.to_string()), now, entropy, actions);
@@ -450,18 +396,12 @@ impl LiveSession {
             }
             Err(e) => return Err(e),
         };
-        if progress.disposition == "applied" {
-            actions.push(LiveAction::Wake { lane: "push" });
+        settle(&progress, actions);
+        let session = self.session();
+        if !progress.continues.is_empty() || std::mem::take(&mut session.again) {
+            // The round goes on from the durable cursors until no channel continues.
+            return self.pull(client, actions);
         }
-        let session = self.session.as_mut().expect("current session");
-        if progress.continues || progress.disposition == "recover" {
-            // The round goes on from the durable cursor until a page is not full.
-            session.queue.push_front(active.channel);
-        } else if session.again.remove(&active.channel) {
-            session.queue.push_back(active.channel);
-        } else {
-            self.flush(&active.channel, client, actions)?;
-        }
-        self.advance(client, actions)
+        self.drain(client, actions)
     }
 }
