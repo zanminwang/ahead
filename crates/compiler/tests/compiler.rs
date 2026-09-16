@@ -157,6 +157,61 @@ fn generated_clients_expose_one_server_connection() {
     assert!(!dart.contains("Transport? transport"));
 }
 
+/// The generated client is the whole client: typed models (with a per-record
+/// sync state), top-level mutations and the runtime members, in both languages.
+#[test]
+fn generated_clients_are_the_whole_client() {
+    let ts = ahead_compiler::client_typescript("@example/custom-runtime");
+    for member in [
+        "readonly mutate: Mutate;",
+        "this.mutate = new Mutate(client)",
+        "syncState(): Promise<ClientSyncState>",
+        "dismissRejection(ordinal: number)",
+        "drop(ordinal: number)",
+        "pendingTasks()",
+        "runPrerequisites(",
+        "async connect(server: ServerOptions",
+        "querySpec(model: string",
+        "readSql(sql: string",
+    ] {
+        assert!(ts.contains(member), "missing {member}: {ts}");
+    }
+    assert!(!ts.contains("status()"), "{ts}");
+    let schema = compile(
+        "model Entry { id String title String @@id(id) } mutation Edit { entry Entry.update<title> } mutation Touch { entry Entry.update<title> }",
+    )
+    .unwrap();
+    let model = ahead_compiler::typescript(&schema);
+    assert!(
+        model.contains("export type MutationName = 'Edit'|'Touch';"),
+        "{model}"
+    );
+    assert!(
+        model.contains("async syncState(identity:EntryIdentity):Promise<SyncState>"),
+        "{model}"
+    );
+    assert!(
+        model.contains("export class Mutate { readonly port:MutatePort;"),
+        "{model}"
+    );
+    assert!(
+        model.contains("interface WritePort extends ReadPort, MutatePort"),
+        "{model}"
+    );
+    let dart = ahead_compiler::dart(&schema);
+    for member in [
+        "late final Mutate mutate = Mutate(client);",
+        "Future<Map<String,dynamic>> syncState() => client.syncState();",
+        "Future<void> dismissRejection(int ordinal)",
+        "Future<void> drop(int ordinal)",
+        "Future<RuntimeConnection> connect(SyncServer server",
+        "Future<SyncState> syncState(EntryIdentity identity)",
+        "class Mutate { final MutatePort port;",
+    ] {
+        assert!(dart.contains(member), "missing {member}: {dart}");
+    }
+}
+
 fn line_of(error: &str) -> usize {
     error
         .split(':')

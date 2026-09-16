@@ -265,6 +265,8 @@ class EntryModel { final ReadPort port; EntryModel(this.port);
 }
 class EntryLiveModel extends EntryModel { final Client client; EntryLiveModel(this.client) : super(client);
  Stream<List<Entry>> watch({EntryFilter? where}) => client.watch('Entry', where:where?.toRecord()??{}).map((rows) => rows.map(Entry.fromRecord).toList());
+ /// This record's sync state: its pending mutations and retained rejections. Local only.
+ Future<SyncState> syncState(EntryIdentity identity) async => SyncState.fromRecord(await client.recordSyncState('Entry', identity.toRecord()));
 }
 class EntryTxModel extends EntryModel { final WritePort writer; EntryTxModel(this.writer) : super(writer);
  Future<void> create(Entry value) { final state=value.toRecord(); for (final key in value.identity.toRecord().keys) { state.remove(key); } return writer.direct({'model':'Entry','op':'create','identity':value.identity.toRecord(),'values':state}); }
@@ -278,6 +280,8 @@ class BookModel { final ReadPort port; BookModel(this.port);
 }
 class BookLiveModel extends BookModel { final Client client; BookLiveModel(this.client) : super(client);
  Stream<List<Book>> watch({BookFilter? where}) => client.watch('Book', where:where?.toRecord()??{}).map((rows) => rows.map(Book.fromRecord).toList());
+ /// This record's sync state: its pending mutations and retained rejections. Local only.
+ Future<SyncState> syncState(BookIdentity identity) async => SyncState.fromRecord(await client.recordSyncState('Book', identity.toRecord()));
 }
 class BookTxModel extends BookModel { final WritePort writer; BookTxModel(this.writer) : super(writer);
  Future<void> create(Book value) { final state=value.toRecord(); for (final key in value.identity.toRecord().keys) { state.remove(key); } return writer.direct({'model':'Book','op':'create','identity':value.identity.toRecord(),'values':state}); }
@@ -291,6 +295,8 @@ class CommentModel { final ReadPort port; CommentModel(this.port);
 }
 class CommentLiveModel extends CommentModel { final Client client; CommentLiveModel(this.client) : super(client);
  Stream<List<Comment>> watch({CommentFilter? where}) => client.watch('Comment', where:where?.toRecord()??{}).map((rows) => rows.map(Comment.fromRecord).toList());
+ /// This record's sync state: its pending mutations and retained rejections. Local only.
+ Future<SyncState> syncState(CommentIdentity identity) async => SyncState.fromRecord(await client.recordSyncState('Comment', identity.toRecord()));
 }
 class CommentTxModel extends CommentModel { final WritePort writer; CommentTxModel(this.writer) : super(writer);
  Future<void> create(Comment value) { final state=value.toRecord(); for (final key in value.identity.toRecord().keys) { state.remove(key); } return writer.direct({'model':'Comment','op':'create','identity':value.identity.toRecord(),'values':state}); }
@@ -303,13 +309,15 @@ class CounterModel { final ReadPort port; CounterModel(this.port);
 }
 class CounterLiveModel extends CounterModel { final Client client; CounterLiveModel(this.client) : super(client);
  Stream<List<Counter>> watch({CounterFilter? where}) => client.watch('Counter', where:where?.toRecord()??{}).map((rows) => rows.map(Counter.fromRecord).toList());
+ /// This record's sync state: its pending mutations and retained rejections. Local only.
+ Future<SyncState> syncState(CounterIdentity identity) async => SyncState.fromRecord(await client.recordSyncState('Counter', identity.toRecord()));
 }
 class CounterTxModel extends CounterModel { final WritePort writer; CounterTxModel(this.writer) : super(writer);
  Future<void> create(Counter value) { final state=value.toRecord(); for (final key in value.identity.toRecord().keys) { state.remove(key); } return writer.direct({'model':'Counter','op':'create','identity':value.identity.toRecord(),'values':state}); }
  Future<void> update(CounterIdentity identity, CounterPatch patch) => writer.direct({'model':'Counter','op':'update','identity':identity.toRecord(),'values':patch.toRecord()});
  Future<void> delete(CounterIdentity identity) => writer.direct({'model':'Counter','op':'delete','identity':identity.toRecord()});
 }
-class Mutate { final WritePort port; Mutate(this.port);
+class Mutate { final MutatePort port; Mutate(this.port);
  Future<int> createEntry({required Entry entry}) => port.mutate(_createEntry(entry:entry));
  Future<int> editEntry({required EditEntryEntryUpdate entry}) => port.mutate(_editEntry(entry:entry));
  Future<int> removeEntries({required List<EntryIdentity> entries,@Deprecated('use entries') RemoveEntriesMaybeUpdate? maybe}) => port.mutate(_removeEntries(entries:entries,maybe:maybe));
@@ -333,7 +341,12 @@ class Channels { final Client client; Channels(this.client);
  Future<void> unsubscribe(String channel) => client.unsubscribe(channel);
 }
 class GeneratedTransaction { final Transaction transaction; late final TxModels models = TxModels(transaction); late final Mutate mutate = Mutate(transaction); GeneratedTransaction(this.transaction); }
-class GeneratedClient { final Client client; final RuntimeConnection? connection; late final LiveModels models = LiveModels(client); late final Channels channels = Channels(client);
+class GeneratedClient {
+ /// The runtime handle (internal); application code uses the members below.
+ final Client client; RuntimeConnection? connection; late final LiveModels models = LiveModels(client);
+ /// Each mutation runs in its own local transaction and returns its ordinal.
+ late final Mutate mutate = Mutate(client);
+ late final Channels channels = Channels(client);
  GeneratedClient._(this.client, this.connection);
  /// Opens the local database at [path]. With a [server], the connection starts immediately and retries on its own.
  static Future<GeneratedClient> open({required String path, SyncServer? server, String? libraryPath, Map<String,dynamic>? migration, void Function(Object)? onError, Future<void> Function()? refreshAuth}) async {
@@ -344,6 +357,21 @@ class GeneratedClient { final Client client; final RuntimeConnection? connection
   } catch (_) { try { await client.close(); } catch (_) {} rethrow; }
  }
  Future<T> transaction<T>(Future<T> Function(GeneratedTransaction tx) body) => client.transaction((tx) => body(GeneratedTransaction(tx)));
- Future<Map<String,dynamic>> status() => client.status();
+ /// This device's durable client identity.
+ String get clientId => client.clientId;
+ /// The client's sync state: a local snapshot, not a network probe.
+ Future<Map<String,dynamic>> syncState() => client.syncState();
+ /// Remove a handled rejection from the local inbox; it is not retried.
+ Future<void> dismissRejection(int ordinal) => client.dismissRejection(ordinal);
+ /// Remove unsent work and recompute local state; frozen work cannot be dropped.
+ Future<void> drop(int ordinal) => client.drop(ordinal);
+ Future<List<Map<String,dynamic>>> pendingTasks() => client.pendingTasks();
+ Future<void> runPrerequisites(Map<String, Future<void> Function(Map<String,dynamic>)> handlers) => client.runPrerequisites(handlers);
+ /// Start the background connection when `open` was called without a server.
+ Future<RuntimeConnection> connect(SyncServer server, {void Function(Object)? onError, Future<void> Function()? refreshAuth}) async => connection = await client.connect(server, onError:onError, refreshAuth:refreshAuth);
+ /// Escape hatch: an untyped structured query.
+ Future<List<Map<String,dynamic>>> querySpec(String model, Map<String,dynamic> query) => client.querySpec(model, query);
+ /// Escape hatch: read-only SQL over the local database.
+ Future<List<Map<String,dynamic>>> readSql(String sql, {List<dynamic> parameters = const []}) => client.readSql(sql, parameters: parameters);
  Future<void> close() => client.close();
 }
