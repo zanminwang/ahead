@@ -56,7 +56,7 @@ async function replay(requests,{reject=false,fail=false,onError}={}){
     return '{"batchSequence":1,"clientId":"alice","records":[],"rejections":[]}';
    },
    processPull:async()=>'{}',
-   publish:async()=>'[]',
+   settleExternal:async()=>'[]',
    negotiateLive:async()=>'{}',
    pullLive:async()=>'{}',
   },

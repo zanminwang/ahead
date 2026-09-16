@@ -20,10 +20,10 @@ export type Native = {
     request: string,
     callback: (request: string) => Promise<string>,
   ): Promise<string>;
-  publish(
+  /** Settles a business change made outside a handler: the same `{changes, publications}` a handler answers with. */
+  settleExternal(
     config: string,
-    changes: string,
-    channels: string,
+    settlement: string,
     callback: (request: string) => Promise<string>,
   ): Promise<string>;
   /** Negotiates and opens the socket's `Subscriptions`; answers `{handle, actions}` JSON. */
@@ -135,7 +135,11 @@ function engineError(error: unknown): unknown {
 /** Wrap every native function so its failures surface as `EngineError`. */
 function typedNative(native: Native): Native {
   type Async =
-    "processPush" | "processPull" | "publish" | "negotiateLive" | "pullLive";
+    | "processPush"
+    | "processPull"
+    | "settleExternal"
+    | "negotiateLive"
+    | "pullLive";
   type Sync = "validateConfig" | "liveEvent" | "liveClose";
   const wrap =
     <K extends Async>(key: K) =>
@@ -160,7 +164,7 @@ function typedNative(native: Native): Native {
     validateConfig: wrapSync("validateConfig"),
     processPush: wrap("processPush"),
     processPull: wrap("processPull"),
-    publish: wrap("publish"),
+    settleExternal: wrap("settleExternal"),
     negotiateLive: wrap("negotiateLive"),
     pullLive: wrap("pullLive"),
     liveEvent: wrapSync("liveEvent"),
@@ -193,15 +197,16 @@ export interface RecordRef {
   identity: object;
 }
 /** The external notification: a business change made outside a handler, reported to one channel. */
-export type NotifyArgs = {
-  channel: string;
-  records: readonly (RecordRef | object)[];
-};
-/** What `backend.transaction` hands its body: the application transaction and the external notify bound to it. */
+/**
+ * What `backend.transaction` hands its body: the application transaction and
+ * the same `changes` and `publish` a handler receives. The body registers the
+ * records it changed and the channels to publish to; the engine settles them
+ * after the body returns, inside the same transaction.
+ */
 export interface TransactionCall<Tx> {
   tx: Tx;
-  /** Reports a business change made outside a handler: every record gets a new stamp and the channel an invalidation, inside `tx`. Await it; a pending notify fails the transaction. */
-  notify(args: NotifyArgs): Promise<void>;
+  changes: Changes;
+  publish: Publish;
 }
 /**
  * One publication a handler asks for. `records` absent publishes the
@@ -530,6 +535,45 @@ export function createBackend<T>(options: BackendOptions<T>) {
     options.onError?.(error);
     return { error: error instanceof Error ? error.message : String(error) };
   };
+  /**
+   * The change set and publication intents one handler or one external
+   * transaction body accumulates; `add` keeps one entry per (model, identity).
+   */
+  const collect = () => {
+    const records: RecordRef[] = [];
+    const seen = new Set<string>();
+    const add = (ref: RecordRef) => {
+      const key = `${ref.model}\u0000${canonical(ref.identity)}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      records.push(ref);
+    };
+    const changes: Changes = {
+      records,
+      add: (record) => add(toRef(record, "changes.add")),
+    };
+    const publications: { channel: string; records?: RecordRef[] }[] = [];
+    const publish: Publish = ({ channel, records }) => {
+      if (typeof channel !== "string" || channel === "")
+        throw new Error("publish: channel must be a non-empty string");
+      if (records === undefined) {
+        publications.push({ channel });
+        return;
+      }
+      if (!Array.isArray(records))
+        throw new Error("publish: records must be an array");
+      publications.push({
+        channel,
+        records: records.map((record) => toRef(record, "publish")),
+      });
+    };
+    return {
+      changes,
+      publish,
+      seed: add,
+      settlement: () => ({ changes: [...records], publications }),
+    };
+  };
   const host = (
     tx: T,
     session: Session,
@@ -569,40 +613,15 @@ export function createBackend<T>(options: BackendOptions<T>) {
                 : shape(slot, raw);
           }
           // The change set starts with every record the operations target,
-          // in slot order; `add` keeps one entry per (model, identity).
-          const records: RecordRef[] = [];
-          const seen = new Set<string>();
-          const add = (ref: RecordRef) => {
-            const key = `${ref.model}\u0000${canonical(ref.identity)}`;
-            if (seen.has(key)) return;
-            seen.add(key);
-            records.push(ref);
-          };
+          // in slot order.
+          const collected = collect();
           for (const slot of entry.slots) {
             const raw = req.arguments[slot.name] as any;
             for (const item of slot.cardinality === "list" ? raw : [raw])
               if (item !== null && item !== undefined)
-                add({ model: slot.model, identity: item.identity });
+                collected.seed({ model: slot.model, identity: item.identity });
           }
-          const changes: Changes = {
-            records,
-            add: (record) => add(toRef(record, "changes.add")),
-          };
-          const publications: { channel: string; records?: RecordRef[] }[] = [];
-          const publish: Publish = ({ channel, records }) => {
-            if (typeof channel !== "string" || channel === "")
-              throw new Error("publish: channel must be a non-empty string");
-            if (records === undefined) {
-              publications.push({ channel });
-              return;
-            }
-            if (!Array.isArray(records))
-              throw new Error("publish: records must be an array");
-            publications.push({
-              channel,
-              records: records.map((record) => toRef(record, "publish")),
-            });
-          };
+          const { changes, publish } = collected;
           try {
             await entry.handler({
               input,
@@ -611,7 +630,7 @@ export function createBackend<T>(options: BackendOptions<T>) {
               changes,
               publish,
             });
-            result = { changes: [...records], publications };
+            result = collected.settlement();
           } catch (error) {
             result = refusal(error);
           }
@@ -678,46 +697,11 @@ export function createBackend<T>(options: BackendOptions<T>) {
         return callbackJson(result);
       });
   };
-  const publish = (
-    tx: T,
-    changes: readonly RecordRef[],
-    channels: readonly string[],
-  ): Promise<unknown> => {
-    const session = sessions.get(tx);
-    if (!session)
-      return Promise.reject(
-        new Error(
-          "transaction not bound: use backend.transaction or bindTransaction",
-        ),
-      );
-    return session.track(async () => {
-      const result = JSON.parse(
-        await native.publish(
-          config,
-          JSON.stringify(changes),
-          JSON.stringify(channels),
-          host(tx, session),
-        ),
-      );
-      for (const channel of channels) session.touched.add(channel);
-      return result;
-    });
-  };
-  const notifyIn =
-    (tx: T) =>
-    ({ channel, records }: NotifyArgs): Promise<void> =>
-      publish(
-        tx,
-        records.map((record) => toRef(record, "notify")),
-        [channel],
-      ).then(() => undefined);
   const bindTransaction = (tx: T) => {
     if (sessions.has(tx)) throw new Error("transaction already bound");
     const session = new Session();
     sessions.set(tx, session);
     return {
-      /** Reports a business change made outside a handler: every record gets a new stamp and the channel an invalidation. Unlike a handler's `publish`, this returns a promise the caller must await before the transaction commits. */
-      notify: notifyIn(tx),
       assertCommittable: () => session.assertCommittable(),
       afterCommit: () => {
         const scopes = [...session.touched];
@@ -754,14 +738,32 @@ export function createBackend<T>(options: BackendOptions<T>) {
     return result;
   };
   /**
-   * Runs `body` in one application transaction with the external notify bound
-   * to it. After the adapter commits, the live subscribers of every channel
-   * notified are woken; a failure rolls back and wakes nobody. Not for use
-   * inside a handler, which already has a transaction and `publish`.
+   * Runs `body` in one application transaction with a handler's `changes` and
+   * `publish`. After the body returns, the engine settles what it collected in
+   * the same transaction: one new stamp per changed record, publications at
+   * those stamps. After the driver commits, the live subscribers of every
+   * channel published to are woken; a failure rolls back and wakes nobody.
+   * Not for use inside a handler, which already has a transaction.
    */
   const transaction = <R,>(
     body: (call: TransactionCall<T>) => Promise<R>,
-  ): Promise<R> => run((tx) => body({ tx, notify: notifyIn(tx) }));
+  ): Promise<R> =>
+    run(async (tx, session) => {
+      const collected = collect();
+      const result = await body({
+        tx,
+        changes: collected.changes,
+        publish: collected.publish,
+      });
+      await session.track(() =>
+        native.settleExternal(
+          config,
+          JSON.stringify(collected.settlement()),
+          host(tx, session),
+        ),
+      );
+      return result;
+    });
   const text = (request: Uint8Array | string) =>
     typeof request === "string"
       ? request
@@ -806,7 +808,6 @@ export function createBackend<T>(options: BackendOptions<T>) {
       wakes.subscribe(scope, wake),
     notifyCommitted: (scopes: readonly string[]) => wakes.notify(scopes),
     closeLive: () => wakes.clear(),
-    bindTransaction,
     transaction,
   };
   const authenticate = async (request: IncomingMessage) => {

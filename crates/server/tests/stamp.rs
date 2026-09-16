@@ -35,6 +35,8 @@ struct Fixed {
     publish: Value,
     published: Mutex<Vec<HostRequest>>,
     loaded: Mutex<Vec<u64>>,
+    advanced: Mutex<Vec<String>>,
+    ensured: Mutex<Vec<String>>,
 }
 impl Fixed {
     fn new(scan: Value, publish: Value) -> Self {
@@ -43,6 +45,8 @@ impl Fixed {
             publish,
             published: Mutex::new(vec![]),
             loaded: Mutex::new(vec![]),
+            advanced: Mutex::new(vec![]),
+            ensured: Mutex::new(vec![]),
         }
     }
 }
@@ -61,7 +65,14 @@ impl Host for Fixed {
                     self.loaded.lock().unwrap().push(*version);
                     json!([{"id":"e","text":"t"}])
                 }
-                HostRequest::AdvanceStamp { .. } => json!(9),
+                HostRequest::AdvanceStamp { identity_key, .. } => {
+                    self.advanced.lock().unwrap().push(identity_key.clone());
+                    json!(9)
+                }
+                HostRequest::EnsureStamp { identity_key, .. } => {
+                    self.ensured.lock().unwrap().push(identity_key.clone());
+                    json!(9)
+                }
                 HostRequest::Publish { .. } => {
                     self.published.lock().unwrap().push(request.clone());
                     self.publish.clone()
@@ -239,11 +250,18 @@ fn pull_rejects_rows_without_a_positive_stamp() {
 }
 
 #[test]
-fn publish_advances_one_stamp_per_record_and_distributes_it_at_that_stamp() {
-    let changes = json!([{"model":"Entry","identity":{"id":"e"}}]);
-    let channels = json!(["a", "b"]);
+fn an_external_settlement_advances_one_stamp_per_record_and_distributes_it_at_that_stamp() {
+    let settlement = json!({
+        "changes":[{"model":"Entry","identity":{"id":"e"}}],
+        "publications":[{"channel":"a"},{"channel":"b"}]
+    });
     let ok = Fixed::new(json!([]), json!({"cursor":3,"stamp":9}));
-    run(ahead_server::publish(&config(), &changes, &channels, &ok)).unwrap();
+    let answer = run(ahead_server::settle_external(&config(), &settlement, &ok)).unwrap();
+    assert_eq!(
+        answer,
+        json!([{"model":"Entry","identity":{"id":"e"},"stamp":9}]),
+        "the changed records come back with their stamps"
+    );
     let published = ok.published.lock().unwrap();
     assert_eq!(published.len(), 2, "one invalidation per channel");
     for request in published.iter() {
@@ -253,6 +271,24 @@ fn publish_advances_one_stamp_per_record_and_distributes_it_at_that_stamp() {
         assert_eq!(*stamp, 9, "both channels carry the one allocated stamp");
     }
     drop(published);
+    // A publication-only record keeps its stamp; `ensureStamp` initializes it.
+    let ensure = Fixed::new(json!([]), json!({"cursor":4,"stamp":9}));
+    let publication_only = json!({
+        "changes":[],
+        "publications":[{"channel":"a","records":[{"model":"Entry","identity":{"id":"e"}}]}]
+    });
+    run(ahead_server::settle_external(
+        &config(),
+        &publication_only,
+        &ensure,
+    ))
+    .unwrap();
+    assert_eq!(
+        ensure.ensured.lock().unwrap().len(),
+        1,
+        "an unchanged member is initialized, not advanced"
+    );
+    assert!(ensure.advanced.lock().unwrap().is_empty());
     // The host must echo the stamp the engine named; anything else is unusable.
     for bad in [
         json!(3),
@@ -261,8 +297,23 @@ fn publish_advances_one_stamp_per_record_and_distributes_it_at_that_stamp() {
         json!({"cursor":3,"stamp":8}),
     ] {
         let host = Fixed::new(json!([]), bad.clone());
-        let err = run(ahead_server::publish(&config(), &changes, &channels, &host)).unwrap_err();
+        let err = run(ahead_server::settle_external(&config(), &settlement, &host)).unwrap_err();
         assert_eq!(err.code, ahead_server::code::HOST_INVALID, "{bad}: {err}");
+    }
+    // A rejection or a malformed settlement is refused before any host call.
+    for bad in [
+        json!({"rejection":"x"}),
+        json!({"changes":[]}),
+        json!({"channels":["a"]}),
+    ] {
+        let host = Fixed::new(json!([]), json!({"cursor":3,"stamp":9}));
+        let err = run(ahead_server::settle_external(&config(), &bad, &host)).unwrap_err();
+        assert_eq!(
+            err.code,
+            ahead_server::code::PUBLISH_INVALID,
+            "{bad}: {err}"
+        );
+        assert!(host.published.lock().unwrap().is_empty());
     }
 }
 

@@ -12,6 +12,8 @@ const db=new PrismaClient();
 // The server suite runs on the Prisma shim (its handlers use Prisma's raw API); driver-conformance.test.mjs proves every shim.
 const database=()=>prisma(db);
 const store=tx=>prisma(db).persistence(tx);
+/** A business change made outside a handler: register the records and publish them to one channel. */
+const external=(backendLike,channel,records)=>backendLike.transaction(({changes,publish})=>{for(const r of records)changes.add(r);publish({channel});});
 const run=prismaDriver(db).transaction;
 const schema={enums:[],models:[{name:'Task',identity:['id'],fields:[{name:'id',type:{kind:'scalar',name:'string'},nullable:false},{name:'title',type:{kind:'scalar',name:'string'},nullable:false}]}]};
 const config={schema,mutations:[{name:'edit',version:1,slots:[{name:'task',model:'Task',operation:'update',cardinality:'single',allowedPatchFields:['title']}]}]};
@@ -48,7 +50,7 @@ const invalidations=async id=>(await db.$queryRawUnsafe('SELECT channel, cursor,
 const head=async channel=>{const rows=await db.$queryRawUnsafe('SELECT head FROM ahead_channel WHERE channel=$1',channel);return rows.length?Number(rows[0].head):0;};
 before(async()=>{for(const sql of (await readFile(new URL('../../../packages/postgres/migration.sql',import.meta.url),'utf8')).split(';').map(x=>x.trim()).filter(Boolean))await db.$executeRawUnsafe(sql);await db.$executeRawUnsafe('CREATE TABLE business_task(id text PRIMARY KEY,title text NOT NULL)');});
 after(()=>db.$disconnect());
-test('native exports production runtime',()=>{assert.equal(typeof native.processPush,'function');assert.equal(typeof native.processPull,'function');assert.equal(typeof native.publish,'function');assert.equal(typeof native.validateConfig,'function');
+test('native exports production runtime',()=>{assert.equal(typeof native.processPush,'function');assert.equal(typeof native.processPull,'function');assert.equal(typeof native.settleExternal,'function');assert.equal(native.publish,undefined);assert.equal(typeof native.validateConfig,'function');
  assert.equal(typeof native.negotiateLive,'function');assert.equal(typeof native.pullLive,'function');
  assert.equal(typeof native.liveEvent,'function');assert.equal(typeof native.liveClose,'function');
  assert.throws(()=>native.liveEvent(0,JSON.stringify({type:'closed'})),error=>JSON.parse(error.message).code==='live.invalid_event','an event on a handle that is not open is a host defect');
@@ -218,20 +220,16 @@ test('a pull reaches the loader of the declared model version and normalizes row
 });
 test('compaction materializes latest state; deletion is aligned null',async()=>{
  await backend.push('alice',push('dedup',2,[mutation(1,'updated')]));await assert.rejects(()=>backend.push('alice',push('dedup',1,[mutation(1,'first')])),/overlap/);
- await backend.transaction(async({tx,notify})=>{await tx.$executeRawUnsafe("DELETE FROM business_task WHERE id='a'");await notify({channel:'shared',records:[{model:'Task',identity:{id:'a'}}]});});
+ await backend.transaction(async({tx,changes,publish})=>{await tx.$executeRawUnsafe("DELETE FROM business_task WHERE id='a'");for(const r of [{model:'Task',identity:{id:'a'}}])changes.add(r);publish({channel:'shared'});});
  const page=await pull();assert.equal(page.changes.length,4);assert.deepEqual(page.changes.at(-1).state,null);assert.equal(page.toCursor,6);
  await assert.rejects(()=>pull('shared',999),/cursor ahead/);
 });
 test('50-row pages retain original cursor progression and remainder reaches head',async()=>{
- // backend.transaction has no timeout parameter (Database<Tx>.transaction takes only the body), so this
- // 51-statement loop stays on db.$transaction with bindTransaction, the advanced path for this one call.
- let wakeFifty;
- await db.$transaction(async tx=>{const session=backend.bindTransaction(tx);try{for(let i=0;i<51;i++){await tx.$executeRawUnsafe('INSERT INTO business_task(id,title) VALUES($1,$2)',`page-${i}`,'page');await session.notify({channel:'shared',records:[{model:'Task',identity:{id:`page-${i}`}}]});}await session.assertCommittable();wakeFifty=session.afterCommit();}finally{session.close();}},{timeout:20000});
- wakeFifty();
+ await backend.transaction(async({tx,changes,publish})=>{for(let i=0;i<51;i++){await tx.$executeRawUnsafe('INSERT INTO business_task(id,title) VALUES($1,$2)',`page-${i}`,'page');changes.add({model:'Task',identity:{id:`page-${i}`}});}publish({channel:'shared'});});
  const first=await pull('shared',6);assert.equal(first.changes.length,50);assert.equal(first.toCursor,56);const last=await pull('shared',56);assert.equal(last.changes.length,1);assert.equal(last.toCursor,57);
 });
 test('concurrent same-client retry executes once under PostgreSQL lock',async()=>{const before=called;const request=push('race',1,[mutation(1,'race','race')]);const receipts=await Promise.all([backend.push('alice',request),backend.push('alice',request)]);assert.equal(receipts[0],receipts[1]);assert.equal(called,before+1);});
-test('publication rollback uses user transaction and rejects unregistered models',async()=>{const before=(await pull('shared',56)).toCursor;await assert.rejects(()=>backend.transaction(async({tx,notify})=>{await notify({channel:'shared',records:[{model:'Task',identity:{id:'rollback'}}]});throw new Error('cancel');}),/cancel/);assert.equal((await pull('shared',56)).toCursor,before);await assert.rejects(()=>backend.transaction(({notify})=>notify({channel:'shared',records:[{model:'Unknown',identity:{id:'x'}}]})),/unregistered loader/);});
+test('publication rollback uses user transaction and rejects unregistered models',async()=>{const before=(await pull('shared',56)).toCursor;await assert.rejects(()=>backend.transaction(async({tx,changes,publish})=>{for(const r of [{model:'Task',identity:{id:'rollback'}}])changes.add(r);publish({channel:'shared'});throw new Error('cancel');}),/cancel/);assert.equal((await pull('shared',56)).toCursor,before);await assert.rejects(()=>external(backend,'shared',[{model:'Unknown',identity:{id:'x'}}]),/unregistered loader/);});
 test('loader defects abort pull instead of silently advancing its cursor',async()=>{
  const make=load=>createBackend({config:{...config,mutations:[]},database:database(),authenticate,handlers:{},loaders:{task:load}});
  await assert.rejects(()=>make(async()=>[]).pull('alice',JSON.stringify({clientId:'c',scope:'shared',fromCursor:56,models:{Task:1}})),/misaligned loader/);
@@ -266,18 +264,13 @@ test('nonfinite nullable loader values are defects rather than null clears',asyn
  expanded.mutations=[];const bad=createBackend({config:expanded,database:database(),authenticate,handlers:{},loaders:{async task({ids}){return ids.map(()=>({title:'x',score:NaN}))}}});
  await assert.rejects(()=>bad.pull('alice',JSON.stringify({clientId:'c',scope:'shared',fromCursor:56,models:{Task:1}})),/nonfinite/);
 });
-test('pending unawaited publication prevents outer transaction commit',async()=>{
- const bad=createBackend({config,database:{transaction:run,persistence:tx=>{const storage=store(tx);return {call:async r=>{if(r.op==='publish')await new Promise(resolve=>setTimeout(resolve,30));return storage.call(r);}}}},authenticate,handlers:{async edit(){}},loaders:{async task(){return []}}});
- await assert.rejects(()=>db.$transaction(async tx=>{const session=bad.bindTransaction(tx);try{await tx.$executeRawUnsafe("INSERT INTO business_task(id,title) VALUES('unawaited','bad')");void session.notify({channel:'shared',records:[{model:'Task',identity:{id:'unawaited'}}]});await session.assertCommittable();}finally{session.close();}}),/unawaited/);
- assert.equal((await db.$queryRawUnsafe("SELECT * FROM business_task WHERE id='unawaited'")).length,0);
-});
-test('external transaction binding retains swallowed publication failure until its completion gate',async()=>{
- await assert.rejects(()=>db.$transaction(async tx=>{const session=backend.bindTransaction(tx);try{await tx.$executeRawUnsafe("INSERT INTO business_task(id,title) VALUES('external','bad')");try{await session.notify({channel:'shared',records:[{model:'Unknown',identity:{id:'x'}}]});}catch{}await session.assertCommittable();}finally{session.close();}}),/unregistered loader/);
+test('backend.transaction rolls the business write back when the settlement is rejected',async()=>{
+ await assert.rejects(()=>backend.transaction(async({tx,changes,publish})=>{await tx.$executeRawUnsafe("INSERT INTO business_task(id,title) VALUES('external','bad')");changes.add({model:'Unknown',identity:{id:'x'}});publish({channel:'shared'});}),/unregistered loader/);
  assert.equal((await db.$queryRawUnsafe("SELECT * FROM business_task WHERE id='external'")).length,0);
 });
 test('repeatable-read runner keeps head, scan, and loader coherent across concurrent publication',async()=>{
- await backend.transaction(({notify})=>notify({channel:'snapshot',records:[{model:'Task',identity:{id:'a'}}]}));let changed=false;
- const reader=createBackend({config:{...config,mutations:[]},database:{transaction:run,persistence:tx=>{const storage=store(tx);return {call:async r=>{const result=await storage.call(r);if(r.op==='head'&&!changed){changed=true;await backend.transaction(({notify})=>notify({channel:'snapshot',records:[{model:'Task',identity:{id:'b'}}]}));}return result;}}}},authenticate,handlers:{},loaders:{async task({ids}){return ids.map(()=>null)}}});
+ await external(backend,'snapshot',[{model:'Task',identity:{id:'a'}}]);let changed=false;
+ const reader=createBackend({config:{...config,mutations:[]},database:{transaction:run,persistence:tx=>{const storage=store(tx);return {call:async r=>{const result=await storage.call(r);if(r.op==='head'&&!changed){changed=true;await external(backend,'snapshot',[{model:'Task',identity:{id:'b'}}]);}return result;}}}},authenticate,handlers:{},loaders:{async task({ids}){return ids.map(()=>null)}}});
  const page=JSON.parse(await reader.pull('alice',JSON.stringify({clientId:'c',scope:'snapshot',fromCursor:0,models:{Task:1}})));assert.equal(page.toCursor,1);assert.equal(page.changes.length,1);
  const next=JSON.parse(await reader.pull('alice',JSON.stringify({clientId:'c',scope:'snapshot',fromCursor:1,models:{Task:1}})));assert.equal(next.toCursor,2);assert.equal(next.changes.length,1);
 });
@@ -303,21 +296,21 @@ test('live transport negotiates, wakes only after commit, reconnects, and cleans
  while(frames.length<1)await delay(5);
  assert.deepEqual(frames[0],{rejections:[],scopes:['bob','shared'],type:'subscribed'});
 
- let release,ready;const held=new Promise(resolve=>{release=resolve;});const started=new Promise(resolve=>{ready=resolve;});let notify;
- const committing=db.$transaction(async tx=>{const session=backend.bindTransaction(tx);try{
+ let release,ready;const held=new Promise(resolve=>{release=resolve;});const started=new Promise(resolve=>{ready=resolve;});
+ const committing=backend.transaction(async({tx,changes,publish})=>{
    await tx.$executeRawUnsafe("INSERT INTO business_task(id,title) VALUES('live-external','committed')");
-   await session.notify({channel:'shared',records:[{model:'Task',identity:{id:'live-external'}}]});notify=session.afterCommit();ready();await held;await session.assertCommittable();
- }finally{session.close();}});
- await started;await delay(80);assert.equal(frames.length,1,'uncommitted publication must stay silent');release();await committing;await delay(50);assert.equal(frames.length,1,'commit alone requires the explicit external after-commit hook');notify();
+   changes.add({model:'Task',identity:{id:'live-external'}});publish({channel:'shared'});ready();await held;
+ });
+ await started;await delay(80);assert.equal(frames.length,1,'uncommitted publication must stay silent');release();await committing;
  while(frames.length<2)await delay(5);
  assert.deepEqual(frames[1].changes.at(-1),{syncId:frames[1].toCursor,model:'Task',identity:{id:'live-external'},stamp:1,state:{title:'committed'}});
 
- const pageStart=frames.length;let notifyPages;
- await db.$transaction(async tx=>{const session=backend.bindTransaction(tx);try{for(let i=0;i<51;i++){const id=`live-page-${i}`;await tx.$executeRawUnsafe('INSERT INTO business_task(id,title) VALUES($1,$2)',id,'paged');await session.notify({channel:'shared',records:[{model:'Task',identity:{id}}]});}await session.assertCommittable();notifyPages=session.afterCommit();}finally{session.close();}},{timeout:20000});notifyPages();
+ const pageStart=frames.length;
+ await backend.transaction(async({tx,changes,publish})=>{for(let i=0;i<51;i++){const id=`live-page-${i}`;await tx.$executeRawUnsafe('INSERT INTO business_task(id,title) VALUES($1,$2)',id,'paged');changes.add({model:'Task',identity:{id}});}publish({channel:'shared'});});
  while(frames.length<pageStart+2)await delay(5);assert.equal(frames[pageStart].changes.length,50);assert.equal(frames[pageStart+1].changes.length,1);assert.equal(frames[pageStart+1].fromCursor,frames[pageStart].toCursor);
 
  const beforeRollback=frames.length;
- await assert.rejects(()=>db.$transaction(async tx=>{const session=backend.bindTransaction(tx);try{await session.notify({channel:'shared',records:[{model:'Task',identity:{id:'live-rollback'}}]});throw new Error('rollback live');}finally{session.close();}}),/rollback live/);
+ await assert.rejects(()=>backend.transaction(async({changes,publish})=>{changes.add({model:'Task',identity:{id:'live-rollback'}});publish({channel:'shared'});throw new Error('rollback live');}),/rollback live/);
  await delay(80);assert.equal(frames.length,beforeRollback);
 
  socket.close();await new Promise(resolve=>socket.addEventListener('close',resolve,{once:true}));
@@ -368,7 +361,7 @@ test('loader safely converts PostgreSQL BigInt scalar and list values without wi
       'SELECT $1::bigint AS count, ARRAY[$1::bigint,(-$1)::bigint] AS counts', value,
     )}},
   });
-  await bigintBackend.transaction(({notify}) => notify({channel: 'bigints', records: [{model: 'Counter', identity: {id: 'one'}}]}));
+  await external(bigintBackend,'bigints',[{model: 'Counter', identity: {id: 'one'}}]);
   const request = JSON.stringify({clientId: 'bigint-reader', scope: 'bigints', fromCursor: 0,models:{Counter:1}});
   let page = JSON.parse(await bigintBackend.pull('alice', request));
   assert.deepEqual(page.changes[0].state, {count: Number.MAX_SAFE_INTEGER, counts: [Number.MAX_SAFE_INTEGER, -Number.MAX_SAFE_INTEGER]});
@@ -474,9 +467,9 @@ test('one push publishing to two channels carries the same stamp to both and adv
  assert.deepEqual(await invalidations('two-a'),[['other',before[1]+1,1],['shared',before[0]+1,1]]);
  assert.deepEqual([await head('shared'),await head('other')],[before[0]+1,before[1]+1]);
 });
-test('an external notify advances the stamp on every call; a push publishing an unchanged record does not',async()=>{
- const notify=()=>backend.transaction(({notify})=>notify({channel:'other',records:[{model:'Task',identity:{id:'pub-only'}}]}));
- const start=await recordStamp('pub-only');await notify();await notify();assert.equal(await recordStamp('pub-only'),start+2,'an external notification reports a business change');
+test('an external write advances the stamp on every call; a push publishing an unchanged record does not',async()=>{
+ const change=()=>external(backend,'other',[{model:'Task',identity:{id:'pub-only'}}]);
+ const start=await recordStamp('pub-only');await change();await change();assert.equal(await recordStamp('pub-only'),start+2,'an external notification reports a business change');
  const [[,cursor,stamp]]=await invalidations('pub-only');assert.equal(stamp,start+2);
  await backend.push('alice',push('pub-only',3,[mutation(3,'publish-only','pub-only-c')]));
  assert.equal(await recordStamp('pub-only'),start+2,'publication alone is distribution');assert.deepEqual(await invalidations('pub-only'),[['other',cursor+1,start+2]]);
@@ -514,8 +507,8 @@ test('scan pairs the invalidation cursor with the current record stamp; a missin
  await assert.rejects(()=>pull('orphan',0),/Record metadata missing/);
 });
 test('concurrent notifies of one record receive distinct stamps',async()=>{
- const notify=()=>backend.transaction(async({notify})=>{await notify({channel:'race-stamp',records:[{model:'Task',identity:{id:'stamp-race'}}]});});
- await Promise.all([notify(),notify(),notify(),notify()]);
+ const change=()=>external(backend,'race-stamp',[{model:'Task',identity:{id:'stamp-race'}}]);
+ await Promise.all([change(),change(),change(),change()]);
  assert.equal(await recordStamp('stamp-race'),4);
  const page=await pull('race-stamp',0);assert.equal(page.changes.length,1);assert.equal(page.changes[0].stamp,4);
 });
@@ -729,9 +722,9 @@ test('the live stream serves the declared model version and refuses an unretaine
    socket.send(JSON.stringify({type:'subscribe',scopes:['shared'],models:{Task:version}}));
    while(frames.length<1)await delay(5);
    assert.equal(frames[0].type,'subscribed');
-   // Streaming starts at the head: publish after the handshake, with the
-   // after-commit hook that wakes subscribers, so a page follows.
-   let wake;await db.$transaction(async tx=>{const session=versioned.bindTransaction(tx);try{await session.notify({channel:'shared',records:[{model:'Task',identity:{id:`live-v${version}`}}]});await session.assertCommittable();wake=session.afterCommit();}finally{session.close();}});wake();
+   // Streaming starts at the head: publish after the handshake; the commit
+   // wakes subscribers, so a page follows.
+   await external(versioned,'shared',[{model:'Task',identity:{id:`live-v${version}`}}]);
    while(frames.length<2)await delay(5);
    shapes.push(frames[1].changes.find(ch=>ch.state!==null).state);
    socket.close();await new Promise(resolve=>socket.addEventListener('close',resolve,{once:true}));
@@ -751,7 +744,7 @@ test('the live stream serves the declared model version and refuses an unretaine
 test('backend.transaction publishes in the application transaction and wakes after commit',async()=>{
  let woke=0;const unsubscribe=backend.onCommitted('shared',()=>{woke++;});
  const from=await head('shared');
- const result=await backend.transaction(async({tx,notify})=>{await write(tx,'tx-1','via transaction');await notify({channel:'shared',records:[{model:'Task',identity:{id:'tx-1'}}]});return 'done';});
+ const result=await backend.transaction(async({tx,changes,publish})=>{await write(tx,'tx-1','via transaction');for(const r of [{model:'Task',identity:{id:'tx-1'}}])changes.add(r);publish({channel:'shared'});return 'done';});
  assert.equal(result,'done');await delay(0);assert.equal(woke,1,'one wake after commit');
  const page=await pull('shared',from);assert.ok(page.changes.some(c=>c.identity.id==='tx-1'&&c.state.title==='via transaction'),JSON.stringify(page));
  unsubscribe();
@@ -759,27 +752,33 @@ test('backend.transaction publishes in the application transaction and wakes aft
 test('backend.transaction rolls back a failing body and wakes nobody',async()=>{
  let woke=0;const unsubscribe=backend.onCommitted('shared',()=>{woke++;});
  const before=await head('shared');
- await assert.rejects(()=>backend.transaction(async({tx,notify})=>{await write(tx,'tx-rollback','never');await notify({channel:'shared',records:[{model:'Task',identity:{id:'tx-rollback'}}]});throw new Error('cancel');}),/cancel/);
+ await assert.rejects(()=>backend.transaction(async({tx,changes,publish})=>{await write(tx,'tx-rollback','never');for(const r of [{model:'Task',identity:{id:'tx-rollback'}}])changes.add(r);publish({channel:'shared'});throw new Error('cancel');}),/cancel/);
  await delay(0);assert.equal(woke,0);assert.equal(await head('shared'),before);
  assert.equal((await db.$queryRawUnsafe("SELECT count(*) AS count FROM business_task WHERE id='tx-rollback'"))[0].count,0n);
  unsubscribe();
-});
-test('backend.transaction refuses to commit an unawaited notify',async()=>{
- const before=await head('shared');
- await assert.rejects(()=>backend.transaction(async({tx,notify})=>{await write(tx,'tx-unawaited','never');void notify({channel:'shared',records:[{model:'Task',identity:{id:'tx-unawaited'}}]});}),/unawaited/);
- assert.equal(await head('shared'),before);
 });
 test('backend.transaction wakes a connected live subscriber without reconnect',async()=>{
  const server=await backend.listen({port:0});const port=Number(new URL(server.url).port);
  const socket=await openSocket(port);const frames=[];socket.addEventListener('message',event=>frames.push(JSON.parse(String(event.data))));
  socket.send(JSON.stringify({type:'subscribe',scopes:['shared'],models:{Task:1}}));while(frames.length<1)await delay(5);
- await backend.transaction(async({tx,notify})=>{await write(tx,'tx-live','live via transaction');await notify({channel:'shared',records:[{model:'Task',identity:{id:'tx-live'}}]});});
+ await backend.transaction(async({tx,changes,publish})=>{await write(tx,'tx-live','live via transaction');for(const r of [{model:'Task',identity:{id:'tx-live'}}])changes.add(r);publish({channel:'shared'});});
  while(frames.length<2)await delay(5);
  assert.deepEqual(frames[1].changes.at(-1).identity,{id:'tx-live'});assert.deepEqual(frames[1].changes.at(-1).state,{title:'live via transaction'});
  socket.close();await new Promise(resolve=>socket.addEventListener('close',resolve,{once:true}));await server.close();
 });
-test('the unbound notify shortcut is gone and bindTransaction still works end to end',async()=>{
- assert.equal(backend.notify,undefined);
- const after=await db.$transaction(async tx=>{const session=backend.bindTransaction(tx);try{await session.notify({channel:'shared',records:[{model:'Task',identity:{id:'bound-still-works'}}]});await session.assertCommittable();return session.afterCommit();}finally{session.close();}});
- after();
+test('notify and bindTransaction are gone; backend.transaction is the only external write path',async()=>{
+ assert.equal(backend.notify,undefined);assert.equal(backend.bindTransaction,undefined);
+ const before=await head('shared');
+ await backend.transaction(async({tx,changes,publish})=>{await write(tx,'tx-only-path','only path');changes.add({model:'Task',identity:{id:'tx-only-path'}});publish({channel:'shared'});});
+ assert.equal(await head('shared'),before+1);
+});
+test('publishing an unchanged record does not advance its stamp; a body without publish still stamps its changes',async()=>{
+ await external(backend,'shared',[{model:'Task',identity:{id:'stamp-probe'}}]);
+ const stampOf=()=>recordStamp('stamp-probe');
+ const first=await stampOf();
+ const headBefore=await head('shared');
+ await backend.transaction(async({publish})=>{publish({channel:'shared',records:[{model:'Task',identity:{id:'stamp-probe'}}]});});
+ assert.equal(await stampOf(),first,'publication-only records keep their stamp');assert.equal(await head('shared'),headBefore+1,'but are still published');
+ await backend.transaction(async({changes})=>{changes.add({model:'Task',identity:{id:'stamp-probe'}});});
+ assert.equal(await stampOf(),first+1,'changes advance even without a publish');assert.equal(await head('shared'),headBefore+1,'and nothing is published');
 });
