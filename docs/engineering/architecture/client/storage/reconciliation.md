@@ -2,63 +2,69 @@
 
 ## 1. Introduction and Goals
 
-Currently, the client stores no schema descriptor. The tables themselves are the record of what schema created them, and opening the client compares them with the compiled schema it was given. Reconciliation makes the tables match when it can do so without losing data, and refuses to open when it cannot.
+A local database records the schema it was built for. Opening a client compares that stored descriptor with the compiled schema it is given and takes one of three ways: open as is, apply an additive change in place, or leave the file behind and build a fresh one beside it that resynchronises from the server. No row, pending mutation or direct record ever moves between schemas, and the runtime never deletes a file an application could still need ([#20](https://github.com/zanminwang/ahead/issues/20)).
 
 ## 3. Context and Scope
 
-Two steps at open ([Frontend interface](../frontend-interface.md)). The **layout gate** runs first, on the committed reader and before any DDL: it refuses a file laid out by the checkpoint-era runtime and touches nothing. **Reconciliation** then runs once inside the opening transaction, after the framework tables exist and before the client row is read. Input: the names of the `ahead_` tables and the columns of `ahead_client`; then the compiled schema and `PRAGMA table_info` of each model table. Output: the tables match, or an error and an untouched file.
+The application passes one `path`; the client chooses the file. Opening reads the sidecar `<path>.current` (one line, the file name; missing means `path` itself), opens that file, and runs the **layout gate** on the committed reader before any DDL: a file laid out by the checkpoint-era runtime is a legacy layout, a file without `ahead_client` is fresh, anything else is current. It then runs the framework DDL, reads the stored descriptor from `ahead_schema` and classifies the difference with the shared rule `Schema::compatibility(stored, incoming)` from [core/schema.rs](../../../../../crates/core/src/schema.rs). **Reconciliation** proper, the DDL that makes the model tables match, runs once inside the opening transaction for a fresh file and for an additive change; a rebuild runs it on the new file. Input: the sidecar, the `ahead_` table names, the stored descriptor and the compiled schema. Output: an open client whose `schema_state()` says what happened, or an error and an untouched file.
+
+Callers are [`Client::open_at`](../frontend-interface.md) (bindings, simulation) and `Client::open` for a store the caller opened itself; the latter has no path, so it refuses a legacy layout instead of rebuilding.
 
 ## 5. Building Block View
 
-Per model there are two tables with identical columns: the visible table named after the model and `ahead_before_<Model>` for before images ([Writes](../engine/local-operations/writes.md)). Column types follow [Types](../../schema/types.md); the identity is the primary key in `@@id` order; each `@@unique` becomes a unique index on the visible table. Eight framework tables (`ahead_client`, `ahead_record`, `ahead_subscription`, the four queue tables, `ahead_rejection`) are created with `IF NOT EXISTS`; `ahead_client` carries `last_completed_push` and `push_models` ([Settlement](../engine/settlement.md)).
+Per model there are two tables with identical columns: the visible table named after the model and `ahead_before_<Model>` for before images ([Writes](../engine/local-operations/writes.md)). Column types follow [Types](../../schema/types.md); the identity is the primary key in `@@id` order; each `@@unique` becomes a unique index on the visible table. Nine framework tables (`ahead_schema`, `ahead_client`, `ahead_record`, `ahead_subscription`, the four queue tables, `ahead_rejection`) are created with `IF NOT EXISTS`; `ahead_schema` holds one row, the canonical JSON of the descriptor and when it was written; `ahead_client` carries `last_completed_push` and `push_models` ([Settlement](../engine/settlement.md)).
 
-Code: [client/ddl.rs](../../../../../crates/client/src/ddl.rs) (`check_layout`, `FRAMEWORK_DDL`, `reconcile`).
+Beside the database: the sidecar `<path>.current`, written as `<path>.current.tmp` and renamed, and the numbered files `<path>.<n>` a rebuild creates, `n` being the smallest unused positive integer.
+
+Code: [client/ddl.rs](../../../../../crates/client/src/ddl.rs) (`check_layout` → `Layout`, `FRAMEWORK_DDL`, `reconcile`); [client/schema_store.rs](../../../../../crates/client/src/schema_store.rs) (descriptor read and write, sidecar, next free file, removal of an abandoned file); the open flow, `rebuild` and the pending counts in [client/lib.rs](../../../../../crates/client/src/lib.rs) (`open_at`, `rebuild_beside`, `rebuild`); the compatibility rule in [core/schema.rs](../../../../../crates/core/src/schema.rs) (`Schema::compatibility`, `Compatibility`, `AdditiveStep`).
 
 ## 6. Runtime View
 
-What reconciliation does depends on the kind of difference. The three outcomes are different in kind and should not be summarized as "schema changes are refused":
+The comparison is the compiler's model rule ([Models §9](../../schema/models.md#9-architecture-decisions)), never a hash: a hash can tell that something changed, not whether the change is safe.
 
-| Difference between schema and table | Outcome |
+| Comparison of stored and incoming schema | Outcome |
 | --- | --- |
-| Layout from the checkpoint era: an `ahead_push_checkpoint` or `ahead_claim` table, or `ahead_client` without `last_completed_push` and `push_models` | **refused** before any DDL, with "this database was created by an earlier Ahead runtime (…); it cannot be opened by this one. Open a fresh database; the old file is left untouched"; every row, checkpoint and pending operation included, stays as found |
-| Model table missing | created, with its before table and indexes |
-| Field missing from the table, nullable | column added to both tables |
-| Field missing, non-nullable, default in the descriptor | column added with that default |
-| Field missing, non-nullable, no default | **refused**; open fails |
-| Identity columns differ | **refused** |
-| Column storage type differs | **refused** |
-| Column in the table but not in the schema | **kept**, never read or written |
-| Unique index no longer declared | **kept**, still enforced |
-| Enum value set changed | **not detected**; the column is `TEXT` |
-| Model removed from the schema | its tables are **kept** |
+| Identical (field order ignored) | **open** |
+| A new model; a new nullable stored field; a new non-nullable field with a descriptor default | **additive**: the tables and columns are added by `reconcile` in the opening transaction and the stored descriptor is replaced in the same transaction |
+| A removed model; a model version change; an identity change; a removed, retyped or nullability-changed field; a changed unique set or relation; changed values of an enum a stored field uses | **incompatible**: the file is not touched; a fresh `<path>.<n>` is created (see below) |
+| Legacy layout from the checkpoint era (`ahead_push_checkpoint`, `ahead_claim`, or `ahead_client` without the completion columns) | **incompatible** as well: it stops being a refusal and becomes a rebuild; its checkpoint-era queue cannot be sent by this runtime, so the count of mutations it held is reported as left behind |
+| Current layout without a descriptor row (a file from before this rule) | it adopts the incoming schema if `reconcile` succeeds on it, otherwise it is rebuilt with the reconciliation error as the reason |
 
-Consequences worth knowing: a field rename is handled as "remove the old field, add the new one", so the old column stays in place and the new column follows the rows above for an added field: filled with `null` if nullable, with the declared default if it has one, and refused (open fails) if it is non-nullable without a default; the old column's values are not carried over. A stale unique index keeps constraining rows; and rows holding an enum value the schema no longer declares remain readable as strings that normalization will reject. A refused reconciliation rolls back and leaves the file exactly as it was; the only remedy today is a new database file. The layout gate is deliberately the same answer: an old file's frozen batches referred to a receipt shape and a settlement rule this runtime no longer has, so it neither migrates nor deletes them ([Protocol / Push §11](../../protocol/push.md#11-risks-and-technical-debt)).
+A **rebuild** creates `<path>.<n>`, runs the framework DDL and `reconcile` for the incoming schema, stores its descriptor, copies the old file's subscription channels at cursor 0 (never the cursors: an old cursor must not claim old rows are present), commits, and only then writes the sidecar. Reopening follows the sidecar to the new file. An interrupted rebuild leaves the sidecar untouched, so the next open finds the old file again, classifies it again, removes every numbered file the sidecar does not name (it holds nothing durable: no receipts, no queue) and retries with a fresh number. The old file stays where it was, with every row, pending mutation and direct record it held; the application may delete the numbered files it no longer needs.
+
+**Unsent work in the old file.** Before an incompatible rebuild the client counts the old file's queued mutations (`pending`) and its direct records (`direct`: rows with no stamp in `ahead_record` and no pending operation, which nothing will ever send). With `pending > 0` and `discard_pending = false`, the old file is opened as it is, **with its stored schema** (its frozen bytes and declaration were compiled for that schema and the server serves that mutation version), and `schema_state().pending` reports `{old_file, reason, pending, direct}`. The push lane runs as usual; reads answer from the old schema. When the queue is empty the application reopens, or calls `rebuild(false)`, which performs the switch in place: the same handle now serves the new file, its watchers are moved and every model table is notified. There is no automatic switch inside a running process. `rebuild(true)`, or `discard_pending = true` at open, rebuilds at once and the report says what the old file keeps: `RebuildReport { old_file, new_file, reason, left_pending, left_direct }`, also available as `schema_state().last_rebuild`. `rebuild` refuses when nothing is pending, when a client transaction is open, and when unsent mutations remain unless told to leave them.
+
+Consequences worth knowing: a field rename is a removal plus an addition, so it is incompatible and rebuilds; the compiler cannot emit a field default ([#27](https://github.com/zanminwang/ahead/issues/27)), so the "non-nullable with default" additive row is unreachable from a `.model` file and a required field always rebuilds, matching the model-version rule that already demands a bump for it. The SQLite reader connection is refreshed after an additive change, and double-quoted string literals are disabled on both connections, so an added column is a column, never a string that looks like one.
 
 ## 9. Architecture Decisions
 
-**Detect compatibility and rebuild incompatible replicas — agreed, not implemented ([#20](https://github.com/zanminwang/ahead/issues/20)).** Generated clients carry the current schema. Store the schema descriptor when creating a local database; on each open, Rust compares that stored descriptor with the incoming schema using the [agreed compatibility rules](../../schema/models.md#9-architecture-decisions). A version or hash can identify a change, but cannot classify compatibility on its own.
+**Detect compatibility and rebuild incompatible replicas — implemented ([#20](https://github.com/zanminwang/ahead/issues/20)).** The rule lives in `ahead-core` so the compiler's history check and the client's open check cannot drift. Rebuilding is automatic framework behaviour: no migration SQL, no migration command, no registered upgrade callback. A compatible database is reused rather than rebuilt on every start.
 
-| Comparison | Target behavior |
-| --- | --- |
-| Unchanged | Open the existing database. |
-| Compatible change, such as a nullable-field addition | Apply the supported additive change and update the stored descriptor atomically. |
-| Incompatible | Create a database matching the new schema and synchronize server data from the beginning; do not reuse the old delivery cursors as evidence that the new database is populated. |
+**The old file is kept and nothing moves.** Rows, pending mutations and direct records stay in the file they were written to. Carrying them into another schema would mean inventing values or rewriting frozen request bytes, both of which the framework refuses to do. The `migration` option the SDK `open` still accepts is ignored: there is no defaults or replay mechanism, and documenting one would promise a seamless upgrade the runtime does not perform.
 
-This is automatic framework behavior, without application migration SQL, migration commands or manually registered upgrade callbacks. Reuse a compatible database rather than rebuilding on every startup. Retain the old database; selecting and switching databases and recovering interrupted rebuilds need implementation design.
+**Unsent work is sent first, or left behind on the application's say-so.** The client never decides a timeout. It keeps the old file open for its work and reports the state; the application decides whether to wait or to call `rebuild({ discardPending: true })` and tell the user what stayed behind.
 
-Continuing unfinished mutations and preserving access to local-only records across incompatible schemas are deferred follow-up work. Retaining the old file does not itself make those operations available in the new database. Do not delete the old database or rewrite frozen requests, and do not claim seamless upgrades for these cases until they are handled. Existing databases without a stored descriptor also need an explicit handling rule.
+**Selection is a sidecar, not a rename.** Renaming the live file under an open connection is not atomic on every platform; a one-line pointer written by temp-and-rename is. The sidecar is written last, so a crash at any earlier point leaves a file the next open discards.
+
+**Ruling: a file without a descriptor adopts the schema it opens with** when reconciliation succeeds. Such files predate the rule and were, by construction, reconciled by the same DDL; refusing or rebuilding them would discard working replicas for no gain.
 
 ## 10. Quality Requirements
 
-- **Additive changes open and fill existing rows; unknown columns survive.** Evidence: [sqlite/tests/ddl.rs](../../../../../crates/sqlite/tests/ddl.rs) `adds_missing_columns_to_both_tables_and_keeps_unknown_ones`.
-- **Identity, type and default-less non-nullable changes are refused without touching the file**. Evidence: `rejects_non_nullable_column_without_default_identity_change_and_type_change`.
-- **A fresh database gets model, before and framework tables and enforces unique indexes.** Evidence: `creates_model_before_and_framework_tables`.
-- **A checkpoint-era layout is refused before any write, and the file, its checkpoint rows and its `ahead_client` row are left exactly as found.** Evidence: `a_database_from_the_checkpoint_era_is_refused_untouched` (a checkpoint table beside the current layout, and an `ahead_client` table without the completion column).
+- **Unchanged and additive schemas open in place; the descriptor is updated; an added column reads as null.** Evidence: [sqlite/tests/rebuild.rs](../../../../../crates/sqlite/tests/rebuild.rs) `unchanged_and_additive_schemas_open_in_place`; [sqlite/tests/ddl.rs](../../../../../crates/sqlite/tests/ddl.rs) `adds_missing_columns_to_both_tables_and_keeps_unknown_ones`.
+- **An incompatible schema gets `<path>.1`, the sidecar points to it, the old file keeps its rows, subscriptions are copied at cursor 0, the new file is empty until it syncs.** Evidence: `an_incompatible_schema_gets_a_fresh_file_and_keeps_the_old_one`.
+- **A checkpoint-era layout is rebuilt beside, not refused; the old file is left as found.** Evidence: `an_earlier_framework_layout_is_rebuilt_beside_not_refused`; through a caller-opened store it is still refused untouched: `a_database_from_the_checkpoint_era_is_refused_untouched` in ddl.rs.
+- **An abandoned partial rebuild is removed and the retry takes the next number.** Evidence: `an_abandoned_partial_rebuild_is_removed_and_retried`.
+- **Unsent work keeps the old file open with its stored schema until sent; the frozen bytes are unchanged; then `rebuild` switches the same handle.** Evidence: `unsent_work_keeps_the_old_file_open_until_it_is_sent_then_rebuild_switches`.
+- **Discarding reports the mutations and direct records left behind and keeps the file.** Evidence: `discarding_pending_work_reports_what_the_old_file_keeps`.
+- **A descriptor-less current file adopts the schema it opens with.** Evidence: `a_current_layout_file_without_a_descriptor_adopts_the_schema_it_opens_with`.
+- **Every rule of the comparison names its reason.** Evidence: [core/tests/compatibility.rs](../../../../../crates/core/tests/compatibility.rs).
+- **Across the bindings and SDKs: `status().schema`, a refused rebuild while work is unsent, the report, the empty fresh file.** Evidence: [bindings/common/tests/session.rs](../../../../../bindings/common/tests/session.rs) `incompatible_schema_reports_pending_work_and_rebuild_switches_files`; [integration/bindings/client-js/rebuild.test.mjs](../../../../../integration/bindings/client-js/rebuild.test.mjs); [packages/dart/test/client_test.dart](../../../../../packages/dart/test/client_test.dart) `an incompatible schema keeps unsent work in the old file until rebuild is asked to leave it`.
+- **End to end: the rebuilt client converges like a fresh one; a restart follows the sidecar.** Evidence: [sim/tests/upgrade.rs](../../../../../crates/sim/tests/upgrade.rs).
 
-Executed 2026-09-15: `cargo test -p ahead-sqlite --locked` passed with the tests above. Reconciliation with a non-empty queue is not tested; the claim that queued operation bytes survive an additive change follows from the row layout.
+Executed 2026-09-16: `cargo test -p ahead-core -p ahead-client -p ahead-sqlite -p ahead-binding -p ahead-sim --locked`, the JS and Dart suites, passed with the tests above.
 
 ## 11. Risks and Technical Debt
 
-**Problem: a non-nullable field cannot be added to a model with data.** The descriptor supports a default, but the compiler cannot emit one ([Models](../../schema/models.md)), so the "added with default" row above is unreachable from a `.model` file. Tracked in [#27](https://github.com/zanminwang/ahead/issues/27) and [#20](https://github.com/zanminwang/ahead/issues/20).
+**Problem: a non-nullable field cannot be added without a rebuild.** The descriptor supports a default, but the compiler cannot emit one ([Models](../../schema/models.md)), so every required field rebuilds the local database. Tracked in [#27](https://github.com/zanminwang/ahead/issues/27).
 
-**Accepted limitation (contract to be decided in [#20](https://github.com/zanminwang/ahead/issues/20)).** Kept columns, kept indexes and undetected enum changes are the current behavior, not a design; #20 lists the open decisions, with the target comparison/rebuild direction in section 9; constraint compatibility and transition details still need design.
+**Accepted limitation.** Old files accumulate until the application deletes them; the runtime removes only an abandoned partial rebuild. A direct record in an old file is reported, never carried. A legacy checkpoint-era queue is counted as left behind, not sent.

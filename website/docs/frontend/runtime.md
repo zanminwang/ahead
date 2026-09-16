@@ -23,16 +23,19 @@ TypeScript imports `Client` from `packages/client-js/index.mts` in a source chec
 
 `schema` is the compiler's generated descriptor. `clientId` is a read-only, persistent identity for that database, used for retry deduplication. Use one active client per database and a separate file per signed-in user. Do not duplicate a database and then let both copies independently send mutations under the same client identity.
 
-Both forms accept `migration`. For an explicitly changed descriptor:
+When the descriptor you pass differs from the one the database was built for, the runtime decides at open ([local storage](storage.md)): an added model or nullable field is applied in place; anything else leaves the file untouched and opens a fresh database file beside it, `local.sqlite.1`, which resynchronises from the backend. If the old file still holds unsent mutations, it stays open for them instead; `status().schema.pending` tells you, and once they are sent you call `rebuild()`:
 
 === "TypeScript"
 
     ```ts
-    const raw = await Client.open({
-      path: 'local.sqlite',
-      schema,
-      migration: { defaults: { Entry: { addedField: null } }, replayPull: true },
-    });
+    const raw = await Client.open({ path: 'local.sqlite', schema });
+    const { schema: state } = await raw.status();
+    if (state.pending) {
+      console.log(`sending ${state.pending.pending} changes before upgrading`);
+      // … connect, wait for pending to reach 0, then:
+      const report = await raw.rebuild();
+      console.log(report.newFile, report.leftPending);
+    }
     ```
 
 === "Flutter"
@@ -41,14 +44,16 @@ Both forms accept `migration`. For an explicitly changed descriptor:
     final raw = await Client.open(
       path: 'local.sqlite', schema: schema,
       libraryPath: '/absolute/path/to/libahead_dart.dylib',
-      migration: {
-        'defaults': {'Entry': {'addedField': null}},
-        'replayPull': true,
-      },
     );
+    final state = (await raw.status())['schema'] as Map<String, dynamic>;
+    if (state['pending'] != null) {
+      // … connect, wait for pending to reach 0, then:
+      final report = await raw.rebuild();
+      print(report['newFile']);
+    }
     ```
 
-Defaults must fit the new field's type. Migration is atomic and preserves client identity, queued work and frozen request bytes. `replayPull` requests cursor rewind when applying the changed descriptor. Arbitrary identity/type changes are not supported; see [local storage](storage.md).
+`rebuild()` switches the same client to the new file and rejects while unsent mutations remain. `rebuild({ discardPending: true })`, or `discardPending: true` at open, rebuilds at once; the report names `leftPending` mutations and `leftDirect` local-only records that stay in `oldFile`. Nothing is moved between schemas and the old file is never deleted by the runtime. `migration` is still accepted for compatibility and ignored.
 
 ## Reads
 
@@ -223,7 +228,7 @@ All controls return promise/future void. Pause/close cancel network activity and
 
 ## Pending work and recovery
 
-`status()` returns `{ clientId, pending, beforeImages, cursors, channels, rejections }`. `pending` counts queued mutations; `beforeImages` is a diagnostic count; `cursors` maps channels to received positions; `channels` lists desired subscriptions; `rejections` contains `{ ordinal, code }` entries. It is a local snapshot, not a network status probe.
+`status()` returns `{ clientId, pending, beforeImages, cursors, channels, rejections, schema }`. `pending` counts queued mutations; `schema` is `{ rebuilt, pending, lastRebuild }` from the open-time schema check ([opening and schema changes](#opening-and-schema-changes)); `beforeImages` is a diagnostic count; `cursors` maps channels to received positions; `channels` lists desired subscriptions; `rejections` contains `{ ordinal, code }` entries. It is a local snapshot, not a network status probe.
 
 === "TypeScript"
 
