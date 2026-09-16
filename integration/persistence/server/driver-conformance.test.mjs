@@ -23,6 +23,20 @@ const key=id=>JSON.stringify({id});
 before(async()=>{for(const sql of (await readFile(new URL('../../../packages/postgres/migration.sql',import.meta.url),'utf8')).split(';').map(x=>x.trim()).filter(Boolean))await q(sql);await q('CREATE TABLE IF NOT EXISTS conformance_task(id text PRIMARY KEY,title text NOT NULL)');});
 after(()=>check.end());
 
+test('pg: a connection whose ROLLBACK fails is released as broken, a healthy one is released for reuse',async()=>{
+ const releases=[];
+ const fakePool=(failRollback)=>({connect:async()=>({
+  query:async sql=>{if(sql==='ROLLBACK'&&failRollback)throw new Error('connection lost');return {rows:[]};},
+  release:arg=>releases.push(arg),
+ })});
+ await assert.rejects(()=>pgDriver(fakePool(true)).transaction(async()=>{throw new Error('body failed');}),/body failed/);
+ assert.ok(releases.at(-1) instanceof Error,'the broken connection is discarded');
+ await assert.rejects(()=>pgDriver(fakePool(false)).transaction(async()=>{throw new Error('body failed');}),/body failed/);
+ assert.equal(releases.at(-1),undefined,'a rolled-back connection goes back to the pool');
+ assert.equal(await pgDriver(fakePool(false)).transaction(async()=>7),7);
+ assert.equal(releases.at(-1),undefined);
+});
+
 const shims=[];
 {const pool=new Pool({connectionString:url});shims.push({name:'pg',database:pg(pool),close:()=>pool.end()});}
 {const client=new PrismaClient();shims.push({name:'prisma',database:prisma(client),close:()=>client.$disconnect()});}

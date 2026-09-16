@@ -32,6 +32,9 @@ export function pgDriver(
       withRetries(
         async () => {
           const client = await pool.connect();
+          // A connection whose ROLLBACK failed is in an unknown state: hand
+          // the error to `release` so the pool discards it instead of reusing it.
+          let broken: Error | undefined;
           try {
             await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
             try {
@@ -39,11 +42,16 @@ export function pgDriver(
               await client.query("COMMIT");
               return result;
             } catch (error) {
-              await client.query("ROLLBACK").catch(() => {});
+              await client.query("ROLLBACK").catch((rollback: unknown) => {
+                broken =
+                  rollback instanceof Error
+                    ? rollback
+                    : new Error(String(rollback));
+              });
               throw error;
             }
           } finally {
-            client.release();
+            client.release(broken);
           }
         },
         (error) => RETRYABLE_SQLSTATES.has(sqlstate(error) ?? ""),

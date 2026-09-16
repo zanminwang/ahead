@@ -196,7 +196,6 @@ export interface RecordRef {
   model: string;
   identity: object;
 }
-/** The external notification: a business change made outside a handler, reported to one channel. */
 /**
  * What `backend.transaction` hands its body: the application transaction and
  * the same `changes` and `publish` a handler receives. The body registers the
