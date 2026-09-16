@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 pub const FRAMEWORK_TABLES: &[&str] = &[
+    "ahead_schema",
     "ahead_client",
     "ahead_record",
     "ahead_subscription",
@@ -17,17 +18,20 @@ pub const FRAMEWORK_TABLES: &[&str] = &[
     "ahead_rejection",
 ];
 
-/// Framework tables an earlier layout kept and this one refuses to open:
+/// Framework tables an earlier layout kept and this one cannot open in place:
 /// channel claims owned records and push checkpoints settled batches, both
 /// replaced by receipt completion ([#55](https://github.com/zanminwang/ahead/issues/55)).
 pub const LEGACY_TABLES: &[&str] = &["ahead_claim", "ahead_push_checkpoint"];
 
 /// `ahead_client` columns this layout requires beyond the original ones. A
 /// database created before they existed holds pending work under the old
-/// contract; it is refused, never converted or wiped.
+/// contract; it is rebuilt beside, never converted or wiped.
 const CLIENT_COLUMNS: &[&str] = &["last_completed_push", "push_models"];
 
 pub const FRAMEWORK_DDL: &str = "
+CREATE TABLE IF NOT EXISTS ahead_schema (
+  descriptor TEXT NOT NULL, created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS ahead_client (
   client_id    TEXT PRIMARY KEY,
   next_ordinal INTEGER NOT NULL,
@@ -73,10 +77,22 @@ CREATE TABLE IF NOT EXISTS ahead_rejection (
 );
 ";
 
-/// Refuse a database laid out by an earlier runtime before anything is
-/// written to it. Reads only: a refused database is left exactly as found,
-/// pending work included ([Reconciliation](../../../docs/engineering/architecture/client/storage/reconciliation.md)).
-pub fn check_layout<S: ClientStore>(store: &mut S) -> Result<()> {
+/// What an existing file was laid out by, decided before anything is written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Layout {
+    /// No framework tables: a fresh file.
+    Fresh,
+    /// This runtime's layout.
+    Current,
+    /// An earlier runtime's layout (channel claims, push checkpoints, or an
+    /// `ahead_client` without this layout's columns): only a rebuild can use
+    /// the file ([Reconciliation](../../../docs/engineering/architecture/client/storage/reconciliation.md)).
+    Legacy(String),
+}
+
+/// Classify the file's layout. Reads only: an incompatible file is left
+/// exactly as found, pending work included.
+pub fn check_layout<S: ClientStore>(store: &mut S) -> Result<Layout> {
     let tables = store.query_committed(
         "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'ahead\\_%' ESCAPE '\\'",
         &[],
@@ -86,25 +102,21 @@ pub fn check_layout<S: ClientStore>(store: &mut S) -> Result<()> {
         .iter()
         .filter_map(|r| r[0].as_str().map(str::to_owned))
         .collect();
-    let refuse = |what: &str| {
-        Err(invalid(format!(
-            "this database was created by an earlier Ahead runtime ({what}); it cannot be opened by this one. Open a fresh database; the old file is left untouched"
-        )))
-    };
     for table in LEGACY_TABLES {
         if names.iter().any(|n| n == table) {
-            return refuse(&format!("table {table}"));
+            return Ok(Layout::Legacy(format!("table {table}")));
         }
     }
-    if names.iter().any(|n| n == "ahead_client") {
-        let columns = store.query_committed("PRAGMA table_info(ahead_client)", &[])?;
-        for column in CLIENT_COLUMNS {
-            if !columns.rows.iter().any(|r| r[1].as_str() == Some(column)) {
-                return refuse(&format!("ahead_client lacks {column}"));
-            }
+    if !names.iter().any(|n| n == "ahead_client") {
+        return Ok(Layout::Fresh);
+    }
+    let columns = store.query_committed("PRAGMA table_info(ahead_client)", &[])?;
+    for column in CLIENT_COLUMNS {
+        if !columns.rows.iter().any(|r| r[1].as_str() == Some(column)) {
+            return Ok(Layout::Legacy(format!("ahead_client lacks {column}")));
         }
     }
-    Ok(())
+    Ok(Layout::Current)
 }
 
 pub fn quote(name: &str) -> String {

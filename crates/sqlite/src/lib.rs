@@ -91,6 +91,17 @@ impl SqliteStore {
                 "PRAGMA query_only=ON; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=1000;",
             )
             .map_err(db)?;
+        // A double-quoted name that is not a column must be an error, never a
+        // string literal: with the legacy fallback a statement prepared
+        // against a stale schema silently returns the column's name as text.
+        for connection in [&writer, &reader] {
+            connection
+                .set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DQS_DML, false)
+                .map_err(db)?;
+            connection
+                .set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DQS_DDL, false)
+                .map_err(db)?;
+        }
         Ok(Self { writer, reader })
     }
 }

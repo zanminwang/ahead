@@ -1,0 +1,303 @@
+//! Schema compatibility at open ([#20]): identical and additive schemas open
+//! the file in place; an incompatible schema, or an earlier framework layout,
+//! gets a fresh file beside the old one, which is kept. Unsent work in the old
+//! file is sent first or explicitly discarded with a report.
+//!
+//! [#20]: https://github.com/zanminwang/ahead/issues/20
+mod common;
+use ahead_client::*;
+use ahead_sqlite::SqliteStore;
+use common::*;
+use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
+
+fn factory() -> StoreFactory<SqliteStore> {
+    Box::new(|p| SqliteStore::open(p))
+}
+fn open_at(path: &Path, schema: Schema) -> Client<SqliteStore> {
+    Client::open_at(path, schema, factory(), false).unwrap()
+}
+fn wider() -> Schema {
+    let mut v = serde_json::to_value(schema()).unwrap();
+    v["models"][0]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name":"extra","nullable":true,"type":{"kind":"scalar","name":"string"}}));
+    Schema::from_value(v).unwrap()
+}
+fn breaking() -> Schema {
+    let mut v = serde_json::to_value(schema()).unwrap();
+    v["models"][0]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name":"due","nullable":false,"type":{"kind":"scalar","name":"string"}}));
+    Schema::from_value(v).unwrap()
+}
+fn sidecar(path: &Path) -> Option<String> {
+    std::fs::read_to_string(schema_store::sidecar_of(path))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+fn descriptor(c: &mut Client<SqliteStore>) -> String {
+    c.read_sql("SELECT descriptor FROM ahead_schema", &[])
+        .unwrap()[0]["descriptor"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+fn numbered(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("db.") && n[3..].chars().all(|c| c.is_ascii_digit()))
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn unchanged_and_additive_schemas_open_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut c = open_at(&path, schema());
+    seed(&mut c, "A");
+    assert!(!c.schema_state().rebuilt);
+    assert!(descriptor(&mut c).contains("\"Entry\""));
+    drop(c);
+    let mut c = open_at(&path, schema());
+    assert!(!c.schema_state().rebuilt);
+    assert_eq!(c.read(&key()).unwrap().unwrap()["text"], "A");
+    drop(c);
+    let mut c = open_at(&path, wider());
+    assert!(
+        !c.schema_state().rebuilt,
+        "a nullable field is added in place"
+    );
+    let row = c.read(&key()).unwrap().unwrap();
+    assert_eq!(row["text"], "A");
+    assert_eq!(row["extra"], Value::Null);
+    assert!(
+        descriptor(&mut c).contains("\"extra\""),
+        "the stored descriptor follows"
+    );
+    assert_eq!(sidecar(&path), None, "no rebuild, no sidecar");
+}
+
+#[test]
+fn an_incompatible_schema_gets_a_fresh_file_and_keeps_the_old_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut c = open_at(&path, schema());
+    subscribe(&mut c, "book");
+    c.apply_page(page("book", 0, 1, Some("A"))).unwrap();
+    assert_eq!(c.cursor("book").unwrap(), 1);
+    drop(c);
+    let mut c = open_at(&path, breaking());
+    let state = c.schema_state().clone();
+    assert!(state.rebuilt);
+    let report = state.last_rebuild.unwrap();
+    assert!(report.reason.contains("due"), "{}", report.reason);
+    assert_eq!((report.left_pending, report.left_direct), (0, 0));
+    assert_eq!(sidecar(&path).as_deref(), Some("db.1"));
+    assert!(path.exists(), "the old file is kept");
+    assert!(dir.path().join("db.1").exists());
+    assert!(
+        c.read(&key()).unwrap().is_none(),
+        "the new file starts empty"
+    );
+    assert_eq!(
+        c.subscriptions().unwrap(),
+        vec![("book".to_string(), 0)],
+        "subscriptions carry over at cursor 0"
+    );
+    // The old file still holds its row and its own schema.
+    let mut old = Client::open(SqliteStore::open(&path).unwrap(), schema()).unwrap();
+    assert_eq!(old.read(&key()).unwrap().unwrap()["text"], "A");
+    drop(old);
+    drop(c);
+    // Reopening follows the sidecar and rebuilds nothing.
+    let mut c = open_at(&path, breaking());
+    assert!(!c.schema_state().rebuilt);
+    assert_eq!(c.subscriptions().unwrap(), vec![("book".to_string(), 0)]);
+}
+
+#[test]
+fn an_earlier_framework_layout_is_rebuilt_beside_not_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut s = SqliteStore::open(&path).unwrap();
+    s.execute_batch(ddl::FRAMEWORK_DDL).unwrap();
+    s.execute_batch("CREATE TABLE ahead_push_checkpoint (push INTEGER NOT NULL, channel TEXT NOT NULL, cursor INTEGER NOT NULL, PRIMARY KEY (push, channel)); INSERT INTO ahead_push_checkpoint VALUES (1,'a',1); INSERT INTO ahead_client (client_id, next_ordinal, next_push, generation) VALUES ('old',1,1,1); INSERT INTO ahead_subscription VALUES ('a', 9)").unwrap();
+    drop(s);
+    assert!(
+        Client::open(SqliteStore::open(&path).unwrap(), schema()).is_err(),
+        "a bare store still refuses the legacy layout"
+    );
+    let mut c = open_at(&path, schema());
+    assert!(c.schema_state().rebuilt);
+    assert!(
+        c.schema_state()
+            .last_rebuild
+            .as_ref()
+            .unwrap()
+            .reason
+            .contains("ahead_push_checkpoint")
+    );
+    assert_eq!(c.subscriptions().unwrap(), vec![("a".to_string(), 0)]);
+    assert_ne!(c.client_id(), "old", "a fresh client identity");
+    let mut s = SqliteStore::open(&path).unwrap();
+    let rows = s
+        .query_committed("SELECT COUNT(*) AS n FROM ahead_push_checkpoint", &[])
+        .unwrap();
+    assert_eq!(rows.rows[0][0], json!(1), "the old file is untouched");
+}
+
+#[test]
+fn an_abandoned_partial_rebuild_is_removed_and_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    drop(open_at(&path, schema()));
+    // A crash left `db.1` behind without moving the sidecar.
+    drop(SqliteStore::open(dir.path().join("db.1")).unwrap());
+    std::fs::write(dir.path().join("db.1"), b"garbage").unwrap();
+    assert_eq!(sidecar(&path), None);
+    let mut c = open_at(&path, breaking());
+    assert!(c.schema_state().rebuilt);
+    assert_eq!(
+        numbered(dir.path()),
+        vec!["db.1".to_string()],
+        "the stray was replaced"
+    );
+    assert_eq!(sidecar(&path).as_deref(), Some("db.1"));
+    assert!(c.read(&key()).unwrap().is_none());
+}
+
+#[test]
+fn unsent_work_keeps_the_old_file_open_until_it_is_sent_then_rebuild_switches() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut c = open_at(&path, schema());
+    seed(&mut c, "A");
+    c.transaction(|tx| tx.enqueue(mutation("B")).map(|_| ()))
+        .unwrap();
+    let frozen = c.freeze().unwrap().unwrap();
+    drop(c);
+    let mut c = open_at(&path, breaking());
+    assert!(!c.schema_state().rebuilt);
+    let pending = c.schema_state().pending.clone().unwrap();
+    assert_eq!(pending.pending, 1);
+    assert_eq!(pending.direct, 1, "the seeded row has no stamp");
+    assert!(pending.reason.contains("due"));
+    assert_eq!(sidecar(&path), None);
+    assert_eq!(
+        c.freeze().unwrap().unwrap(),
+        frozen,
+        "the old file's frozen bytes are sent unchanged"
+    );
+    assert_eq!(
+        c.read(&key()).unwrap().unwrap()["text"],
+        "B",
+        "reads use the old schema"
+    );
+    let err = c.rebuild(false).unwrap_err();
+    assert!(err.to_string().contains("unsent"), "{err}");
+    let r = receipt(&mut c, 1, vec![authority(Some("B"), 2)]);
+    c.acknowledge(1, r).unwrap();
+    assert_eq!(c.pending_count().unwrap(), 0);
+    let report = c.rebuild(false).unwrap();
+    assert_eq!(report.left_pending, 0);
+    assert_eq!(report.left_direct, 0, "the row now has a stamp");
+    assert!(c.schema_state().rebuilt);
+    assert!(c.schema_state().pending.is_none());
+    assert_eq!(sidecar(&path).as_deref(), Some("db.1"));
+    assert!(
+        c.read(&key()).unwrap().is_none(),
+        "the new file is empty until it syncs"
+    );
+    // The client now speaks the new schema: a row with the new required field lands.
+    c.transaction(|tx| {
+        tx.direct(Operation {
+            model: "Entry".into(),
+            op: OperationKind::Create,
+            identity: json!({"id":"e"}),
+            values: Some(json!({"text":"new","note":null,"due":"today"})),
+        })
+    })
+    .unwrap();
+    assert_eq!(c.read(&key()).unwrap().unwrap()["due"], "today");
+}
+
+#[test]
+fn discarding_pending_work_reports_what_the_old_file_keeps() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut c = open_at(&path, schema());
+    seed(&mut c, "A");
+    c.transaction(|tx| {
+        tx.direct(Operation {
+            model: "Entry".into(),
+            op: OperationKind::Create,
+            identity: json!({"id":"local"}),
+            values: Some(json!({"text":"never sent","note":null})),
+        })?;
+        tx.enqueue(mutation("B")).map(|_| ())
+    })
+    .unwrap();
+    drop(c);
+    let mut c = open_at(&path, breaking());
+    assert!(c.schema_state().pending.is_some());
+    let report = c.rebuild(true).unwrap();
+    assert_eq!(report.left_pending, 1);
+    assert_eq!(
+        report.left_direct, 2,
+        "both direct rows stay in the old file"
+    );
+    assert!(report.old_file.ends_with("db"));
+    assert!(report.new_file.ends_with("db.1"));
+    assert!(path.exists());
+    assert!(c.schema_state().pending.is_none());
+    drop(c);
+    // Opening with `discard_pending` from the start rebuilds at once.
+    let path2: PathBuf = dir.path().join("other");
+    let mut c = open_at(&path2, schema());
+    seed(&mut c, "A");
+    c.transaction(|tx| tx.enqueue(mutation("B")).map(|_| ()))
+        .unwrap();
+    drop(c);
+    let c = Client::open_at(&path2, breaking(), factory(), true).unwrap();
+    assert!(c.schema_state().rebuilt);
+    assert_eq!(
+        c.schema_state().last_rebuild.as_ref().unwrap().left_pending,
+        1
+    );
+}
+
+#[test]
+fn a_current_layout_file_without_a_descriptor_adopts_the_schema_it_opens_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let mut c = open_at(&path, schema());
+    seed(&mut c, "A");
+    c.read_sql("DELETE FROM ahead_schema", &[]).ok();
+    let mut s = SqliteStore::open(&path).unwrap();
+    s.execute("DELETE FROM ahead_schema", &[]).unwrap();
+    drop(s);
+    drop(c);
+    let mut c = open_at(&path, wider());
+    assert!(
+        !c.schema_state().rebuilt,
+        "reconciliation succeeded, so the file is adopted"
+    );
+    assert!(descriptor(&mut c).contains("\"extra\""));
+    assert_eq!(c.read(&key()).unwrap().unwrap()["text"], "A");
+    drop(c);
+    let mut s = SqliteStore::open(&path).unwrap();
+    s.execute("DELETE FROM ahead_schema", &[]).unwrap();
+    drop(s);
+    let c = open_at(&path, breaking());
+    assert!(
+        c.schema_state().rebuilt,
+        "reconciliation failed, so the file is rebuilt beside"
+    );
+}
