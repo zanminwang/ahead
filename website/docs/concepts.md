@@ -32,7 +32,7 @@ After a Handler returns, the framework allocates a stamp for every changed Recor
 
 Background jobs publish through `backend.transaction`, which runs the job's writes and its publication in one application transaction, advances the stamps of the records it names, and wakes live subscribers once the transaction commits.
 
-The [backend SDK guide](backend/setup.md) shows registration and background publication. The first adapter targets [Prisma/PostgreSQL](backend/prisma.md).
+The [backend SDK guide](backend/setup.md) shows registration and background publication. The backend stores its metadata in [PostgreSQL](backend/database.md), through `pg`, Prisma or Drizzle.
 
 ## Channel and Cursor
 
